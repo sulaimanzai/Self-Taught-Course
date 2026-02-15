@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 6: Synthetic Frame Construction - Draugr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2694;&#xFE0F;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#a855f7;--accent2:#ec4899;--gradient:linear-gradient(135deg,#a855f7,#ec4899)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Draugr Course</h2>
+<span>Synthetic Stack Frame Evasion</span>
+</div>
+<a class="home-link" href="../Draugr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. EDR Call Stack Analysis</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. Beacon Object Files</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. x64 Stack Unwinding</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. SSN &amp; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Spoof Assembly Routine</span><span class="diff d2">d2</span></a>
+<a class="mod-link active" href="module6.html"><span>6. Synthetic Frame Construction</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Gadgets &amp; Clean Return</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Full Chain &amp; Detection</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 6: Synthetic Frame Construction</h1>
+<p class="subtitle">Building a three-layer fake stack that survives full unwinding &mdash; one precise <code>sub rsp</code> at a time.</p>
+
+<div class="card highlight">
+<h4>Module Overview</h4>
+<p>This is the core of Draugr. The Spoof assembly routine constructs a <strong>three-layer synthetic stack</strong> beneath the current execution point. Each layer represents a fake call frame for a legitimate Windows function. When the syscall executes and an EDR walks the stack, it sees: the current function called through <code>BaseThreadInitThunk</code>, which was called by <code>RtlUserThreadStart</code> &mdash; exactly what every normal thread looks like. This module walks through each layer, byte by byte.</p>
+</div>
+
+<!-- ==================== SECTION 1: Complete Stack Layout ==================== -->
+<h2>The Three-Layer Stack Layout</h2>
+<p>The synthetic stack is constructed from the bottom up (highest address to lowest). The final RSP after construction points to the very top &mdash; the gadget address that will be popped by RET after the syscall returns.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Complete Synthetic Stack (Top to Bottom)</h4>
+<div style="max-width:580px;margin:0 auto;font-size:.85rem;font-family:var(--code-font, monospace)">
+<div style="text-align:center;color:var(--dim);margin-bottom:8px">[Top of stack &mdash; lowest address &mdash; RSP points here]</div>
+<div style="border:2px solid var(--accent);border-radius:var(--radius);overflow:hidden">
+<div style="padding:10px 14px;background:rgba(168,85,247,.15);border-bottom:2px solid var(--accent);display:flex;justify-content:space-between;align-items:center">
+<span style="color:var(--accent);font-weight:700">Gadget Address</span>
+<span style="color:var(--dim)">JMP [RBX] &larr; RSP at syscall time</span>
+</div>
+<div style="padding:10px 14px;background:var(--surface2);border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--green)">BaseThreadInitThunk+0x14 frame</span>
+<span style="color:var(--dim)">calculated size from UNWIND_CODEs</span>
+</div>
+<div style="padding:10px 14px;background:var(--surface2);border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--yellow)">RtlUserThreadStart+0x21 frame</span>
+<span style="color:var(--dim)">calculated size from UNWIND_CODEs</span>
+</div>
+<div style="padding:10px 14px;background:var(--surface2);border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--dim)">0x200 bytes reserved buffer</span>
+<span style="color:var(--dim)">512 bytes padding</span>
+</div>
+<div style="padding:10px 14px;background:rgba(239,68,68,.1);display:flex;justify-content:space-between">
+<span style="color:var(--red);font-weight:700">NULL terminator (0x0)</span>
+<span style="color:var(--dim)">stops stack walkers</span>
+</div>
+</div>
+<div style="text-align:center;color:var(--dim);margin-top:8px">[Bottom of stack &mdash; highest address]</div>
+</div>
+</div>
+
+<div class="card">
+<h4>Construction Order</h4>
+<p>The stack grows downward on x64 (lower addresses = newer frames). Draugr builds from the bottom up:</p>
+<ol>
+<li><strong>NULL terminator</strong> &mdash; pushed first (highest address)</li>
+<li><strong>0x200 buffer</strong> &mdash; RSP decremented by 512 bytes</li>
+<li><strong>RtlUserThreadStart frame</strong> &mdash; RSP decremented by calculated frame size</li>
+<li><strong>BaseThreadInitThunk frame</strong> &mdash; RSP decremented by calculated frame size</li>
+<li><strong>Gadget address</strong> &mdash; pushed last (lowest address, top of stack)</li>
+</ol>
+</div>
+
+<!-- ==================== SECTION 2: Layer 1 - Reserved Buffer ==================== -->
+<h2>Layer 1: The Reserved Buffer (0x200 Bytes)</h2>
+<p>The first allocation after the NULL terminator is a 512-byte reserved buffer at the base of the synthetic stack.</p>
+
+<pre><code><span class="lang-tag">ASM - Buffer allocation</span>    ; Push NULL terminator first (base of stack)
+    xor   rax, rax
+    push  rax                  ; [rsp] = 0x0 (NULL)
+
+    ; Allocate 0x200 bytes of buffer space
+    sub   rsp, 0x200           ; RSP -= 512</code></pre>
+
+<div class="card">
+<h4>Purpose of the Buffer</h4>
+<p>This 512-byte region provides <strong>working space and separation</strong> between the NULL terminator and the synthetic frames. Some stack-walking implementations may read memory below the bottom frame. The buffer ensures these reads hit zeroed or benign memory rather than unmapped pages. It also provides alignment padding and prevents the synthetic frames from being immediately adjacent to the stack terminator, which could look suspicious under heuristic analysis.</p>
+</div>
+
+<!-- ==================== SECTION 3: Layer 2 - RtlUserThreadStart ==================== -->
+<h2>Layer 2: RtlUserThreadStart Frame</h2>
+<p>The second layer creates a fake frame for <code>ntdll!RtlUserThreadStart</code>. This is the function that Windows calls to start every user-mode thread. Its frame sits at the bottom of every legitimate call stack.</p>
+
+<pre><code><span class="lang-tag">ASM - RtlUserThreadStart synthetic frame</span>    ; Load RtlUserThreadStart frame size from PRM
+    mov   r12, [rbx + 0x48]    ; R12 = RtlUserThreadStart_Size
+
+    ; Allocate the frame
+    sub   rsp, r12             ; RSP -= frame size
+
+    ; Write the fake return address at the top of this frame
+    mov   r13, [rbx + 0x58]    ; R13 = RtlUserThreadStart + 0x21
+    mov   [rsp], r13           ; [RSP] = fake return address</code></pre>
+
+<div class="card highlight">
+<h4>What This Creates</h4>
+<p>After this code executes, the stack contains a frame that is <strong>exactly the size</strong> that Windows expects for <code>RtlUserThreadStart</code>. At the top of this frame (lowest address) sits the return address <code>RtlUserThreadStart+0x21</code>. When the stack unwinder processes this frame, it reads the return address, looks up the RUNTIME_FUNCTION for the address, and uses the UNWIND_CODEs to determine how many bytes to skip. Because Draugr calculated the exact same size from the exact same UNWIND_CODEs, the unwinder lands precisely at the NULL terminator &mdash; the expected end of the stack.</p>
+</div>
+
+<!-- ==================== SECTION 4: Layer 3 - BaseThreadInitThunk ==================== -->
+<h2>Layer 3: BaseThreadInitThunk Frame</h2>
+<p>On top of the RtlUserThreadStart frame, Draugr builds the <code>kernel32!BaseThreadInitThunk</code> frame. In a real thread, this function is called by RtlUserThreadStart and in turn calls the thread's entry point.</p>
+
+<pre><code><span class="lang-tag">ASM - BaseThreadInitThunk synthetic frame</span>    ; Load BaseThreadInitThunk frame size from PRM
+    mov   r14, [rbx + 0x40]    ; R14 = BaseThreadInitThunk_Size
+
+    ; Allocate the frame
+    sub   rsp, r14             ; RSP -= frame size
+
+    ; Write the fake return address at the top of this frame
+    mov   r15, [rbx + 0x50]    ; R15 = BaseThreadInitThunk + 0x14
+    mov   [rsp], r15           ; [RSP] = fake return address</code></pre>
+
+<div class="card">
+<h4>Frame Chain</h4>
+<p>Now the stack unwinder sees a chain: the current frame's return address is <code>BaseThreadInitThunk+0x14</code>. Unwinding that frame (by its UNWIND_CODEs) reveals a return address of <code>RtlUserThreadStart+0x21</code>. Unwinding that frame reveals the NULL terminator. This is <strong>identical</strong> to what a real thread's stack looks like &mdash; the EDR cannot distinguish this synthetic chain from a genuine one.</p>
+</div>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Unwinder's View of the Synthetic Stack</h4>
+<div class="flow">
+<div class="box g">Current Frame<br><small>ret = BaseThreadInitThunk+0x14</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">BaseThreadInitThunk<br><small>ret = RtlUserThreadStart+0x21</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">RtlUserThreadStart<br><small>ret = 0x0 (NULL)</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box r">STOP<br><small>NULL = end of stack</small></div>
+</div>
+</div>
+
+<!-- ==================== SECTION 5: The Gadget Frame ==================== -->
+<h2>The Gadget Frame</h2>
+<p>The final element placed on the stack is the <strong>gadget address</strong>. This sits at the very top of the synthetic stack (the lowest address). When the syscall returns, the CPU's <code>RET</code> instruction pops this address into RIP.</p>
+
+<pre><code><span class="lang-tag">ASM - Pushing the gadget</span>    ; Load gadget address from PRM
+    mov   rax, [rbx + 0x60]    ; RAX = gadget address (JMP [RBX])
+
+    ; Push it as the return address for the syscall
+    push  rax                  ; [RSP] = gadget address</code></pre>
+
+<div class="card warn">
+<h4>Critical Ordering</h4>
+<p>The gadget address <strong>must</strong> be the last thing pushed. RSP points to it at the time the <code>syscall</code> instruction executes. When the syscall returns, <code>RET</code> pops the top of the stack into RIP. If the gadget is not at the top, the CPU would jump to the wrong address &mdash; either a fake return address or garbage &mdash; and crash immediately.</p>
+</div>
+
+<!-- ==================== SECTION 6: NULL Terminator ==================== -->
+<h2>The NULL Terminator</h2>
+<p>A zero value (<code>0x0</code>) is placed at the very bottom of the synthetic stack, below the 0x200 buffer. This serves as a <strong>stack walk terminator</strong>.</p>
+
+<div class="card">
+<h4>Why NULL Stops the Walk</h4>
+<p>Windows stack walking functions like <code>RtlWalkFrameChain</code> and <code>RtlCaptureStackBackTrace</code> iterate through frames by following return addresses. When they encounter a return address of <code>0x0</code>, they interpret it as the end of the stack and stop. Without this terminator, the walker would continue past the synthetic frames into uncontrolled memory &mdash; either reading garbage that exposes the spoof, or causing an access violation.</p>
+</div>
+
+<div class="card green">
+<h4>Real Threads Have This Too</h4>
+<p>On a genuine Windows thread, the bottom of the stack also terminates with a NULL return address. The OS sets this up when it creates the thread's stack. Draugr replicates this behavior exactly, so even the termination condition is indistinguishable from a real stack.</p>
+</div>
+
+<!-- ==================== SECTION 7: Stack Argument Copying ==================== -->
+<h2>Stack Argument Copying</h2>
+<p>The x64 Windows calling convention passes the first four arguments in registers (RCX, RDX, R8, R9). Arguments 5 and beyond are passed on the stack. When Draugr replaces the real stack with the synthetic one, any stack-based arguments must be copied to the correct positions in the new stack.</p>
+
+<pre><code><span class="lang-tag">ASM - Stack argument copying (for &gt;4 argument syscalls)</span>    ; The PRM contains all arguments at offset 0x78+
+    ; Arguments 1-4 go in registers (handled separately)
+    ; Arguments 5+ must be placed on the stack at [RSP+0x28], [RSP+0x30], etc.
+
+    ; Check if there are stack arguments
+    mov   rcx, [rbx + 0x78]    ; arg1 (will go in RCX later)
+    mov   rdx, [rbx + 0x80]    ; arg2 (will go in RDX later)
+    mov   r8,  [rbx + 0x88]    ; arg3 (will go in R8 later)
+    mov   r9,  [rbx + 0x90]    ; arg4 (will go in R9 later)
+
+    ; Copy stack arguments (arg5, arg6, ...) to the synthetic stack
+    ; Stack slots at [RSP+0x28], [RSP+0x30], [RSP+0x38], ...
+    mov   rax, [rbx + 0x98]    ; arg5
+    mov   [rsp + 0x28], rax
+    mov   rax, [rbx + 0xA0]    ; arg6
+    mov   [rsp + 0x30], rax
+    ; ... additional arguments as needed</code></pre>
+
+<div class="card">
+<h4>Why 0x28 and Not 0x20?</h4>
+<p>The x64 calling convention reserves 32 bytes (0x20) of <strong>shadow space</strong> on the stack above the return address. Arguments 5+ start at <code>[RSP + 0x28]</code> (shadow space + 8 bytes for the return address). Draugr must respect this layout exactly, or the kernel function will read the wrong values for parameters 5 and beyond. Functions like <code>NtAllocateVirtualMemory</code> take 6 arguments, so getting this right is critical.</p>
+</div>
+
+<!-- ==================== SECTION 8: Assembly Walkthrough ==================== -->
+<h2>Assembly Walkthrough: Complete Construction</h2>
+<p>Here is the full sequence from the Spoof routine that builds the synthetic stack, loads register arguments, and jumps to the syscall instruction. Read top to bottom &mdash; each instruction is annotated with its purpose.</p>
+
+<pre><code><span class="lang-tag">ASM - Stub.s: Synthetic Stack Construction</span>    ; ---- Save original state ----
+    mov   rbx, rcx             ; RBX = &amp;PRM (anchor pointer)
+    mov   rax, [rsp]           ; Save original return address
+    mov   [rbx + 0x08], rax    ; PRM.OG_retaddr = original return
+
+    ; ---- Save non-volatile registers ----
+    mov   [rbx + 0x10], rdi
+    mov   [rbx + 0x18], rsi
+    mov   [rbx + 0x20], r12
+    mov   [rbx + 0x28], r13
+    mov   [rbx + 0x30], r14
+    mov   [rbx + 0x38], r15
+
+    ; ---- Layer 0: NULL terminator ----
+    xor   rax, rax
+    push  rax                  ; Stack bottom = 0x0
+
+    ; ---- Layer 1: Reserved buffer ----
+    sub   rsp, 0x200           ; 512 bytes of padding
+
+    ; ---- Layer 2: RtlUserThreadStart frame ----
+    mov   r12, [rbx + 0x48]   ; R12 = RtlUserThreadStart frame size
+    sub   rsp, r12             ; Allocate frame
+    mov   r13, [rbx + 0x58]   ; R13 = RtlUserThreadStart + 0x21
+    mov   [rsp], r13           ; Write fake return address
+
+    ; ---- Layer 3: BaseThreadInitThunk frame ----
+    mov   r14, [rbx + 0x40]   ; R14 = BaseThreadInitThunk frame size
+    sub   rsp, r14             ; Allocate frame
+    mov   r15, [rbx + 0x50]   ; R15 = BaseThreadInitThunk + 0x14
+    mov   [rsp], r15           ; Write fake return address
+
+    ; ---- Gadget: top of stack ----
+    mov   rax, [rbx + 0x60]   ; RAX = gadget address (JMP [RBX])
+    push  rax                  ; RSP now points to gadget
+
+    ; ---- Load syscall arguments into registers ----
+    mov   r10, [rbx + 0x78]   ; R10 = arg1 (R10, not RCX for syscall)
+    mov   rdx, [rbx + 0x80]   ; RDX = arg2
+    mov   r8,  [rbx + 0x88]   ; R8  = arg3
+    mov   r9,  [rbx + 0x90]   ; R9  = arg4
+
+    ; ---- Load SSN and jump to syscall ----
+    mov   rax, [rbx + 0x68]   ; RAX = System Service Number
+    mov   r11, [rbx + 0x70]   ; R11 = syscall instruction address
+    jmp   r11                  ; Jump to: syscall; ret in ntdll</code></pre>
+
+<div class="card highlight">
+<h4>Why R10 Instead of RCX?</h4>
+<p>In the Windows syscall convention, the kernel expects the first argument in <strong>R10</strong>, not RCX. This is because the <code>syscall</code> instruction itself uses RCX to store the return address (RIP). The standard ntdll stub does <code>mov r10, rcx</code> before the syscall. Since Draugr jumps directly to the <code>syscall</code> instruction (bypassing the stub preamble), it must place the first argument in R10 manually.</p>
+</div>
+
+<div class="card highlight">
+<h4>Why JMP Instead of CALL?</h4>
+<p>The Spoof routine uses <code>jmp r11</code> (not <code>call r11</code>) to reach the syscall instruction. A <code>CALL</code> would push an additional return address onto the stack, misaligning the carefully constructed synthetic stack. The <code>JMP</code> transfers control without modifying RSP. The syscall instruction in ntdll is followed by <code>RET</code>, which will pop the gadget address from RSP &mdash; exactly as intended.</p>
+</div>
+
+<!-- ==================== QUIZ ==================== -->
+<div class="quiz" id="quiz6">
+<h4>Module 6 Quiz: Synthetic Frame Construction</h4>
+<div class="quiz-q" data-correct="3">
+<p>Q1: In what order are the synthetic stack layers constructed (first pushed to last pushed)?</p>
+<label data-opt="0"><input type="radio" name="q6_0"> Gadget, BaseThreadInitThunk, RtlUserThreadStart, Buffer, NULL</label>
+<label data-opt="1"><input type="radio" name="q6_0"> BaseThreadInitThunk, RtlUserThreadStart, Gadget, Buffer, NULL</label>
+<label data-opt="2"><input type="radio" name="q6_0"> NULL, Buffer, BaseThreadInitThunk, RtlUserThreadStart, Gadget</label>
+<label data-opt="3"><input type="radio" name="q6_0"> NULL, Buffer, RtlUserThreadStart, BaseThreadInitThunk, Gadget</label>
+<div class="explain">The stack grows downward, so the first item pushed ends up at the highest address (bottom). NULL is pushed first, then the buffer is allocated, then the RtlUserThreadStart frame, then the BaseThreadInitThunk frame, and finally the gadget address is pushed on top. RSP points to the gadget at syscall time.</div>
+</div>
+<div class="quiz-q" data-correct="2">
+<p>Q2: What is the purpose of the NULL terminator at the bottom of the synthetic stack?</p>
+<label data-opt="0"><input type="radio" name="q6_1"> It marks the start of the buffer region</label>
+<label data-opt="1"><input type="radio" name="q6_1"> It provides alignment for the frame above it</label>
+<label data-opt="2"><input type="radio" name="q6_1"> Stack walkers stop when they encounter a NULL return address, preventing them from reading past the synthetic frames into uncontrolled memory</label>
+<label data-opt="3"><input type="radio" name="q6_1"> It is required by the syscall instruction</label>
+<div class="explain">Functions like RtlWalkFrameChain treat a NULL return address as the end of the call chain. Without it, the walker would continue into whatever memory lies beyond the synthetic stack, either producing garbage frames that expose the spoof or causing an access violation.</div>
+</div>
+<div class="quiz-q" data-correct="1">
+<p>Q3: Why must each synthetic frame be exactly the size calculated from the target function's UNWIND_CODEs?</p>
+<label data-opt="0"><input type="radio" name="q6_2"> The kernel checks frame sizes during syscall execution</label>
+<label data-opt="1"><input type="radio" name="q6_2"> The stack unwinder uses UNWIND_CODEs to calculate how many bytes to skip when moving to the next frame; incorrect sizes cause misalignment and expose the spoof</label>
+<label data-opt="2"><input type="radio" name="q6_2"> Windows requires all stack frames to be a fixed size</label>
+<label data-opt="3"><input type="radio" name="q6_2"> The frame size determines the function's argument count</label>
+<div class="explain">The stack unwinder reads the UNWIND_CODEs for each function and uses them to calculate how many bytes to advance RSP to reach the previous frame. If a synthetic frame is the wrong size, the unwinder will land at the wrong position, reading garbage as the next return address. The frame sizes must match exactly so the unwinder walks cleanly from frame to frame.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz6')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module5.html">&larr; Prev: Spoof Assembly Routine</a>
+<a class="primary" href="module7.html">Next: Gadgets &amp; Clean Return &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

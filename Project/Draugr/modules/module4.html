@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 4: SSN Resolution &amp; Indirect Syscalls - Draugr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2694;&#xFE0F;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#a855f7;--accent2:#ec4899;--gradient:linear-gradient(135deg,#a855f7,#ec4899)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Draugr Course</h2>
+<span>Synthetic Stack Frame Evasion</span>
+</div>
+<a class="home-link" href="../Draugr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. EDR Call Stack Analysis</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. Beacon Object Files</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. x64 Stack Unwinding</span><span class="diff d1">d1</span></a>
+<a class="mod-link active" href="module4.html"><span>4. SSN &amp; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Spoof Assembly Routine</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. Synthetic Frame Construction</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Gadgets &amp; Clean Return</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Full Chain &amp; Detection</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge medium">Difficulty: Intermediate</span>
+<h1>Module 4: SSN Resolution &amp; Indirect Syscalls</h1>
+<p class="subtitle">Finding syscall numbers, handling EDR hooks, and jumping to the syscall instruction inside ntdll.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Draugr needs two things before it can execute a spoofed syscall: the <strong>System Service Number (SSN)</strong> for the target function, and the <strong>address of the syscall instruction</strong> inside ntdll. This module covers how Draugr resolves SSNs from clean and hooked stubs, the difference between direct and indirect syscalls, and how Draugr combines indirect syscalls with synthetic stack frames for full evasion.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. Direct vs Indirect Syscalls</h2>
+
+<p>There are two fundamental approaches to executing syscalls without going through EDR-hooked ntdll stubs. Each has different detection characteristics:</p>
+
+<div class="versus">
+<div>
+<h5 style="color:var(--red)">Direct Syscall</h5>
+<ul>
+<li>The <code>syscall</code> instruction is in <strong>your code</strong> (EXE, BOF, shellcode)</li>
+<li>SSN loaded into EAX, <code>syscall</code> executed from attacker memory</li>
+<li>Return address (RCX after syscall) points to your code</li>
+<li><strong>Detected by:</strong> InstrumentationCallback checks return address</li>
+<li>If return address is outside ntdll, flagged immediately</li>
+<li>Used by: SysWhispers1, early Hell's Gate implementations</li>
+</ul>
+</div>
+<div>
+<h5 style="color:var(--green)">Indirect Syscall</h5>
+<ul>
+<li>Your code jumps to the <code>syscall;ret</code> inside ntdll's own memory</li>
+<li>SSN loaded in your code, then JMP to ntdll stub's syscall instruction</li>
+<li>Return address after syscall points to <strong>ntdll memory</strong></li>
+<li><strong>Passes:</strong> InstrumentationCallback (return addr in ntdll)</li>
+<li><strong>Fails:</strong> Call stack analysis (caller is still unbacked)</li>
+<li>Used by: SysWhispers2/3, HWSyscalls, <strong>Draugr</strong> (+ stack spoofing)</li>
+</ul>
+</div>
+</div>
+
+<p>Draugr uses <strong>indirect syscalls</strong>. The syscall instruction executes from ntdll's memory, passing InstrumentationCallback checks. The call stack problem is solved separately by synthetic frames (covered in Modules 5-7). This two-pronged approach gives Draugr evasion against both Layer 2 (return address validation) and Layer 3 (call stack analysis).</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">Direct vs Indirect Execution Flow</h4>
+<div style="display:flex;gap:30px;justify-content:center;flex-wrap:wrap">
+<div style="flex:1;min-width:280px">
+<p style="text-align:center;color:var(--red);font-weight:700;margin-bottom:10px">Direct Syscall</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box" style="width:100%">mov r10, rcx <small>(in your code)</small></div>
+<div class="box" style="width:100%">mov eax, SSN <small>(in your code)</small></div>
+<div class="box r" style="width:100%">syscall <small>(in your code = DETECTED)</small></div>
+<div class="box r" style="width:100%">ret <small>(return addr = your code)</small></div>
+</div>
+</div>
+<div style="flex:1;min-width:280px">
+<p style="text-align:center;color:var(--green);font-weight:700;margin-bottom:10px">Indirect Syscall (Draugr)</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box" style="width:100%">mov r10, rcx <small>(in spoof routine)</small></div>
+<div class="box" style="width:100%">mov eax, SSN <small>(in spoof routine)</small></div>
+<div class="box g" style="width:100%">jmp [ntdll syscall addr] <small>(jump INTO ntdll)</small></div>
+<div class="box g" style="width:100%">syscall; ret <small>(executes from ntdll memory)</small></div>
+</div>
+</div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. The ntdll Syscall Stub</h2>
+
+<p>Every <code>Nt*</code> function in ntdll.dll is a thin stub that transitions to the kernel. In its clean (unhooked) state, the stub is only about 12 bytes:</p>
+
+<pre><code><span class="lang-tag">x86-64 ASM</span>; Clean ntdll syscall stub (e.g., NtAllocateVirtualMemory)
+; Total: 12 bytes
+;
+4C 8B D1          mov  r10, rcx       ; Save 1st arg (syscall clobbers RCX)
+B8 18 00 00 00    mov  eax, 0x18      ; SSN = 0x18 (NtAllocateVirtualMemory)
+0F 05             syscall             ; Transition to Ring 0
+C3                ret                 ; Return to caller
+
+; Byte pattern: 4C 8B D1 B8 [SSN_LO] [SSN_HI] 00 00 0F 05 C3</code></pre>
+
+<div class="card">
+<h4>Why <code>mov r10, rcx</code>?</h4>
+<p>The <code>syscall</code> instruction uses RCX to save the return address (RIP) and R11 to save RFLAGS. This means the first argument (normally in RCX per the x64 calling convention) would be destroyed. The stub copies RCX to R10 first, and the kernel reads the first argument from R10 instead of RCX. This is a fundamental part of the Windows syscall ABI.</p>
+</div>
+
+<p>The SSN (System Service Number) is the index into the <strong>System Service Descriptor Table (SSDT)</strong> in the kernel. Each Nt* function has a unique SSN. The kernel uses <code>EAX</code> as the index to dispatch to the correct kernel function.</p>
+
+<!-- ============================================================ -->
+<h2>3. Draugr's Primary SSN Resolution</h2>
+
+<p>Draugr resolves SSNs by pattern-matching the known clean stub bytes. When initializing, it locates each target Nt* function in ntdll and checks if the first bytes match the expected pattern:</p>
+
+<pre><code><span class="lang-tag">C (Draugr SSN Resolution)</span>// Primary resolution: pattern match for clean stub
+// Looking for: 4C 8B D1 B8 [SSN_LO] [SSN_HI] 00 00
+//              mov r10,rcx; mov eax, SSN
+
+BOOL ResolveSsn(PVOID functionAddress, PWORD outSsn) {
+    PBYTE stub = (PBYTE)functionAddress;
+
+    // Check for the clean stub signature: 4C 8B D1 B8
+    if (stub[0] == 0x4C &amp;&amp;    // mov r10, rcx (byte 1)
+        stub[1] == 0x8B &amp;&amp;    // mov r10, rcx (byte 2)
+        stub[2] == 0xD1 &amp;&amp;    // mov r10, rcx (byte 3)
+        stub[3] == 0xB8) {    // mov eax, imm32 (opcode)
+
+        // SSN is the 16-bit value at offset 4-5
+        // (bytes 6-7 are always 0x00 0x00 since SSNs are small)
+        *outSsn = *(PWORD)(stub + 4);
+        return TRUE;
+    }
+
+    // Stub is hooked - primary resolution failed
+    return FALSE;
+}</code></pre>
+
+<p>This is the fast path. If the stub hasn't been hooked by an EDR, the SSN is right there at byte offset 4. Extract it and move on.</p>
+
+<div class="card">
+<h4>How Draugr Finds the Function Address</h4>
+<p>Draugr uses the Export Address Table (EAT) of ntdll.dll to resolve function addresses. The process:</p>
+<ol style="padding-left:20px;line-height:2;">
+<li>Get ntdll base address from the PEB (Process Environment Block)</li>
+<li>Parse the PE headers to find the Export Directory</li>
+<li>Walk the AddressOfNames array, hash each name, compare to target hash</li>
+<li>Use the matching ordinal to index into AddressOfFunctions</li>
+<li>The result is the RVA of the syscall stub</li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Hooked Stub Fallback</h2>
+
+<p>When an EDR hooks a syscall stub, the first bytes are overwritten with a JMP instruction. The clean pattern (<code>4C 8B D1 B8</code>) is destroyed:</p>
+
+<pre><code><span class="lang-tag">x86-64 ASM</span>; Hooked NtAllocateVirtualMemory (EDR has patched it):
+E9 XX XX XX XX    jmp  edr_hook_handler    ; 5-byte relative jump
+00 00 00          ; remaining bytes (corrupted)
+0F 05             syscall                  ; still present but unreachable via normal flow
+C3                ret
+
+; The original 4C 8B D1 B8 18 00 00 00 has been replaced
+; Pattern matching fails - Draugr cannot extract the SSN from here</code></pre>
+
+<p>When primary resolution fails, Draugr falls back to a <strong>neighbor scanning</strong> technique. This exploits a fundamental property of the SSDT: <strong>SSNs are sequential</strong>. Adjacent Nt* functions in ntdll's export table have consecutive SSNs.</p>
+
+<pre><code><span class="lang-tag">C (Neighbor Scan Fallback)</span>// Fallback: scan neighboring stubs at 32-byte intervals
+// ntdll syscall stubs are laid out sequentially, each ~32 bytes apart
+// SSNs increment by 1 for each adjacent stub
+
+BOOL ResolveSsnFallback(PVOID functionAddress, PWORD outSsn) {
+    PBYTE stub = (PBYTE)functionAddress;
+
+    // Search downward (previous stubs)
+    for (int i = 1; i &lt; 500; i++) {
+        PBYTE neighbor = stub - (i * 32);  // 32-byte stub spacing
+
+        if (neighbor[0] == 0x4C &amp;&amp;
+            neighbor[1] == 0x8B &amp;&amp;
+            neighbor[2] == 0xD1 &amp;&amp;
+            neighbor[3] == 0xB8) {
+            // Found an unhooked neighbor!
+            // Its SSN + i = our SSN (since SSNs are sequential)
+            *outSsn = *(PWORD)(neighbor + 4) + (WORD)i;
+            return TRUE;
+        }
+    }
+
+    // Search upward (next stubs)
+    for (int i = 1; i &lt; 500; i++) {
+        PBYTE neighbor = stub + (i * 32);
+
+        if (neighbor[0] == 0x4C &amp;&amp;
+            neighbor[1] == 0x8B &amp;&amp;
+            neighbor[2] == 0xD1 &amp;&amp;
+            neighbor[3] == 0xB8) {
+            // Found an unhooked neighbor!
+            // Its SSN - i = our SSN
+            *outSsn = *(PWORD)(neighbor + 4) - (WORD)i;
+            return TRUE;
+        }
+    }
+
+    return FALSE;  // All neighbors hooked (extremely unlikely)
+}</code></pre>
+
+<div class="card warn">
+<h4>Why This Works</h4>
+<p>EDRs hook specific high-value functions (NtAllocateVirtualMemory, NtWriteVirtualMemory, NtOpenProcess, etc.) but they <strong>don't hook every single Nt* function</strong>. There are 400+ syscalls in modern Windows. Hooking them all would cause severe performance degradation. So there are always unhooked neighbors nearby. The neighbor's SSN &plusmn; the offset gives the target function's SSN.</p>
+</div>
+
+<p>This technique is conceptually similar to <strong>Halo's Gate</strong> (by Sektor7 / reenz0h), which also scans neighbors when the target stub is hooked. The key insight: even if the EDR hooks your target function, it almost certainly left a neighbor unhooked within a few stubs.</p>
+
+<!-- ============================================================ -->
+<h2>5. Comparison with Other SSN Resolution Methods</h2>
+
+<div class="card">
+<h4>SSN Resolution Technique Comparison</h4>
+<table>
+<tr><th>Technique</th><th>Author</th><th>Method</th><th>Handles Hooks?</th><th>Weakness</th></tr>
+<tr><td><strong>Hell's Gate</strong></td><td>am0nsec, smelly__vx</td><td>Pattern match on target stub</td><td style="color:var(--red)">No &mdash; fails if stub is hooked</td><td>No fallback mechanism</td></tr>
+<tr><td><strong>Halo's Gate</strong></td><td>Sektor7</td><td>Hell's Gate + neighbor scan</td><td style="color:var(--green)">Yes &mdash; scans up/down neighbors</td><td>Fixed 32-byte stride assumption</td></tr>
+<tr><td><strong>Tartarus' Gate</strong></td><td>trickster0</td><td>Halo's Gate + multi-byte JMP detection</td><td style="color:var(--green)">Yes &mdash; handles E9 and FF 25 hooks</td><td>Still relies on neighbor availability</td></tr>
+<tr><td><strong>SysWhispers2</strong></td><td>jthuraisamy</td><td>Sort Zw* functions by address</td><td style="color:var(--green)">Yes &mdash; doesn't read stub bytes</td><td>Requires iterating entire EAT</td></tr>
+<tr><td><strong>MDSec Exception Dir</strong></td><td>MDSec</td><td>Walk RUNTIME_FUNCTION entries</td><td style="color:var(--green)">Yes &mdash; uses metadata, not bytes</td><td>Assumes .pdata ordering = SSN ordering</td></tr>
+<tr><td><strong>Draugr</strong></td><td>NtDallas</td><td>Pattern match + neighbor fallback</td><td style="color:var(--green)">Yes &mdash; combined approach</td><td>Same neighbor availability assumption</td></tr>
+</table>
+</div>
+
+<p>Draugr's approach is pragmatic: try the fast path first (direct pattern match), fall back to neighbor scanning if hooked. This provides reliable SSN resolution with minimal code complexity &mdash; important for a BOF where every byte counts.</p>
+
+<!-- ============================================================ -->
+<h2>6. How Draugr Executes the Syscall</h2>
+
+<p>After resolving the SSN and locating the <code>syscall</code> instruction address inside ntdll, Draugr's spoof routine executes the actual system call. The sequence combines SSN resolution, synthetic frame construction, and indirect syscall execution:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">Draugr Syscall Execution Chain</h4>
+<div class="flow">
+<div class="box">Resolve SSN<br><small>(pattern / fallback)</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Find syscall;ret<br>addr in ntdll</div>
+<div class="arrow">&rarr;</div>
+<div class="box">Build synthetic<br>stack frames</div>
+<div class="arrow">&rarr;</div>
+<div class="box">Set EAX = SSN<br>R10 = arg1</div>
+<div class="arrow">&rarr;</div>
+<div class="box g">JMP to ntdll<br>syscall;ret</div>
+</div>
+</div>
+
+<p>The spoof assembly routine (detailed in Module 5) performs these register operations just before the jump:</p>
+
+<pre><code><span class="lang-tag">x86-64 ASM (Spoof Routine - Syscall Phase)</span>; At this point, synthetic frames are already built on the stack
+; Arguments are in their correct positions (RCX/RDX/R8/R9 + stack)
+
+mov  r10, rcx              ; Copy 1st arg to R10 (syscall ABI requirement)
+mov  eax, [ssn_value]      ; Load the resolved System Service Number
+jmp  qword ptr [syscall_addr]  ; Jump to syscall;ret inside ntdll
+
+; Execution continues at ntdll:
+;   0F 05    syscall        ; Transition to kernel (Ring 0)
+;   C3       ret            ; Return to our spoof routine's cleanup
+;
+; At this moment, if the EDR inspects the stack:
+;   - InstrumentationCallback sees return addr in ntdll (PASS)
+;   - Stack walker sees BaseThreadInitThunk + RtlUserThreadStart (PASS)
+;   - All return addresses are in backed memory (PASS)</code></pre>
+
+<div class="card green">
+<h4>The Syscall Address: Where to Jump</h4>
+<p>Draugr needs the address of the <code>syscall</code> instruction (bytes <code>0F 05</code>) inside the target function's stub in ntdll. Even if the stub is hooked, the <code>syscall;ret</code> bytes at the end of the stub are typically preserved (the hook only replaces the first 5-7 bytes). Draugr locates these bytes by scanning forward from the stub address:</p>
+<pre><code><span class="lang-tag">C</span>// Find the syscall instruction within the stub
+PVOID FindSyscallAddr(PVOID stubAddr) {
+    PBYTE p = (PBYTE)stubAddr;
+    for (int i = 0; i &lt; 32; i++) {
+        // Look for: 0F 05 C3 (syscall; ret)
+        if (p[i] == 0x0F &amp;&amp; p[i+1] == 0x05 &amp;&amp; p[i+2] == 0xC3) {
+            return &amp;p[i];  // Address of syscall instruction
+        }
+    }
+    return NULL;
+}</code></pre>
+<p>The jump target is the <code>0F 05</code> address, so execution flows: <code>syscall</code> (kernel transition) &rarr; <code>ret</code> (return to Draugr's cleanup code). The return address on the stack at this point is controlled by Draugr's synthetic frame layout.</p>
+</div>
+
+<div class="card">
+<h4>Complete SSN + Syscall Resolution Flow</h4>
+<table>
+<tr><th>Step</th><th>Action</th><th>Output</th></tr>
+<tr><td>1</td><td>Hash target function name (e.g., NtAllocateVirtualMemory)</td><td>Hash value for EAT lookup</td></tr>
+<tr><td>2</td><td>Walk ntdll EAT, match hash to export name</td><td>Function RVA (stub address)</td></tr>
+<tr><td>3</td><td>Check stub bytes for <code>4C 8B D1 B8</code> pattern</td><td>SSN (if unhooked) or failure</td></tr>
+<tr><td>4</td><td>If hooked: scan neighbors at 32-byte intervals</td><td>SSN via neighbor offset arithmetic</td></tr>
+<tr><td>5</td><td>Scan stub for <code>0F 05 C3</code> (syscall;ret) pattern</td><td>Indirect syscall jump target address</td></tr>
+<tr><td>6</td><td>Store SSN + syscall address in VxTable entry</td><td>Ready for spoof routine to use</td></tr>
+</table>
+</div>
+
+<p>All of this resolution happens once during Draugr's initialization phase (<code>InitVxTable</code>). The resolved SSNs and syscall addresses are stored in a table structure so subsequent calls don't need to re-resolve.</p>
+
+<!-- ============================================================ -->
+<div class="quiz" id="quiz1">
+<h4>Module 4 Quiz: SSN Resolution &amp; Indirect Syscalls</h4>
+
+<div class="quiz-q" data-correct="1">
+<p>Q1: Why does the syscall stub execute <code>mov r10, rcx</code> before <code>syscall</code>?</p>
+<label data-opt="0"><input type="radio" name="q1_0"> R10 is the syscall number register on Windows</label>
+<label data-opt="1"><input type="radio" name="q1_0"> The syscall instruction clobbers RCX (saves RIP into it), so the first argument must be preserved in R10</label>
+<label data-opt="2"><input type="radio" name="q1_0"> R10 provides faster register access than RCX in kernel mode</label>
+<label data-opt="3"><input type="radio" name="q1_0"> It's a NOP-equivalent used for alignment padding</label>
+<div class="explain">The x86-64 <code>syscall</code> instruction saves the current RIP into RCX and RFLAGS into R11. This destroys whatever was in RCX (the first argument per the Windows x64 calling convention). The stub copies RCX to R10 first so the kernel can read the first argument from R10. This is specific to the Windows syscall ABI &mdash; Linux uses a different register convention.</div>
+</div>
+
+<div class="quiz-q" data-correct="2">
+<p>Q2: When Draugr's primary SSN resolution fails (stub is hooked), how does the neighbor fallback determine the correct SSN?</p>
+<label data-opt="0"><input type="radio" name="q2_0"> It reads the SSN from the EDR's hook handler code</label>
+<label data-opt="1"><input type="radio" name="q2_0"> It loads a fresh copy of ntdll from disk</label>
+<label data-opt="2"><input type="radio" name="q2_0"> It finds an unhooked neighbor stub and adds/subtracts the positional offset, since SSNs are sequential</label>
+<label data-opt="3"><input type="radio" name="q2_0"> It queries the kernel directly for the SSN via NtQuerySystemInformation</label>
+<div class="explain">Syscall stubs in ntdll are laid out sequentially (~32 bytes apart), and their SSNs are consecutive integers. If NtAllocateVirtualMemory (SSN 0x18) is hooked but NtOpenSection (SSN 0x1A, two stubs later) is not, Draugr reads SSN 0x1A from the clean neighbor and subtracts the offset (2) to get 0x18. This works because EDRs hook selectively &mdash; they never hook all 400+ syscall stubs.</div>
+</div>
+
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module3.html">&larr; Prev: x64 Stack Unwinding</a>
+<a class="primary" href="module5.html">Next: Spoof Assembly Routine &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 8: Full Chain, Detection &amp; Ecosystem - Draugr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2694;&#xFE0F;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#a855f7;--accent2:#ec4899;--gradient:linear-gradient(135deg,#a855f7,#ec4899)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Draugr Course</h2>
+<span>Synthetic Stack Frame Evasion</span>
+</div>
+<a class="home-link" href="../Draugr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. EDR Call Stack Analysis</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. Beacon Object Files</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. x64 Stack Unwinding</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. SSN &amp; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Spoof Assembly Routine</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. Synthetic Frame Construction</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Gadgets &amp; Clean Return</span><span class="diff d3">d3</span></a>
+<a class="mod-link active" href="module8.html"><span>8. Full Chain &amp; Detection</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 8: Full Chain, Detection &amp; Ecosystem</h1>
+<p class="subtitle">The complete execution pipeline, what defeats it, and the broader landscape of call stack spoofing tools.</p>
+
+<div class="card highlight">
+<h4>Final Module</h4>
+<p>This module ties together everything from the previous seven modules into a single end-to-end view. We trace a <code>DRAUGR_SYSCALL</code> call from the macro expansion to the kernel and back. Then we examine the detection surfaces that make this technique imperfect, the hardware features that fundamentally break it, and the ecosystem of related tools that preceded and followed Draugr.</p>
+</div>
+
+<!-- ==================== SECTION 1: End-to-End Flow ==================== -->
+<h2>End-to-End Execution</h2>
+<p>Here is the complete numbered sequence when a Beacon operator calls a Draugr-wrapped syscall. Every step maps to a concept from a previous module.</p>
+
+<div class="card">
+<h4>Complete Execution Pipeline</h4>
+<ol>
+<li><strong>DRAUGR_SYSCALL macro</strong> is called with the function name and arguments (e.g., <code>DRAUGR_SYSCALL(NtAllocateVirtualMemory, ...)</code>)</li>
+<li><strong>DraugrInit</strong> resolves three addresses: <code>BaseThreadInitThunk+0x14</code>, <code>RtlUserThreadStart+0x21</code>, and <code>kernelbase.dll</code> base (Module 5, Phase 1)</li>
+<li><strong>InitVxTable</strong> resolves the SSN via pattern matching on the ntdll stub. If the stub is hooked, the neighbor-based fallback finds the SSN from adjacent syscalls (Module 4)</li>
+<li><strong>DraugrCalculateStackSize</strong> parses the UNWIND_CODE arrays for both target functions and computes exact frame sizes in bytes (Module 5, Phase 2)</li>
+<li><strong>DraugrFindGadget</strong> scans kernelbase.dll's <code>.text</code> section for the <code>0xFF 0x23</code> byte sequence (<code>JMP [RBX]</code>) (Module 7)</li>
+<li><strong>DraugrCall</strong> packages everything into the PRM structure: Fixup address, frame sizes, target addresses, SSN, syscall address, and all function arguments (Module 5)</li>
+<li><strong>Spoof()</strong> assembly routine builds the three-layer synthetic stack: NULL terminator, 0x200 buffer, RtlUserThreadStart frame, BaseThreadInitThunk frame, gadget (Module 6)</li>
+<li><strong>Register setup</strong>: RAX = SSN, R10 = arg1, RDX = arg2, R8 = arg3, R9 = arg4, RBX = &amp;PRM. JMP to the syscall instruction in ntdll (Module 6)</li>
+<li><strong>Kernel executes</strong> the syscall. The synthetic stack is visible to any kernel-mode stack walker during this time. Return value placed in RAX.</li>
+<li><strong>Return path</strong>: RET pops gadget address &rarr; <code>JMP [RBX]</code> &rarr; Fixup deallocates synthetic stack &rarr; restores registers &rarr; JMP to original return address (Module 7)</li>
+</ol>
+</div>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Full Chain Flow Diagram</h4>
+<div class="flow">
+<div class="box">DRAUGR_SYSCALL<br><small>macro entry</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Init + SSN<br><small>resolve addresses</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">CalcSize<br><small>parse UNWIND_CODEs</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">FindGadget<br><small>scan kernelbase</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Spoof()<br><small>build stack</small></div>
+</div>
+<div class="flow" style="margin-top:10px">
+<div class="box g">syscall<br><small>kernel transition</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box r">RET<br><small>pop gadget</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">JMP [RBX]<br><small>to Fixup</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Restore<br><small>regs + stack</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Return<br><small>to caller</small></div>
+</div>
+</div>
+
+<!-- ==================== SECTION 2: What the EDR Sees ==================== -->
+<h2>What the EDR Sees</h2>
+<p>The entire point of Draugr is to change what the EDR observes when it walks the call stack during a syscall. Here is the before-and-after comparison.</p>
+
+<div class="versus">
+<div class="card" style="border-left:3px solid var(--red)">
+<h4>Without Draugr (Detected)</h4>
+<pre><code><span class="lang-tag">Call Stack - Suspicious</span>Frame 0: ntdll!NtAllocateVirtualMemory+0x14
+Frame 1: 0x00007FFE12340000  &lt;-- UNBACKED MEMORY
+  [No module found for this address]
+  [Return address is in private RWX region]
+
+EDR Verdict: BLOCKED
+  - Return address in unbacked memory
+  - No valid RUNTIME_FUNCTION for caller
+  - Shellcode injection detected</code></pre>
+</div>
+
+<div class="card" style="border-left:3px solid var(--green)">
+<h4>With Draugr (Legitimate)</h4>
+<pre><code><span class="lang-tag">Call Stack - Clean</span>Frame 0: ntdll!NtAllocateVirtualMemory+0x14
+Frame 1: kernel32!BaseThreadInitThunk+0x14
+Frame 2: ntdll!RtlUserThreadStart+0x21
+Frame 3: 0x0000000000000000 (end of stack)
+
+EDR Verdict: ALLOWED
+  - All return addresses in signed modules
+  - Standard thread initialization chain
+  - Matches expected Windows thread pattern</code></pre>
+</div>
+</div>
+
+<div class="card">
+<h4>Why This Fools the EDR</h4>
+<p>The synthetic stack replicates the exact pattern that every legitimate Windows thread produces. The EDR's call stack analysis checks three things: (1) all return addresses resolve to known modules, (2) each frame has valid UNWIND_INFO, and (3) the chain terminates properly. Draugr satisfies all three checks. The return addresses are in kernel32.dll and ntdll.dll (signed Microsoft DLLs), the frame sizes match the UNWIND_CODEs exactly, and the NULL terminator provides a clean end-of-stack signal.</p>
+</div>
+
+<!-- ==================== SECTION 3: Intel CET & Shadow Stacks ==================== -->
+<h2>Intel CET &amp; Shadow Stacks</h2>
+
+<div class="card warn">
+<h4>CRITICAL LIMITATION: CET Breaks Draugr</h4>
+<p>Intel Control-flow Enforcement Technology (CET) introduces a <strong>hardware shadow stack</strong> that fundamentally defeats all stack spoofing techniques, including Draugr. This is the single most important limitation of the entire approach.</p>
+</div>
+
+<div class="card">
+<h4>How Shadow Stacks Work</h4>
+<table>
+<tr><th>Operation</th><th>Regular Stack</th><th>Shadow Stack</th></tr>
+<tr><td><code>CALL</code></td><td>Pushes return address to [RSP]</td><td>Also pushes return address to shadow stack</td></tr>
+<tr><td><code>RET</code></td><td>Pops return address from [RSP]</td><td>Pops from shadow stack and <strong>compares</strong></td></tr>
+<tr><td>Mismatch</td><td>&mdash;</td><td>Generates <code>#CP</code> (Control Protection) exception</td></tr>
+<tr><td><code>MOV [rsp], value</code></td><td>Modifies the regular stack</td><td><strong>Does NOT modify</strong> the shadow stack</td></tr>
+</table>
+</div>
+
+<div class="card highlight">
+<h4>Why Draugr Cannot Bypass CET</h4>
+<p>Draugr writes synthetic return addresses using <code>MOV</code> instructions (e.g., <code>mov [rsp], r15</code>). These writes only affect the regular stack. The shadow stack is a <strong>separate hardware-protected memory region</strong> that can only be modified by <code>CALL</code> and <code>RET</code> instructions (or supervisor-mode instructions like <code>WRSSD</code>/<code>WRSSQ</code>). When the syscall returns and <code>RET</code> executes, the CPU compares the popped return address (the gadget) against the shadow stack entry. They will not match, because no <code>CALL</code> ever pushed the gadget address to the shadow stack. The CPU raises a <code>#CP</code> exception and the process crashes.</p>
+</div>
+
+<div class="card">
+<h4>CET Availability</h4>
+<table>
+<tr><th>Platform</th><th>CET Support</th></tr>
+<tr><td>Intel 11th Gen (Tiger Lake) and newer</td><td>Hardware support present</td></tr>
+<tr><td>AMD Zen 3 and newer</td><td>Hardware support present</td></tr>
+<tr><td>Windows 11</td><td>OS support for user-mode shadow stacks</td></tr>
+<tr><td>Windows 10</td><td>No user-mode shadow stack enforcement</td></tr>
+<tr><td>Older CPUs</td><td>No hardware support &mdash; Draugr works normally</td></tr>
+</table>
+<p style="margin-top:12px;color:var(--dim)">As of 2025, CET enforcement is still being gradually rolled out. Many enterprise endpoints run Windows 10 or have CET disabled. However, the long-term trend is clear: hardware-based call stack integrity will eventually make all user-mode stack spoofing obsolete.</p>
+</div>
+
+<!-- ==================== SECTION 4: Detection Surface ==================== -->
+<h2>Detection Surface</h2>
+<p>Even without CET, Draugr is not invisible. Multiple detection opportunities exist for defenders who know what to look for.</p>
+
+<div class="card">
+<h4>Detection Methods</h4>
+<table>
+<tr><th>Method</th><th>How It Works</th><th>Effectiveness</th></tr>
+<tr><td><strong>Semantic call chain analysis</strong></td><td>Verify that the function call sequence is logically possible. For example, <code>BaseThreadInitThunk</code> should only call thread entry points, not arbitrary syscalls. The call chain is syntactically valid but semantically wrong.</td><td>High &mdash; requires domain knowledge but catches all synthetic stacks</td></tr>
+<tr><td><strong>Intel CET / Shadow Stacks</strong></td><td>Hardware-enforced return address integrity. Synthetic addresses on the regular stack do not match shadow stack entries.</td><td>Absolute &mdash; architectural incompatibility, no user-mode bypass</td></tr>
+<tr><td><strong>Kernel ETW-TI</strong></td><td>EtwTi (Threat Intelligence) providers log thread context modifications and syscall metadata. Unusual patterns in syscall origin can be flagged.</td><td>Medium &mdash; requires analysis of telemetry streams</td></tr>
+<tr><td><strong>Gadget scanning</strong></td><td>Detect threads that have return addresses pointing to <code>JMP [RBX]</code> instructions. Legitimate code rarely returns through such gadgets.</td><td>Medium &mdash; generates false positives in ROP-heavy code</td></tr>
+<tr><td><strong>BOF artifact detection</strong></td><td>Detect COFF loading patterns in memory: RWX allocations, COFF headers, relocations applied to private memory.</td><td>Medium &mdash; detects the BOF loader, not Draugr specifically</td></tr>
+</table>
+</div>
+
+<div class="card green">
+<h4>Defense in Depth</h4>
+<p>No single detection method is foolproof (except CET). Effective defense combines multiple layers: stack semantics checking + ETW monitoring + memory region analysis + hardware enforcement. Draugr can evade any one of these in isolation, but the combination narrows the window significantly.</p>
+</div>
+
+<!-- ==================== SECTION 5: Prior Art ==================== -->
+<h2>Prior Art Evolution</h2>
+<p>Draugr did not emerge in a vacuum. It is the culmination of years of research into call stack manipulation for evasion. Each prior tool contributed a key insight.</p>
+
+<div class="card">
+<h4>Timeline of Stack Spoofing Techniques</h4>
+<table>
+<tr><th>Author / Tool</th><th>Year</th><th>Key Contribution</th></tr>
+<tr><td><strong>namazso</strong></td><td>2021</td><td>Original return address spoofing concept &mdash; first public demonstration of replacing return addresses to evade stack inspection</td></tr>
+<tr><td><strong>ThreadStackSpoofer</strong> (mgeeky)</td><td>2021</td><td>First public PoC. Overwrites the call stack during Beacon sleep to hide shellcode return addresses. Simple but effective for sleep-time evasion.</td></tr>
+<tr><td><strong>SilentMoonWalk</strong> (klezVirus)</td><td>2022</td><td>Fully dynamic approach with two modes: synthetic frame construction and thread desynchronization. First tool to parse UNWIND_CODEs for exact frame sizes.</td></tr>
+<tr><td><strong>LoudSunRun</strong> (susMdT)</td><td>2023</td><td>Direct predecessor to Draugr. Refined the synthetic frame approach and introduced the gadget-based return mechanism. Draugr extends this with BOF integration and production hardening.</td></tr>
+<tr><td><strong>WithSecure CallStackSpoofer</strong></td><td>2023</td><td>Thread context manipulation via <code>GetThreadContext</code>/<code>SetThreadContext</code> + VEH-based recovery after crashing at the fake return address.</td></tr>
+<tr><td><strong>Draugr</strong> (NtDallas)</td><td>2024</td><td>Production-quality BOF with gadget-based return, exact frame sizes from UNWIND_CODE parsing, indirect syscalls, and Cobalt Strike integration.</td></tr>
+<tr><td><strong>Cobalt Strike BeaconGate + Eden</strong></td><td>2024</td><td>Official Cobalt Strike integration. BeaconGate hooks all Beacon syscalls; Eden UDRL integrates Draugr-style spoofing into the loader itself.</td></tr>
+</table>
+</div>
+
+<!-- ==================== SECTION 6: NtDallas Ecosystem ==================== -->
+<h2>The NtDallas Ecosystem</h2>
+<p>Draugr is part of a larger collection of offensive tools by NtDallas. Together, they cover the full lifecycle of post-exploitation: loading, execution, evasion, and persistence.</p>
+
+<div class="card">
+<h4>Related Tools</h4>
+<table>
+<tr><th>Tool</th><th>Purpose</th><th>Relationship to Draugr</th></tr>
+<tr><td><strong>OdinLdr</strong></td><td>Reflective DLL loader</td><td>Integrates Draugr for stack-spoofed syscalls during reflective loading. Also includes EAF (Export Address Filtering) evasion.</td></tr>
+<tr><td><strong>BOF_Spawn</strong></td><td>Fork-and-run execution</td><td>Uses Draugr to spoof the call stack when spawning sacrificial processes for BOF execution.</td></tr>
+<tr><td><strong>Huginn</strong></td><td>Standalone COFF loader</td><td>Loads and executes COFF (BOF) files outside of Cobalt Strike, with integrated stack spoofing via Draugr.</td></tr>
+<tr><td><strong>KrakenMask</strong></td><td>Sleep obfuscation</td><td>Encrypts Beacon memory and spoofs the stack during sleep periods. Complementary to Draugr (sleep-time vs. execution-time evasion).</td></tr>
+<tr><td><strong>MemLoader</strong></td><td>In-memory PE/.NET execution</td><td>Loads and runs PE files and .NET assemblies entirely in memory, avoiding disk writes.</td></tr>
+<tr><td><strong>draugrgen</strong> (ziggoon)</td><td>BeaconGate hook generator</td><td>Automatically generates the BeaconGate hook code needed to integrate Draugr with Cobalt Strike's syscall interception.</td></tr>
+</table>
+</div>
+
+<!-- ==================== SECTION 7: Build Requirements ==================== -->
+<h2>Build Requirements</h2>
+<p>Draugr is built with MinGW and requires specific compiler versions due to assembly compatibility.</p>
+
+<div class="card warn">
+<h4>GCC Version Constraint</h4>
+<p>Draugr requires <strong>GCC 13</strong> (or earlier). GCC 14 introduced changes to inline assembly handling and register allocation that break the Spoof routine's assumptions about register preservation across inline <code>asm</code> blocks. If you build with GCC 14, the non-volatile register saves may be optimized away or reordered, causing crashes at Fixup time.</p>
+</div>
+
+<pre><code><span class="lang-tag">Shell - Building Draugr</span># Native build (requires MinGW with GCC 13)
+$ x86_64-w64-mingw32-gcc --version
+x86_64-w64-mingw32-gcc (GCC) 13.2.0
+
+$ make
+
+# Docker build (recommended for reproducibility)
+$ docker build -t draugr-build .
+$ docker run --rm -v $(pwd)/output:/output draugr-build</code></pre>
+
+<div class="card">
+<h4>Build Output</h4>
+<p>The build produces a <code>.o</code> file (COFF object) that can be loaded directly by Cobalt Strike as a BOF. The object contains all Draugr code: the C orchestration functions, the Spoof/Fixup assembly routines, and the syscall stub. No additional dependencies are required at runtime &mdash; everything is resolved dynamically from loaded system DLLs.</p>
+</div>
+
+<!-- ==================== SECTION 8: Course Complete ==================== -->
+<h2>Course Complete</h2>
+
+<div class="card" style="border:2px solid var(--accent);background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(236,72,153,.08))">
+<h4 style="background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:1.3rem">Congratulations</h4>
+<p>You have completed the Draugr course. Over eight modules, you learned:</p>
+<ul>
+<li><strong>Module 1</strong>: How EDRs use kernel callbacks and stack walking to detect shellcode</li>
+<li><strong>Module 2</strong>: Beacon Object Files &mdash; what they are, how they load, and why Draugr is a BOF</li>
+<li><strong>Module 3</strong>: x64 stack unwinding internals &mdash; RUNTIME_FUNCTION, UNWIND_INFO, and UNWIND_CODEs</li>
+<li><strong>Module 4</strong>: System Service Numbers, pattern-based SSN resolution, and indirect syscalls</li>
+<li><strong>Module 5</strong>: The five-phase execution model and the PRM data structure</li>
+<li><strong>Module 6</strong>: Three-layer synthetic stack construction with exact frame sizes</li>
+<li><strong>Module 7</strong>: The JMP [RBX] gadget, Fixup routine, and clean return mechanism</li>
+<li><strong>Module 8</strong>: End-to-end chain, CET limitations, detection surfaces, and the broader ecosystem</li>
+</ul>
+<p style="margin-top:16px"><strong>Next steps</strong>: Read the Draugr source code (<code>github.com/NtDallas/Draugr</code>), study <code>Stub.s</code> line by line, experiment with the Docker build, and explore the related tools (OdinLdr, KrakenMask). For defense, investigate CET enforcement on your endpoints and implement semantic call chain validation in your detection stack.</p>
+</div>
+
+<!-- ==================== QUIZ ==================== -->
+<div class="quiz" id="quiz8">
+<h4>Module 8 Quiz: Full Chain, Detection &amp; Ecosystem</h4>
+<div class="quiz-q" data-correct="1">
+<p>Q1: In the complete Draugr execution chain, what happens immediately after the syscall returns from the kernel?</p>
+<label data-opt="0"><input type="radio" name="q8_0"> Draugr calls DraugrInit again to verify addresses</label>
+<label data-opt="1"><input type="radio" name="q8_0"> The RET instruction pops the JMP [RBX] gadget address from RSP, then the gadget dereferences RBX to jump to the Fixup routine</label>
+<label data-opt="2"><input type="radio" name="q8_0"> A VEH handler catches an exception and restores the original stack</label>
+<label data-opt="3"><input type="radio" name="q8_0"> The thread is suspended and a timer callback restores the stack</label>
+<div class="explain">After the syscall returns, the ntdll stub's RET instruction pops the top of the synthetic stack (the gadget address) into RIP. The CPU executes JMP [RBX], which reads PRM.Fixup from offset 0x00, and jumps to the Fixup routine. No exceptions, no timers, no VEH involvement.</div>
+</div>
+<div class="quiz-q" data-correct="3">
+<p>Q2: Why does Intel CET (Control-flow Enforcement Technology) fundamentally break Draugr?</p>
+<label data-opt="0"><input type="radio" name="q8_1"> CET prevents the syscall instruction from executing</label>
+<label data-opt="1"><input type="radio" name="q8_1"> CET encrypts the stack so MOV instructions cannot write to it</label>
+<label data-opt="2"><input type="radio" name="q8_1"> CET detects the JMP [RBX] gadget as a ROP chain</label>
+<label data-opt="3"><input type="radio" name="q8_1"> CET maintains a shadow stack that is only updated by CALL/RET; Draugr writes addresses with MOV (regular stack only), so RET finds a mismatch and raises a #CP exception</label>
+<div class="explain">The hardware shadow stack records return addresses pushed by CALL. Draugr constructs its synthetic stack using MOV instructions, which only modify the regular stack. When RET executes, the CPU compares the regular stack value (gadget address) against the shadow stack value (no matching entry). The mismatch triggers a Control Protection exception (#CP), crashing the process.</div>
+</div>
+<div class="quiz-q" data-correct="2">
+<p>Q3: What distinguishes ThreadStackSpoofer from Draugr in terms of when the stack is spoofed?</p>
+<label data-opt="0"><input type="radio" name="q8_2"> ThreadStackSpoofer spoofs during API execution; Draugr spoofs during sleep</label>
+<label data-opt="1"><input type="radio" name="q8_2"> Both spoof at the same time but use different techniques</label>
+<label data-opt="2"><input type="radio" name="q8_2"> ThreadStackSpoofer only overwrites the stack during Beacon sleep periods; Draugr spoofs the stack during active API/syscall execution</label>
+<label data-opt="3"><input type="radio" name="q8_2"> There is no meaningful difference in timing</label>
+<div class="explain">ThreadStackSpoofer modifies return addresses on the existing stack while Beacon is sleeping, hiding the shellcode origin during sleep-time stack scans. Draugr constructs an entirely synthetic stack that is active during the actual syscall execution. This means Draugr protects against stack inspection that happens during API calls (e.g., kernel callbacks), while ThreadStackSpoofer only protects during sleep.</div>
+</div>
+<div class="quiz-q" data-correct="0">
+<p>Q4: Which tool from the NtDallas ecosystem handles sleep-time memory encryption, complementing Draugr's execution-time stack spoofing?</p>
+<label data-opt="0"><input type="radio" name="q8_3"> KrakenMask</label>
+<label data-opt="1"><input type="radio" name="q8_3"> OdinLdr</label>
+<label data-opt="2"><input type="radio" name="q8_3"> Huginn</label>
+<label data-opt="3"><input type="radio" name="q8_3"> MemLoader</label>
+<div class="explain">KrakenMask handles sleep obfuscation: it encrypts Beacon memory and spoofs the call stack during sleep periods. This complements Draugr, which handles execution-time evasion. Together, they cover both phases: the Beacon is protected while sleeping (KrakenMask) and while executing syscalls (Draugr).</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz8')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module7.html">&larr; Prev: Gadgets &amp; Clean Return</a>
+<a class="primary" href="../Draugr_index.html">Back to Course Home &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

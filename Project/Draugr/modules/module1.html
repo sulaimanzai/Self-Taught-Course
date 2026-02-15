@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 1: EDR Call Stack Analysis - Draugr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2694;&#xFE0F;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#a855f7;--accent2:#ec4899;--gradient:linear-gradient(135deg,#a855f7,#ec4899)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Draugr Course</h2>
+<span>Synthetic Stack Frame Evasion</span>
+</div>
+<a class="home-link" href="../Draugr_index.html">&larr; Course Home</a>
+<a class="mod-link active" href="module1.html"><span>1. EDR Call Stack Analysis</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. Beacon Object Files</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. x64 Stack Unwinding</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. SSN &amp; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Spoof Assembly Routine</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. Synthetic Frame Construction</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Gadgets &amp; Clean Return</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Full Chain &amp; Detection</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 1: EDR Call Stack Analysis</h1>
+<p class="subtitle">Every API call leaves a trail of return addresses. EDRs read that trail like a forensic report.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Before understanding <strong>how</strong> Draugr spoofs the call stack, you need to understand <strong>what</strong> EDRs look at when your code makes a sensitive API call. This module covers kernel callbacks, stack walking, backed vs unbacked memory, and why shellcode can never hide from call stack inspection &mdash; unless you construct synthetic frames.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. What EDRs See When Code Runs</h2>
+
+<p>Modern EDR products don't just scan files on disk. They install <strong>kernel-mode drivers</strong> that subscribe to a set of <strong>notification callbacks</strong> built into the Windows kernel. These callbacks fire in the context of the calling thread, giving the EDR direct access to the thread's user-mode stack.</p>
+
+<div class="card">
+<h4>Key Kernel Callbacks</h4>
+<table>
+<tr><th>Callback Registration</th><th>Triggers On</th><th>What EDR Inspects</th></tr>
+<tr><td><code>PsSetCreateProcessNotifyRoutine</code></td><td>Process creation / exit</td><td>Parent PID, image path, command line</td></tr>
+<tr><td><code>PsSetCreateThreadNotifyRoutine</code></td><td>Thread creation / exit</td><td>Start address, thread context</td></tr>
+<tr><td><code>PsSetLoadImageNotifyRoutine</code></td><td>DLL / image load</td><td>Image name, base address, size</td></tr>
+<tr><td><code>ObRegisterCallbacks</code></td><td>Handle operations (open/duplicate)</td><td>Desired access mask, target process</td></tr>
+<tr><td><code>CmRegisterCallbackEx</code></td><td>Registry operations</td><td>Key path, value data</td></tr>
+</table>
+</div>
+
+<p>The critical detail: when <code>ObRegisterCallbacks</code> fires because your code called <code>NtOpenProcess</code> with <code>PROCESS_ALL_ACCESS</code>, the callback executes <strong>on your thread</strong>. The EDR kernel driver can read your thread's user-mode stack directly from kernel mode. It doesn't need to inject anything &mdash; it's already running in your context.</p>
+
+<div class="card warn">
+<h4>Why This Matters for Attackers</h4>
+<p>You cannot avoid these callbacks by being clever in user mode. They fire in Ring 0. The only question is: <strong>what does the EDR see when it inspects your call stack?</strong> If it sees return addresses pointing into unbacked heap memory, you are caught. Draugr exists to control exactly what the EDR finds when it walks your stack.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Stack Walking with RtlWalkFrameChain</h2>
+
+<p>When the kernel callback fires, the EDR calls one of two APIs to capture the current thread's stack frames:</p>
+
+<pre><code><span class="lang-tag">C (Kernel Mode)</span>// Captures an array of return addresses from the current call stack
+ULONG RtlWalkFrameChain(
+    PVOID  *Callers,     // Output: array of return addresses
+    ULONG  Count,        // Max frames to capture
+    ULONG  Flags         // 0 = kernel frames, 1 = user frames
+);
+
+// Alternative: captures from the calling thread's stack
+USHORT RtlCaptureStackBackTrace(
+    ULONG  FramesToSkip,
+    ULONG  FramesToCapture,
+    PVOID  *BackTrace,
+    PULONG BackTraceHash
+);</code></pre>
+
+<p>Both functions return an array of <strong>return addresses</strong>. Each return address is the instruction pointer (RIP) that will be returned to when the current function completes. The EDR iterates through this array and, for each address, determines which module it belongs to.</p>
+
+<div class="card">
+<h4>Stack Walk Resolution</h4>
+<div class="flow">
+<div class="box">Callback fires<br><small>(kernel context)</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">RtlWalkFrameChain<br><small>(capture return addrs)</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">For each address:<br><small>find owning module</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box r">Check: backed or<br>unbacked memory?</div>
+</div>
+</div>
+
+<p>The EDR checks each return address against the list of loaded modules (from the PEB's <code>InMemoryOrderModuleList</code> or via <code>MmGetSystemAddressForMdl</code>). If a return address falls within <code>ntdll.dll</code>, <code>kernel32.dll</code>, or <code>kernelbase.dll</code>, that's expected. If it falls in a region that isn't mapped to any file on disk, that's a problem.</p>
+
+<!-- ============================================================ -->
+<h2>3. Backed vs Unbacked Memory</h2>
+
+<p>This distinction is the foundation of call stack-based detection:</p>
+
+<div class="versus">
+<div>
+<h5 style="color:var(--green)">Backed Memory (Legitimate)</h5>
+<ul>
+<li>Memory-mapped from a file on disk (DLL, EXE, SYS)</li>
+<li>Has a corresponding entry in the VAD tree with a file object</li>
+<li>Examples: ntdll.dll .text section, kernel32.dll code</li>
+<li>Return addresses here are expected and normal</li>
+<li>EDR can verify the on-disk file matches the in-memory content</li>
+</ul>
+</div>
+<div>
+<h5 style="color:var(--red)">Unbacked Memory (Suspicious)</h5>
+<ul>
+<li>Allocated with <code>VirtualAlloc</code> / <code>NtAllocateVirtualMemory</code></li>
+<li>No file mapping &mdash; exists only in RAM</li>
+<li>Examples: shellcode buffers, BOF memory, injected code</li>
+<li>Return addresses here indicate code running from dynamic allocation</li>
+<li>Primary indicator of malicious in-memory execution</li>
+</ul>
+</div>
+</div>
+
+<p>When the EDR walks your call stack and finds a return address like <code>0x000001A4F2C01337</code>, it checks: does this address fall within any loaded module's address range? If not, it checks the VAD (Virtual Address Descriptor) tree. If the VAD entry shows <code>MEM_PRIVATE</code> with no file backing, the verdict is clear: <strong>code is executing from unbacked memory</strong>.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">Call Stack Comparison: Legitimate vs Suspicious</h4>
+<div style="display:flex;gap:30px;justify-content:center;flex-wrap:wrap">
+<div style="flex:1;min-width:260px">
+<p style="text-align:center;color:var(--green);font-weight:700;margin-bottom:10px">Legitimate Call Stack</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box g" style="width:100%">ntdll!NtOpenProcess <small>(backed: ntdll.dll)</small></div>
+<div class="box g" style="width:100%">KERNELBASE!OpenProcess <small>(backed: kernelbase.dll)</small></div>
+<div class="box g" style="width:100%">kernel32!OpenProcessStub <small>(backed: kernel32.dll)</small></div>
+<div class="box g" style="width:100%">myapp.exe!main <small>(backed: myapp.exe)</small></div>
+</div>
+</div>
+<div style="flex:1;min-width:260px">
+<p style="text-align:center;color:var(--red);font-weight:700;margin-bottom:10px">Suspicious Call Stack</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box g" style="width:100%">ntdll!NtOpenProcess <small>(backed: ntdll.dll)</small></div>
+<div class="box r" style="width:100%">0x1A4F2C01337 <small>(UNBACKED: VirtualAlloc)</small></div>
+<div class="box r" style="width:100%">0x1A4F2C00100 <small>(UNBACKED: shellcode entry)</small></div>
+</div>
+</div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. What a Legitimate Call Stack Looks Like</h2>
+
+<p>Every Windows thread begins execution at the same two functions. This is hardcoded into the operating system's thread initialization path and is the same for every process on every Windows version:</p>
+
+<pre><code><span class="lang-tag">Call Stack</span>// Every normal thread in Windows starts with this exact chain:
+ntdll!RtlUserThreadStart         ; Thread entry point (set by kernel)
+  ntdll!BaseThreadInitThunk      ; Called by RtlUserThreadStart (kernel32 forwarded)
+    application!actual_function  ; The function passed to CreateThread()
+      ...                        ; Whatever the function calls</code></pre>
+
+<p>When a thread calls <code>NtAllocateVirtualMemory</code>, the EDR expects to see a call stack that terminates with <code>RtlUserThreadStart</code> at the bottom and <code>BaseThreadInitThunk</code> above it. These two functions are the <strong>anchor frames</strong> that prove the thread was legitimately created by the OS.</p>
+
+<div class="card">
+<h4>The Standard Thread Init Chain</h4>
+<table>
+<tr><th>Frame</th><th>Function</th><th>Module</th><th>Role</th></tr>
+<tr><td>Bottom</td><td><code>RtlUserThreadStart</code></td><td>ntdll.dll</td><td>Kernel sets RIP to this on thread creation</td></tr>
+<tr><td>Bottom + 1</td><td><code>BaseThreadInitThunk</code></td><td>kernel32.dll</td><td>Calls the user-supplied thread start routine</td></tr>
+<tr><td>...</td><td><em>user code</em></td><td>varies</td><td>The actual application logic</td></tr>
+<tr><td>Top</td><td><em>current function</em></td><td>varies</td><td>Where execution is right now</td></tr>
+</table>
+</div>
+
+<p>EDRs validate this pattern. If the bottom two frames are missing, if they're in the wrong order, or if there's unbacked memory between the Nt* call and <code>BaseThreadInitThunk</code>, the call stack is flagged as anomalous.</p>
+
+<!-- ============================================================ -->
+<h2>5. The Problem for Shellcode and BOFs</h2>
+
+<p>When shellcode or a Beacon Object File calls a sensitive API like <code>NtAllocateVirtualMemory</code>, the call stack reveals the truth:</p>
+
+<pre><code><span class="lang-tag">Suspicious Stack</span>// Shellcode calling NtAllocateVirtualMemory via indirect syscall:
+ntdll!NtAllocateVirtualMemory     ; syscall stub (return addr in ntdll = good)
+0x00000234A8001200                ; UNBACKED - shellcode called the stub
+0x00000234A8000050                ; UNBACKED - shellcode entry point
+                                  ; Missing: RtlUserThreadStart, BaseThreadInitThunk!</code></pre>
+
+<div class="card warn">
+<h4>Indirect Syscalls Do NOT Solve This</h4>
+<p>Even with indirect syscalls (jumping to the <code>syscall</code> instruction inside ntdll), the <strong>caller's return address</strong> is still in unbacked memory. The syscall itself originates from ntdll (passing InstrumentationCallback checks), but the call stack one frame up reveals unbacked memory. EDR kernel callbacks see the entire stack, not just the top frame.</p>
+</div>
+
+<p>This is the fundamental problem. Every technique that runs code from dynamically allocated memory &mdash; shellcode, BOFs, reflective DLLs &mdash; produces a call stack with unbacked return addresses. Direct syscalls, indirect syscalls, and even simple function pointer calls all have the same weakness: the <strong>return address chain</strong> exposes the true origin of the call.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">Why Indirect Syscalls Still Fail Stack Analysis</h4>
+<div class="flow">
+<div class="box">Shellcode in<br>unbacked memory</div>
+<div class="arrow">&rarr;</div>
+<div class="box">JMP to ntdll<br>syscall;ret</div>
+<div class="arrow">&rarr;</div>
+<div class="box g">syscall from ntdll<br><small>(InstrumentationCB: PASS)</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box r">Stack walk finds<br>unbacked caller<br><small>(Stack analysis: FAIL)</small></div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. ETW and Kernel-Level Telemetry</h2>
+
+<p>Beyond call stack analysis, EDRs also leverage <strong>Event Tracing for Windows (ETW)</strong> and the <strong>Microsoft-Windows-Threat-Intelligence</strong> (EtwTi) provider. This kernel-level telemetry is separate from stack walking and monitors specific API patterns:</p>
+
+<div class="card">
+<h4>Key Telemetry Sources for EDRs</h4>
+<table>
+<tr><th>Source</th><th>What It Reports</th><th>Draugr Relevance</th></tr>
+<tr><td><strong>EtwTi Provider</strong></td><td>VirtualAlloc with RWX, cross-process writes, handle operations</td><td>Draugr doesn't suppress ETW &mdash; it only fixes the call stack</td></tr>
+<tr><td><strong>Kernel Callbacks</strong></td><td>Process/thread creation, image loads, handle ops</td><td>These are where stack walking occurs</td></tr>
+<tr><td><strong>InstrumentationCallback</strong></td><td>Validates syscall return addresses</td><td>Solved by indirect syscall (return addr in ntdll)</td></tr>
+<tr><td><strong>AMSI / Script Logging</strong></td><td>PowerShell, .NET, script content scanning</td><td>Not relevant &mdash; BOFs are native code</td></tr>
+</table>
+</div>
+
+<p>It is important to understand that Draugr addresses a <strong>specific detection surface</strong>: call stack analysis during kernel callbacks. It does not suppress ETW telemetry, avoid kernel callback registration, or interfere with other detection layers. A comprehensive evasion strategy would combine Draugr's stack spoofing with additional techniques for ETW and other telemetry sources.</p>
+
+<h3>Key Terminology</h3>
+
+<table>
+<tr><th>Term</th><th>Definition</th></tr>
+<tr><td><strong>Backed Memory</strong></td><td>Virtual memory region mapped from a file on disk (DLL, EXE, SYS). Has a file object in the VAD tree.</td></tr>
+<tr><td><strong>Unbacked Memory</strong></td><td>Virtual memory allocated with VirtualAlloc/NtAllocateVirtualMemory. No file mapping &mdash; exists only in RAM.</td></tr>
+<tr><td><strong>VAD Tree</strong></td><td>Virtual Address Descriptor tree &mdash; kernel data structure tracking all virtual memory regions in a process.</td></tr>
+<tr><td><strong>Synthetic Frame</strong></td><td>A stack frame manually constructed to mimic a real function call, without an actual CALL instruction having occurred.</td></tr>
+<tr><td><strong>Anchor Frames</strong></td><td>RtlUserThreadStart and BaseThreadInitThunk &mdash; the two bottom frames every Windows thread should have.</td></tr>
+<tr><td><strong>Stack Walking</strong></td><td>The process of iterating through return addresses on the stack to reconstruct the call chain.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>7. What Draugr Does</h2>
+
+<div class="card green">
+<h4>The Draugr Solution: Synthetic Stack Frames</h4>
+<p>Draugr constructs <strong>synthetic stack frames</strong> on the stack before executing a syscall. These frames make the call stack look exactly like what a normal Windows thread produces:</p>
+<pre><code><span class="lang-tag">Spoofed Stack (what the EDR sees)</span>ntdll!NtAllocateVirtualMemory     ; The actual syscall
+kernel32!BaseThreadInitThunk      ; SYNTHETIC FRAME (Draugr placed this)
+ntdll!RtlUserThreadStart          ; SYNTHETIC FRAME (Draugr placed this)
+                                  ; Clean termination - looks like normal thread init</code></pre>
+<p style="margin-top:12px;">The frames are <strong>"synthetic"</strong> because no real CALL instruction created them. Draugr manually writes return addresses and adjusts RSP so that the stack walker's unwind logic produces exactly the right sequence. The key insight: the stack walker doesn't verify that a CALL actually occurred &mdash; it just follows RUNTIME_FUNCTION metadata to compute frame sizes and locate return addresses.</p>
+</div>
+
+<p>Draugr's approach is fundamentally different from timer-based stack spoofing (like ThreadStackSpoofer). Instead of spoofing the stack only during sleep, Draugr spoofs the stack <strong>at the exact moment of the sensitive API call</strong> &mdash; when the kernel callback fires and the EDR inspects the stack.</p>
+
+<div class="card">
+<h4>Draugr vs Other Approaches</h4>
+<table>
+<tr><th>Technique</th><th>When Stack is Spoofed</th><th>Survives Kernel Callback?</th></tr>
+<tr><td>ThreadStackSpoofer</td><td>During sleep only</td><td style="color:var(--red)">No &mdash; stack is real during API calls</td></tr>
+<tr><td>SilentMoonWalk</td><td>During API call</td><td style="color:var(--green)">Yes &mdash; synthetic frames at call time</td></tr>
+<tr><td><strong>Draugr</strong></td><td>During API call</td><td style="color:var(--green)">Yes &mdash; synthetic frames at call time</td></tr>
+<tr><td>LayeredSyscall</td><td>Inherently real stack</td><td style="color:var(--green)">Yes &mdash; uses real API chain</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz" id="quiz1">
+<h4>Module 1 Quiz: EDR Call Stack Analysis</h4>
+
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why can EDR kernel callbacks inspect a user-mode thread's call stack?</p>
+<label data-opt="0"><input type="radio" name="q1_0"> The EDR injects a DLL into the process first</label>
+<label data-opt="1"><input type="radio" name="q1_0"> The callback uses ReadProcessMemory to read the stack</label>
+<label data-opt="2"><input type="radio" name="q1_0"> The callback executes in the context of the calling thread, giving direct access to its stack</label>
+<label data-opt="3"><input type="radio" name="q1_0"> Windows copies the stack to kernel memory before invoking callbacks</label>
+<div class="explain">Kernel callbacks like those registered via ObRegisterCallbacks execute on the same thread that triggered the event. Since the kernel has full access to the thread's user-mode stack, no injection or inter-process reads are needed. The EDR simply calls RtlWalkFrameChain with Flags=1 to walk user-mode frames.</div>
+</div>
+
+<div class="quiz-q" data-correct="1">
+<p>Q2: What is the primary indicator EDRs use to detect shellcode during call stack analysis?</p>
+<label data-opt="0"><input type="radio" name="q2_0"> The syscall instruction is executed from user code</label>
+<label data-opt="1"><input type="radio" name="q2_0"> Return addresses point to unbacked (non-file-mapped) memory regions</label>
+<label data-opt="2"><input type="radio" name="q2_0"> The thread's start address is suspicious</label>
+<label data-opt="3"><input type="radio" name="q2_0"> The process has RWX memory pages</label>
+<div class="explain">The primary signal from call stack analysis is return addresses in unbacked memory. Backed memory is mapped from a file on disk (DLLs, EXEs). Unbacked memory (VirtualAlloc'd regions) containing executable code with return addresses on the stack is the strongest indicator of in-memory shellcode or injected code.</div>
+</div>
+
+<div class="quiz-q" data-correct="3">
+<p>Q3: What two functions form the expected bottom of every normal Windows thread's call stack?</p>
+<label data-opt="0"><input type="radio" name="q3_0"> kernel32!CreateThread and ntdll!NtCreateThreadEx</label>
+<label data-opt="1"><input type="radio" name="q3_0"> ntdll!LdrInitializeThunk and ntdll!NtContinue</label>
+<label data-opt="2"><input type="radio" name="q3_0"> kernel32!BaseThreadInitThunk and kernelbase!CreateThread</label>
+<label data-opt="3"><input type="radio" name="q3_0"> ntdll!RtlUserThreadStart and kernel32!BaseThreadInitThunk</label>
+<div class="explain">Every Windows thread begins at ntdll!RtlUserThreadStart (the kernel sets the initial RIP to this function) which then calls kernel32!BaseThreadInitThunk, which in turn calls the user-supplied thread start routine. EDRs expect to see these two frames at the bottom of every thread's call stack. Draugr's synthetic frames replicate exactly this pattern.</div>
+</div>
+
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<span></span>
+<a class="primary" href="module2.html">Next: Beacon Object Files &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

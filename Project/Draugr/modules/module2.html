@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 2: Beacon Object Files (BOFs) - Draugr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2694;&#xFE0F;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#a855f7;--accent2:#ec4899;--gradient:linear-gradient(135deg,#a855f7,#ec4899)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Draugr Course</h2>
+<span>Synthetic Stack Frame Evasion</span>
+</div>
+<a class="home-link" href="../Draugr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. EDR Call Stack Analysis</span><span class="diff d1">d1</span></a>
+<a class="mod-link active" href="module2.html"><span>2. Beacon Object Files</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. x64 Stack Unwinding</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. SSN &amp; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Spoof Assembly Routine</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. Synthetic Frame Construction</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Gadgets &amp; Clean Return</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Full Chain &amp; Detection</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 2: Beacon Object Files (BOFs)</h1>
+<p class="subtitle">Tiny compiled objects that run inside Beacon itself &mdash; no new process, no DLL, no disk artifacts.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Draugr is delivered as a <strong>Beacon Object File</strong>. Understanding what BOFs are, how Cobalt Strike loads and executes them, and why they're preferred over alternatives is essential context for the rest of this course. This module covers the COFF format, the BOF lifecycle, the BOF API, and why Draugr's design as a BOF creates specific constraints and advantages.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. What Is a BOF?</h2>
+
+<p>A <strong>Beacon Object File (BOF)</strong> is a compiled C/C++ object file in <strong>COFF (Common Object File Format)</strong> that runs directly inside the Cobalt Strike Beacon process. The key distinction: it is an <strong>object file</strong> (<code>.o</code>), not a linked executable or DLL.</p>
+
+<p>When you compile C code normally, the compiler produces an object file, then the <strong>linker</strong> resolves external symbols (function addresses, global variables) and produces a final PE executable. With BOFs, you skip the linker entirely. You compile to <code>.o</code> and send the raw object file to Beacon over the C2 channel. <strong>Beacon itself acts as the linker</strong>, resolving symbols at runtime.</p>
+
+<pre><code><span class="lang-tag">Compilation</span>// Normal compilation: compiler + linker
+cl.exe /c bof.c          // Produces bof.obj (COFF object file)
+link.exe bof.obj ...     // Linker resolves symbols, produces bof.exe
+
+// BOF compilation: compiler only, no linking
+x86_64-w64-mingw32-gcc -c bof.c -o bof.o
+// That's it. Send bof.o to Beacon. Beacon IS the linker.</code></pre>
+
+<div class="card">
+<h4>COFF Object File Structure</h4>
+<table>
+<tr><th>Component</th><th>Purpose</th></tr>
+<tr><td>COFF Header</td><td>Machine type, number of sections, timestamp</td></tr>
+<tr><td>Section Table</td><td>Entries for .text (code), .data, .rdata, .reloc</td></tr>
+<tr><td>.text Section</td><td>Compiled machine code of your BOF functions</td></tr>
+<tr><td>.data / .rdata</td><td>Initialized data, string literals, constants</td></tr>
+<tr><td>Symbol Table</td><td>Function names, external references (imports)</td></tr>
+<tr><td>Relocation Table</td><td>Tells Beacon where to patch addresses after loading</td></tr>
+</table>
+</div>
+
+<p>Because it's a raw object file, a BOF is extremely small. A typical BOF that performs process injection might be <strong>3-5 KB</strong>. Compare that to a reflective DLL (50-200 KB) or a .NET assembly (100 KB+). Less data over the C2 wire means less opportunity for network detection.</p>
+
+<!-- ============================================================ -->
+<h2>2. Why BOFs Matter</h2>
+
+<p>BOFs were introduced in Cobalt Strike 4.1 as an alternative to existing post-exploitation mechanisms. Here's how they compare:</p>
+
+<div class="versus">
+<div>
+<h5 style="color:var(--green)">Beacon Object File (BOF)</h5>
+<ul>
+<li>Runs inside Beacon's own process and thread</li>
+<li>Typically 3-10 KB compiled size</li>
+<li>No child process creation</li>
+<li>No DLL injection or reflective loading</li>
+<li>No disk artifacts whatsoever</li>
+<li>Memory freed immediately after execution</li>
+<li>Single-threaded: blocks Beacon during execution</li>
+</ul>
+</div>
+<div>
+<h5 style="color:var(--red)">Reflective DLL / execute-assembly</h5>
+<ul>
+<li>Often spawns a sacrificial process (fork&amp;run)</li>
+<li>50-200+ KB typical size</li>
+<li>Process creation events trigger EDR callbacks</li>
+<li>execute-assembly loads the CLR into memory</li>
+<li>May leave .NET metadata artifacts</li>
+<li>Memory persists until sacrificial process exits</li>
+<li>Can run asynchronously in separate process</li>
+</ul>
+</div>
+</div>
+
+<div class="card">
+<h4>IOC (Indicator of Compromise) Comparison</h4>
+<table>
+<tr><th>IOC Type</th><th>BOF</th><th>Reflective DLL</th><th>execute-assembly</th></tr>
+<tr><td>Child process</td><td style="color:var(--green)">None</td><td style="color:var(--dim)">Optional (fork&amp;run)</td><td style="color:var(--red)">Yes (sacrificial)</td></tr>
+<tr><td>Cross-process injection</td><td style="color:var(--green)">None</td><td style="color:var(--red)">Yes</td><td style="color:var(--red)">Yes</td></tr>
+<tr><td>CLR/.NET load</td><td style="color:var(--green)">None</td><td style="color:var(--green)">None</td><td style="color:var(--red)">Yes</td></tr>
+<tr><td>Network footprint</td><td style="color:var(--green)">~3 KB</td><td style="color:var(--dim)">~100 KB</td><td style="color:var(--red)">~200+ KB</td></tr>
+<tr><td>Disk artifacts</td><td style="color:var(--green)">None</td><td style="color:var(--green)">None</td><td style="color:var(--dim)">Possible (.NET files)</td></tr>
+<tr><td>Memory lifetime</td><td style="color:var(--green)">Freed after run</td><td style="color:var(--dim)">Until process exit</td><td style="color:var(--dim)">Until process exit</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. BOF Lifecycle</h2>
+
+<p>The journey from C source code to in-memory execution follows a specific path:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">BOF Execution Lifecycle</h4>
+<div class="flow">
+<div class="box">Operator writes<br>BOF in C/C++</div>
+<div class="arrow">&rarr;</div>
+<div class="box">Compile with MinGW<br><small>gcc -c bof.c -o bof.o</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Send .o over<br>C2 channel</div>
+<div class="arrow">&rarr;</div>
+<div class="box">Beacon parses<br>COFF sections</div>
+</div>
+<div class="flow" style="margin-top:10px;">
+<div class="box">Allocate memory<br>for .text + .data</div>
+<div class="arrow">&rarr;</div>
+<div class="box">Resolve imports<br><small>(symbol table)</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Apply relocations<br><small>(patch addresses)</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Call go() entry<br><small>(BOF executes)</small></div>
+</div>
+</div>
+
+<p>Step by step:</p>
+<ol style="padding-left:20px;line-height:2.2;">
+<li><strong>Parse COFF header</strong> &mdash; Beacon reads the section table to determine how much memory to allocate for code (.text) and data (.data, .rdata).</li>
+<li><strong>Allocate memory</strong> &mdash; Beacon allocates RWX memory inside its own process for the BOF's sections. The code section needs to be executable.</li>
+<li><strong>Copy sections</strong> &mdash; Raw bytes from each COFF section are copied into the allocated memory.</li>
+<li><strong>Resolve symbols</strong> &mdash; External symbols (like <code>KERNEL32$VirtualAlloc</code>) are resolved using <code>GetProcAddress</code>. The BOF naming convention <code>MODULE$Function</code> tells Beacon which DLL to search.</li>
+<li><strong>Apply relocations</strong> &mdash; Beacon processes the relocation table to patch absolute addresses, function pointers, and data references.</li>
+<li><strong>Execute</strong> &mdash; Beacon calls the <code>go()</code> entry point. The BOF runs synchronously on Beacon's thread.</li>
+<li><strong>Cleanup</strong> &mdash; After <code>go()</code> returns, Beacon collects any output and frees the allocated memory.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2>4. BOF API</h2>
+
+<p>Cobalt Strike provides a small API for BOFs to interact with Beacon. These functions are available without any linking &mdash; Beacon resolves them during the symbol resolution phase:</p>
+
+<pre><code><span class="lang-tag">C (BOF API)</span>// Output functions - send data back to the operator
+void   BeaconPrintf(int type, char *fmt, ...);   // printf-style output
+void   BeaconOutput(int type, char *data, int len); // raw data output
+
+// Argument parsing - process args sent with the BOF command
+void   BeaconDataParse(datap *parser, char *buffer, int size);
+char*  BeaconDataExtract(datap *parser, int *size);
+int    BeaconDataInt(datap *parser);
+short  BeaconDataShort(datap *parser);
+
+// Format buffer - build structured output
+void   BeaconFormatAlloc(formatp *format, int maxsz);
+void   BeaconFormatPrintf(formatp *format, char *fmt, ...);
+void   BeaconFormatFree(formatp *format);
+char*  BeaconFormatToString(formatp *format, int *size);</code></pre>
+
+<h3>Dynamic Function Resolution</h3>
+
+<p>BOFs resolve Win32 API functions using a special naming convention. Instead of linking against import libraries, you declare functions with the <code>MODULE$Function</code> syntax:</p>
+
+<pre><code><span class="lang-tag">C (BOF Imports)</span>// Declaration syntax: DECLSPEC_IMPORT tells the compiler this is external
+// The symbol name MODULE$Function tells Beacon where to find it
+
+DECLSPEC_IMPORT HANDLE WINAPI KERNEL32$GetProcessHeap();
+DECLSPEC_IMPORT LPVOID WINAPI KERNEL32$HeapAlloc(HANDLE, DWORD, SIZE_T);
+DECLSPEC_IMPORT NTSTATUS NTAPI NTDLL$NtAllocateVirtualMemory(
+    HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG
+);
+DECLSPEC_IMPORT HMODULE WINAPI KERNEL32$GetModuleHandleA(LPCSTR);
+
+// Usage in your BOF code:
+void go(char *args, int len) {
+    HANDLE heap = KERNEL32$GetProcessHeap();
+    LPVOID mem = KERNEL32$HeapAlloc(heap, 0, 4096);
+    BeaconPrintf(CALLBACK_OUTPUT, "Allocated at: %p", mem);
+}</code></pre>
+
+<div class="card">
+<h4>Symbol Resolution Rules</h4>
+<table>
+<tr><th>Symbol Format</th><th>Resolution Method</th><th>Example</th></tr>
+<tr><td><code>MODULE$Function</code></td><td><code>GetProcAddress(LoadLibrary("MODULE"), "Function")</code></td><td><code>KERNEL32$VirtualAlloc</code></td></tr>
+<tr><td><code>__imp_BeaconPrintf</code></td><td>Beacon internal function table</td><td>BOF API functions</td></tr>
+<tr><td><code>__imp_MODULE$Function</code></td><td>Same as MODULE$Function (alternate form)</td><td><code>__imp_NTDLL$NtClose</code></td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Single-Threaded Execution</h2>
+
+<p>A critical BOF constraint: BOFs execute <strong>synchronously on Beacon's main thread</strong>. While your BOF runs, Beacon cannot process new commands, check in with the team server, or do anything else. It is completely blocked.</p>
+
+<div class="card warn">
+<h4>BOF Execution Constraints</h4>
+<ul style="padding-left:20px;line-height:2;">
+<li><strong>No async operations</strong> &mdash; BOFs should complete quickly (seconds, not minutes)</li>
+<li><strong>No sleeping</strong> &mdash; Calling <code>Sleep()</code> inside a BOF freezes Beacon entirely</li>
+<li><strong>No threads</strong> &mdash; Creating threads from a BOF is dangerous (memory is freed when go() returns)</li>
+<li><strong>Crash = Beacon death</strong> &mdash; An unhandled exception in a BOF kills the entire Beacon process</li>
+<li><strong>No SEH</strong> &mdash; Structured Exception Handling is unreliable in BOF context</li>
+</ul>
+</div>
+
+<p>This constraint is exactly why Draugr's approach is superior to timer-based stack spoofing. Timer-based approaches (like ThreadStackSpoofer) use a secondary thread with a timer callback to overwrite the stack during sleep. This is inherently slow and introduces timing windows. Draugr's synthetic frames are constructed and torn down in <strong>microseconds</strong> &mdash; just some stack pointer manipulation and memory writes &mdash; making it perfectly suited for the single-threaded BOF execution model.</p>
+
+<!-- ============================================================ -->
+<h2>6. Why Draugr Is a BOF</h2>
+
+<div class="card green">
+<h4>Draugr as a BOF: Design Advantages</h4>
+<p>Draugr wraps sensitive syscalls (<code>NtAllocateVirtualMemory</code>, <code>NtOpenProcess</code>, <code>NtWriteVirtualMemory</code>, etc.) with synthetic stack frames. By running as a BOF inside Beacon:</p>
+<ul style="padding-left:20px;line-height:2;margin-top:10px;">
+<li><strong>No process creation</strong> &mdash; No <code>PsSetCreateProcessNotifyRoutine</code> callbacks fired</li>
+<li><strong>No cross-process injection</strong> &mdash; No suspicious handle operations</li>
+<li><strong>Runs in Beacon's context</strong> &mdash; Syscalls originate from a process that's already running</li>
+<li><strong>Minimal memory footprint</strong> &mdash; The BOF is loaded, executes, and its memory is freed</li>
+<li><strong>Composable</strong> &mdash; Operators can call DRAUGR_SYSCALL from their own BOFs</li>
+</ul>
+</div>
+
+<p>The DRAUGR_SYSCALL and DRAUGR_API macros provide a clean interface that any BOF can use. Your BOF code calls the macro exactly like it would call the real API, and Draugr handles all the stack frame construction, syscall execution, and cleanup transparently.</p>
+
+<!-- ============================================================ -->
+<h2>7. The DRAUGR Macro Interface</h2>
+
+<p>Draugr provides two primary macros that operators use to make spoofed calls:</p>
+
+<pre><code><span class="lang-tag">C (Draugr API)</span>// For NT syscalls (NtAllocateVirtualMemory, NtOpenProcess, etc.)
+DRAUGR_SYSCALL(functionName, arg1, arg2, ...)
+
+// For Win32 API calls (VirtualProtect, WriteFile, etc.)
+DRAUGR_API(functionName, arg1, arg2, ...)</code></pre>
+
+<h3>Variadic Macro Dispatch</h3>
+
+<p>Under the hood, DRAUGR_SYSCALL and DRAUGR_API use variadic macro magic to dispatch to specialized versions based on argument count. This is necessary because the x64 calling convention places the first 4 arguments in registers (RCX, RDX, R8, R9) and additional arguments on the stack &mdash; the assembly stub needs to know exactly how many stack arguments to copy:</p>
+
+<pre><code><span class="lang-tag">C (Macro Internals)</span>// The variadic dispatch selects the right macro based on arg count
+#define DRAUGR_SYSCALL(fn, ...) \
+    DRAUGR_SYSCALL_N(__VA_ARGS__, _9, _8, _7, _6, _5, _4, _3, _2, _1, _0)(fn, __VA_ARGS__)
+
+// Each numbered variant knows exactly how many stack args to set up
+// Args 1-4:  RCX, RDX, R8, R9 (register args, no stack copy needed)
+// Args 5+:   Pushed onto the shadow stack space by the spoof routine
+
+// Example usage in a BOF:
+NTSTATUS status = DRAUGR_SYSCALL(
+    NtAllocateVirtualMemory,     // Function to call
+    processHandle,                // Arg 1 (RCX) -> goes to R10 for syscall
+    &amp;baseAddress,                 // Arg 2 (RDX)
+    0,                            // Arg 3 (R8)
+    &amp;regionSize,                  // Arg 4 (R9)
+    MEM_COMMIT | MEM_RESERVE,     // Arg 5 (stack)
+    PAGE_READWRITE                // Arg 6 (stack)
+);</code></pre>
+
+<div class="card">
+<h4>What Happens When You Call DRAUGR_SYSCALL</h4>
+<div class="flow">
+<div class="box">Macro resolves<br>function SSN</div>
+<div class="arrow">&rarr;</div>
+<div class="box">Build synthetic<br>stack frames</div>
+<div class="arrow">&rarr;</div>
+<div class="box">Copy args to<br>correct positions</div>
+<div class="arrow">&rarr;</div>
+<div class="box">JMP to ntdll<br>syscall;ret</div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Return NTSTATUS<br>to caller</div>
+</div>
+</div>
+
+<p>From the operator's perspective, it's a drop-in replacement. Replace <code>NtAllocateVirtualMemory(...)</code> with <code>DRAUGR_SYSCALL(NtAllocateVirtualMemory, ...)</code> and the call stack is automatically spoofed. No manual frame construction, no assembly knowledge required.</p>
+
+<!-- ============================================================ -->
+<div class="quiz" id="quiz1">
+<h4>Module 2 Quiz: Beacon Object Files</h4>
+
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why are BOFs typically only 3-10 KB while reflective DLLs are 50-200 KB?</p>
+<label data-opt="0"><input type="radio" name="q1_0"> BOFs use a more efficient compression algorithm</label>
+<label data-opt="1"><input type="radio" name="q1_0"> BOFs don't include executable code</label>
+<label data-opt="2"><input type="radio" name="q1_0"> BOFs are raw object files without linking &mdash; Beacon resolves imports at runtime</label>
+<label data-opt="3"><input type="radio" name="q1_0"> BOFs are compiled in release mode while DLLs are debug builds</label>
+<div class="explain">BOFs are unlinked COFF object files. They contain only the raw compiled code and a symbol table. The linker step (which normally pulls in import libraries, CRT code, and produces PE headers) is skipped entirely. Beacon acts as the linker at runtime, resolving symbols via GetProcAddress. This eliminates all the overhead of a fully linked PE.</div>
+</div>
+
+<div class="quiz-q" data-correct="0">
+<p>Q2: Why is Draugr's BOF-based approach better suited than timer-based stack spoofing for single-threaded Beacon execution?</p>
+<label data-opt="0"><input type="radio" name="q2_0"> Synthetic frames are built/torn down in microseconds, matching BOF's synchronous execution model</label>
+<label data-opt="1"><input type="radio" name="q2_0"> Timer-based spoofing requires a separate process</label>
+<label data-opt="2"><input type="radio" name="q2_0"> BOFs cannot use timers at all</label>
+<label data-opt="3"><input type="radio" name="q2_0"> Draugr uses less memory than timer callbacks</label>
+<div class="explain">BOFs run synchronously on Beacon's thread and must complete quickly. Timer-based stack spoofing uses a secondary thread with timer callbacks to overwrite the stack during sleep &mdash; this is slow and has timing windows. Draugr constructs synthetic frames via direct stack manipulation (just writing return addresses and adjusting RSP), which takes microseconds and is perfectly suited for the single-threaded, fast-execution BOF model.</div>
+</div>
+
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module1.html">&larr; Prev: EDR Call Stack Analysis</a>
+<a class="primary" href="module3.html">Next: x64 Stack Unwinding &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

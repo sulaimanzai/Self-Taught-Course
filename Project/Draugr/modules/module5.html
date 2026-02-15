@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 5: The Spoof Assembly Routine - Draugr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2694;&#xFE0F;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#a855f7;--accent2:#ec4899;--gradient:linear-gradient(135deg,#a855f7,#ec4899)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Draugr Course</h2>
+<span>Synthetic Stack Frame Evasion</span>
+</div>
+<a class="home-link" href="../Draugr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. EDR Call Stack Analysis</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. Beacon Object Files</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. x64 Stack Unwinding</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. SSN &amp; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link active" href="module5.html"><span>5. Spoof Assembly Routine</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. Synthetic Frame Construction</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Gadgets &amp; Clean Return</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Full Chain &amp; Detection</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge medium">Difficulty: Intermediate</span>
+<h1>Module 5: The Spoof Assembly Routine</h1>
+<p class="subtitle">Five phases orchestrate the entire stack spoof &mdash; from address resolution to cleanup and return.</p>
+
+<div class="card highlight">
+<h4>Module Overview</h4>
+<p>Draugr's core logic is distributed across five distinct phases. Each phase has a single responsibility: resolve addresses, calculate frame sizes, find a code gadget, build the synthetic stack and execute, then clean up. Understanding these phases is the key to understanding how every piece of the system fits together. This module covers the orchestration layer &mdash; the next modules will dive deep into the frame construction (Module 6) and the return mechanism (Module 7).</p>
+</div>
+
+<!-- ==================== SECTION 1: Five-Phase Model ==================== -->
+<h2>The Five-Phase Execution Model</h2>
+<p>Every Draugr syscall passes through five phases in strict order. If any phase fails, the syscall cannot proceed safely. The macro <code>DRAUGR_SYSCALL</code> triggers this entire pipeline.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Five-Phase Pipeline</h4>
+<div class="flow">
+<div class="box">Phase 1<br><small>DraugrInit</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Phase 2<br><small>CalcStackSize</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Phase 3<br><small>FindGadget</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Phase 4<br><small>Spoof() ASM</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Phase 5<br><small>Fixup</small></div>
+</div>
+</div>
+
+<div class="card">
+<h4>Phase Summary</h4>
+<table>
+<tr><th>Phase</th><th>Function</th><th>Responsibility</th></tr>
+<tr><td><strong>1</strong></td><td><code>DraugrInit</code></td><td>Resolve three key addresses: <code>BaseThreadInitThunk+0x14</code>, <code>RtlUserThreadStart+0x21</code>, and <code>kernelbase.dll</code> base</td></tr>
+<tr><td><strong>2</strong></td><td><code>DraugrCalculateStackSize</code></td><td>Parse UNWIND_CODE arrays for both functions to determine exact frame sizes in bytes</td></tr>
+<tr><td><strong>3</strong></td><td><code>DraugrFindGadget</code></td><td>Scan kernelbase.dll <code>.text</code> section for a <code>JMP [RBX]</code> gadget (bytes <code>0xFF 0x23</code>)</td></tr>
+<tr><td><strong>4</strong></td><td><code>Spoof()</code></td><td>Assembly routine: build three-layer synthetic stack, set up registers, execute syscall</td></tr>
+<tr><td><strong>5</strong></td><td><code>Fixup</code></td><td>Deallocate synthetic frames, restore non-volatile registers, return to original caller</td></tr>
+</table>
+</div>
+
+<!-- ==================== SECTION 2: Phase 1 ==================== -->
+<h2>Phase 1: DraugrInit &mdash; Address Resolution</h2>
+<p>Before any stack spoofing can happen, Draugr must resolve three specific addresses. These addresses form the foundation of the entire fake call stack.</p>
+
+<div class="card">
+<h4>The Three Target Addresses</h4>
+<table>
+<tr><th>Target</th><th>Why This Specific Offset</th></tr>
+<tr><td><code>kernel32!BaseThreadInitThunk + 0x14</code></td><td>Points to a <code>CALL</code> instruction within the function. When the stack unwinder encounters this as a return address, it follows the unwind metadata for <code>BaseThreadInitThunk</code> and sees a legitimate call site.</td></tr>
+<tr><td><code>ntdll!RtlUserThreadStart + 0x21</code></td><td>Points to a <code>CALL</code> instruction within the function. This is the bottom of every normal Windows thread's call stack &mdash; the function that the OS calls to start a thread.</td></tr>
+<tr><td><code>kernelbase.dll</code> base address</td><td>Needed for Phase 3 (gadget scanning). The <code>JMP [RBX]</code> gadget is found by scanning the <code>.text</code> section of this DLL.</td></tr>
+</table>
+</div>
+
+<div class="card highlight">
+<h4>Why These Offsets?</h4>
+<p>The offsets <code>+0x14</code> and <code>+0x21</code> are not arbitrary. They point to <strong>existing <code>CALL</code> instructions</strong> within each function. When an EDR's stack walker encounters these as return addresses, it performs a backward scan for a <code>CALL</code> instruction and finds a real one. If the return address pointed to the function entry instead, the stack walker would see no preceding <code>CALL</code> instruction and flag the frame as suspicious. The offsets ensure the fake return addresses appear to be <strong>genuine return sites</strong> from legitimate function calls.</p>
+</div>
+
+<pre><code><span class="lang-tag">C - DraugrInit (simplified)</span>BOOL DraugrInit(PDRAUGR_CONFIG config) {
+    // Resolve kernel32!BaseThreadInitThunk
+    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    FARPROC pBaseThreadInit = GetProcAddress(hKernel32,
+                                  "BaseThreadInitThunk");
+    config-&gt;BaseThreadInitThunk_Addr = (ULONG_PTR)pBaseThreadInit + 0x14;
+
+    // Resolve ntdll!RtlUserThreadStart
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    FARPROC pRtlUserThread = GetProcAddress(hNtdll,
+                                  "RtlUserThreadStart");
+    config-&gt;RtlUserThreadStart_Addr = (ULONG_PTR)pRtlUserThread + 0x21;
+
+    // Resolve kernelbase.dll base for gadget scanning
+    config-&gt;KernelBase_Addr = (ULONG_PTR)GetModuleHandleA(
+                                  "kernelbase.dll");
+
+    return TRUE;
+}</code></pre>
+
+<div class="card green">
+<h4>Every Thread Looks the Same</h4>
+<p>On any Windows system, every user-mode thread starts with the same bottom two frames: <code>RtlUserThreadStart</code> calls <code>BaseThreadInitThunk</code>, which calls the thread's entry point. By fabricating these exact frames, Draugr's fake stack is indistinguishable from a real thread's call stack. An EDR performing stack analysis sees the standard Windows thread initialization chain.</p>
+</div>
+
+<!-- ==================== SECTION 3: Phase 2 ==================== -->
+<h2>Phase 2: Stack Size Calculation</h2>
+<p>Each synthetic frame must be <strong>exactly the right size</strong>. If the frame for <code>BaseThreadInitThunk</code> is even one byte off, the stack unwinder will misalign and produce garbage frames. Draugr calculates these sizes by parsing the same UNWIND_CODE metadata that Windows uses internally.</p>
+
+<h3>Step 1: Get RUNTIME_FUNCTION</h3>
+<p><code>DraugrWrapperStackSize</code> calls <code>RtlLookupFunctionEntry</code> to retrieve the <code>RUNTIME_FUNCTION</code> structure for the target function. This structure points to the function's <code>UNWIND_INFO</code>, which contains the UNWIND_CODE array.</p>
+
+<pre><code><span class="lang-tag">C - DraugrWrapperStackSize</span>DWORD DraugrWrapperStackSize(ULONG_PTR functionAddr) {
+    ULONG_PTR imageBase = 0;
+
+    // RtlLookupFunctionEntry retrieves the RUNTIME_FUNCTION
+    // for any address within an x64 function
+    PRUNTIME_FUNCTION pRuntimeFunc = RtlLookupFunctionEntry(
+        functionAddr,
+        &amp;imageBase,
+        NULL    // HistoryTable - not needed
+    );
+
+    if (!pRuntimeFunc) return 0;
+
+    // Parse the UNWIND_INFO to calculate total frame size
+    return DraugrCalculateStackSize(imageBase, pRuntimeFunc);
+}</code></pre>
+
+<h3>Step 2: Parse UNWIND_CODEs</h3>
+<p><code>DraugrCalculateStackSize</code> iterates through the UNWIND_CODE array and accumulates the total bytes that the function's prologue allocates on the stack. Each opcode type contributes a different amount.</p>
+
+<pre><code><span class="lang-tag">C - DraugrCalculateStackSize (core logic)</span>DWORD DraugrCalculateStackSize(ULONG_PTR imageBase,
+                                PRUNTIME_FUNCTION pFunc)
+{
+    DWORD totalSize = 0;
+
+    // Get UNWIND_INFO from RUNTIME_FUNCTION
+    PUNWIND_INFO pUnwindInfo = (PUNWIND_INFO)(
+        imageBase + pFunc-&gt;UnwindInfoAddress
+    );
+
+    DWORD i = 0;
+    while (i &lt; pUnwindInfo-&gt;CountOfCodes) {
+        UNWIND_CODE code = pUnwindInfo-&gt;UnwindCode[i];
+
+        switch (code.UnwindOp) {
+            case UWOP_PUSH_NONVOL:     // push reg
+                totalSize += 8;        // Each push = 8 bytes on x64
+                i += 1;
+                break;
+
+            case UWOP_ALLOC_SMALL:     // sub rsp, N (small)
+                totalSize += (code.OpInfo * 8) + 8;
+                i += 1;
+                break;
+
+            case UWOP_ALLOC_LARGE:     // sub rsp, N (large)
+                if (code.OpInfo == 0) {
+                    // Next slot contains size / 8
+                    totalSize += pUnwindInfo-&gt;UnwindCode[i+1].FrameOffset * 8;
+                    i += 2;
+                } else {
+                    // Next TWO slots contain raw 32-bit size
+                    DWORD rawSize = *(DWORD*)&amp;pUnwindInfo-&gt;UnwindCode[i+1];
+                    totalSize += rawSize;
+                    i += 3;
+                }
+                break;
+
+            default:
+                i += 1;  // Skip unrecognized opcodes
+                break;
+        }
+    }
+
+    // Handle chained unwind info (UNW_FLAG_CHAININFO)
+    if (pUnwindInfo-&gt;Flags &amp; UNW_FLAG_CHAININFO) {
+        // Chained RUNTIME_FUNCTION follows the UNWIND_CODE array
+        PRUNTIME_FUNCTION pChained = /* next aligned RUNTIME_FUNCTION */;
+        totalSize += DraugrCalculateStackSize(imageBase, pChained);
+    }
+
+    // Add 8 bytes for the return address pushed by CALL
+    totalSize += 8;
+
+    return totalSize;
+}</code></pre>
+
+<div class="card">
+<h4>UNWIND_CODE Opcode Reference</h4>
+<table>
+<tr><th>Opcode</th><th>Meaning</th><th>Stack Contribution</th></tr>
+<tr><td><code>UWOP_PUSH_NONVOL</code></td><td><code>push reg</code> (e.g., push rbp)</td><td>+8 bytes</td></tr>
+<tr><td><code>UWOP_ALLOC_SMALL</code></td><td><code>sub rsp, N</code> where N &le; 128</td><td>+(OpInfo * 8) + 8 bytes</td></tr>
+<tr><td><code>UWOP_ALLOC_LARGE</code></td><td><code>sub rsp, N</code> where N &gt; 128</td><td>Reads 1 or 2 extra UNWIND_CODE slots for the size</td></tr>
+<tr><td><code>UWOP_SET_FPREG</code></td><td><code>lea rbp, [rsp+N]</code></td><td>0 bytes (sets frame pointer, no allocation)</td></tr>
+<tr><td><code>UWOP_SAVE_NONVOL</code></td><td><code>mov [rsp+N], reg</code></td><td>0 bytes (saves register, no allocation)</td></tr>
+</table>
+</div>
+
+<div class="card warn">
+<h4>Chained Unwind Info</h4>
+<p>Some functions have <strong>chained unwind info</strong> (the <code>UNW_FLAG_CHAININFO</code> flag). This means the function's unwind data is split across multiple <code>RUNTIME_FUNCTION</code> entries. Draugr handles this by recursively calling <code>DraugrCalculateStackSize</code> on the chained entry. If it didn't, the calculated frame size would be too small, and the stack unwinder would misalign when walking past the synthetic frame.</p>
+</div>
+
+<!-- ==================== SECTION 4: PRM Structure ==================== -->
+<h2>The PRM (Parameter) Structure</h2>
+<p>The PRM structure is the central data package passed between the C orchestration code and the Spoof assembly routine. It carries everything the assembly needs to build the synthetic stack, execute the syscall, and clean up afterward.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">PRM Structure Layout</h4>
+<div style="max-width:550px;margin:0 auto;font-size:.85rem;font-family:var(--code-font, monospace)">
+<div style="border:1px solid var(--border);border-radius:var(--radius)">
+<div style="padding:8px 14px;border-bottom:1px solid var(--border);background:var(--surface2);display:flex;justify-content:space-between">
+<span style="color:var(--accent)">Offset 0x00</span><span>Fixup address</span><span style="color:var(--dim)">&larr; [RBX] dereferences here</span>
+</div>
+<div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--accent)">0x08</span><span>OG_retaddr</span><span style="color:var(--dim)">original return address</span>
+</div>
+<div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--accent)">0x10&ndash;0x38</span><span>Saved RDI, RSI, R12&ndash;R15</span><span style="color:var(--dim)">non-volatile registers</span>
+</div>
+<div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--accent)">0x40</span><span>BaseThreadInitThunk frame size</span><span style="color:var(--dim)">from Phase 2</span>
+</div>
+<div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--accent)">0x48</span><span>RtlUserThreadStart frame size</span><span style="color:var(--dim)">from Phase 2</span>
+</div>
+<div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--accent)">0x50</span><span>BaseThreadInitThunk+0x14</span><span style="color:var(--dim)">fake return address 1</span>
+</div>
+<div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--accent)">0x58</span><span>RtlUserThreadStart+0x21</span><span style="color:var(--dim)">fake return address 2</span>
+</div>
+<div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--accent)">0x60</span><span>Gadget address (JMP [RBX])</span><span style="color:var(--dim)">from Phase 3</span>
+</div>
+<div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--accent)">0x68</span><span>SSN (System Service Number)</span><span style="color:var(--dim)">from VxTable</span>
+</div>
+<div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+<span style="color:var(--accent)">0x70</span><span>Syscall instruction address</span><span style="color:var(--dim)">in ntdll stub</span>
+</div>
+<div style="padding:8px 14px;display:flex;justify-content:space-between">
+<span style="color:var(--accent)">0x78+</span><span>Function arguments (arg1&ndash;argN)</span><span style="color:var(--dim)">passed to syscall</span>
+</div>
+</div>
+</div>
+</div>
+
+<div class="card highlight">
+<h4>Why Fixup at Offset 0x00?</h4>
+<p>The first field of PRM is the <code>Fixup</code> address. This is not a coincidence &mdash; it is a critical design choice. After the syscall returns, the <code>JMP [RBX]</code> gadget executes. RBX points to the PRM structure. The instruction <code>JMP [RBX]</code> dereferences RBX and jumps to the value stored at <code>[RBX + 0]</code> &mdash; which is the Fixup address. By placing Fixup at offset zero, the gadget naturally redirects execution to the cleanup routine without any additional offset calculations.</p>
+</div>
+
+<!-- ==================== SECTION 5: Register Preservation ==================== -->
+<h2>Register Preservation</h2>
+<p>The x64 Windows calling convention designates certain registers as <strong>non-volatile</strong> (callee-saved). Any function that modifies these registers must restore them before returning. Since the Spoof routine manipulates the entire stack and register state, it must save and restore all non-volatile registers to maintain correctness.</p>
+
+<div class="card">
+<h4>Non-Volatile Register Save</h4>
+<p>At the very beginning of the Spoof routine, the following registers are saved into the PRM structure:</p>
+<table>
+<tr><th>Register</th><th>PRM Offset</th><th>Why It Must Be Saved</th></tr>
+<tr><td><code>RDI</code></td><td>0x10</td><td>Callee-saved; used internally by Spoof for memory operations</td></tr>
+<tr><td><code>RSI</code></td><td>0x18</td><td>Callee-saved; may be used as a source pointer</td></tr>
+<tr><td><code>R12</code></td><td>0x20</td><td>Callee-saved; available as scratch within Spoof</td></tr>
+<tr><td><code>R13</code></td><td>0x28</td><td>Callee-saved; available as scratch within Spoof</td></tr>
+<tr><td><code>R14</code></td><td>0x30</td><td>Callee-saved; available as scratch within Spoof</td></tr>
+<tr><td><code>R15</code></td><td>0x38</td><td>Callee-saved; available as scratch within Spoof</td></tr>
+</table>
+</div>
+
+<pre><code><span class="lang-tag">ASM - Spoof() entry (from Stub.s)</span>Spoof:
+    ; RCX = pointer to PRM structure
+    mov  rbx, rcx              ; RBX = &amp;PRM (persists across syscall)
+
+    ; Save the original return address
+    mov  rax, [rsp]            ; RAX = return address on stack
+    mov  [rbx + 0x08], rax     ; PRM.OG_retaddr = return address
+
+    ; Save all non-volatile registers into PRM
+    mov  [rbx + 0x10], rdi     ; PRM.saved_rdi
+    mov  [rbx + 0x18], rsi     ; PRM.saved_rsi
+    mov  [rbx + 0x20], r12     ; PRM.saved_r12
+    mov  [rbx + 0x28], r13     ; PRM.saved_r13
+    mov  [rbx + 0x30], r14     ; PRM.saved_r14
+    mov  [rbx + 0x38], r15     ; PRM.saved_r15
+
+    ; ... Phase 4 continues: build synthetic stack ...</code></pre>
+
+<div class="card green">
+<h4>Why RBX Is the Anchor</h4>
+<p>RBX is a <strong>non-volatile register</strong> in the x64 calling convention. This means the <code>syscall</code> instruction (which transitions to kernel mode and back) is required to preserve RBX. After the syscall returns, RBX still points to the PRM structure. This is why the <code>JMP [RBX]</code> gadget works &mdash; it can always find the Fixup address through the preserved RBX pointer, no matter what the kernel did during execution.</p>
+</div>
+
+<div class="card warn">
+<h4>What Happens If Registers Are Not Restored?</h4>
+<p>If the Fixup routine fails to restore the non-volatile registers, the <strong>calling function will use corrupted values</strong>. The C compiler assumes that callee-saved registers are unchanged after a function call. Corrupted RDI, RSI, or R12-R15 would cause silent data corruption, wrong loop counters, invalid pointer dereferences, or outright crashes in the Beacon code that called the Draugr syscall.</p>
+</div>
+
+<!-- ==================== SECTION 6: End-to-End Phase Recap ==================== -->
+<h2>Putting It All Together</h2>
+<p>Here is the complete data flow from the <code>DRAUGR_SYSCALL</code> macro to the Spoof assembly entry point:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Data Flow: C to Assembly</h4>
+<div class="flow">
+<div class="box">DRAUGR_SYSCALL<br><small>macro expands</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">DraugrCall<br><small>fills PRM struct</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Spoof(&amp;PRM)<br><small>RCX = &amp;PRM</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Build Stack<br><small>3-layer synthetic</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box r">syscall<br><small>kernel transition</small></div>
+</div>
+</div>
+
+<div class="card">
+<h4>DraugrCall: The Packager</h4>
+<p><code>DraugrCall</code> is the final C function before entering assembly. It populates every field of the PRM structure with data gathered from Phases 1&ndash;3, sets the SSN, the syscall instruction address, and copies all function arguments into the PRM. Then it calls <code>Spoof(&amp;PRM)</code>, passing the structure pointer in RCX (the first argument register on x64 Windows).</p>
+</div>
+
+<pre><code><span class="lang-tag">C - DraugrCall (simplified)</span>NTSTATUS DraugrCall(PDRAUGR_CONFIG config, PVX_TABLE_ENTRY entry,
+                     DWORD argc, ...)
+{
+    PRM prm = { 0 };
+
+    // Phase 1 results
+    prm.BaseThreadInitThunk_Addr = config-&gt;BaseThreadInitThunk_Addr;
+    prm.RtlUserThreadStart_Addr  = config-&gt;RtlUserThreadStart_Addr;
+
+    // Phase 2 results
+    prm.BaseThreadInitThunk_Size = config-&gt;BaseThreadInitThunk_FrameSize;
+    prm.RtlUserThreadStart_Size  = config-&gt;RtlUserThreadStart_FrameSize;
+
+    // Phase 3 result
+    prm.Gadget = config-&gt;GadgetAddr;
+
+    // SSN and syscall address from VxTable
+    prm.SSN          = entry-&gt;wSSN;
+    prm.SyscallAddr  = entry-&gt;pSyscallAddr;
+
+    // Fixup routine address
+    prm.Fixup = (ULONG_PTR)&amp;Fixup;
+
+    // Copy function arguments into PRM
+    va_list args;
+    va_start(args, argc);
+    for (DWORD i = 0; i &lt; argc; i++) {
+        prm.args[i] = va_arg(args, ULONG_PTR);
+    }
+    va_end(args);
+
+    // Enter the assembly routine
+    return Spoof(&amp;prm);
+}</code></pre>
+
+<!-- ==================== QUIZ ==================== -->
+<div class="quiz" id="quiz5">
+<h4>Module 5 Quiz: The Spoof Assembly Routine</h4>
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why are the offsets +0x14 and +0x21 chosen for BaseThreadInitThunk and RtlUserThreadStart respectively?</p>
+<label data-opt="0"><input type="radio" name="q5_0"> They are the function entry points</label>
+<label data-opt="1"><input type="radio" name="q5_0"> They are random values that look plausible</label>
+<label data-opt="2"><input type="radio" name="q5_0"> They point to existing CALL instructions within the functions, making return addresses appear as legitimate call sites to stack unwinders</label>
+<label data-opt="3"><input type="radio" name="q5_0"> They are the offsets of the RET instructions</label>
+<div class="explain">Correct! The offsets point to real CALL instructions inside each function. When a stack walker performs a backward scan from a return address looking for a preceding CALL, it finds a genuine one. If the offsets pointed to the function entry or a non-CALL instruction, the return addresses would be flagged as invalid.</div>
+</div>
+<div class="quiz-q" data-correct="1">
+<p>Q2: Why is the Fixup address stored at offset 0x00 in the PRM structure?</p>
+<label data-opt="0"><input type="radio" name="q5_1"> It makes the structure easier to read</label>
+<label data-opt="1"><input type="radio" name="q5_1"> Because JMP [RBX] dereferences offset 0x00, so placing Fixup there means the gadget naturally jumps to the cleanup routine</label>
+<label data-opt="2"><input type="radio" name="q5_1"> Windows requires the first field to be a function pointer</label>
+<label data-opt="3"><input type="radio" name="q5_1"> It is required for alignment purposes</label>
+<div class="explain">The JMP [RBX] gadget reads the value at the address stored in RBX and jumps there. Since RBX points to the start of the PRM structure, it reads offset 0x00. Placing the Fixup address at offset zero means the gadget naturally redirects to cleanup without needing any offset arithmetic.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz5')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module4.html">&larr; Prev: SSN &amp; Indirect Syscalls</a>
+<a class="primary" href="module6.html">Next: Synthetic Frame Construction &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

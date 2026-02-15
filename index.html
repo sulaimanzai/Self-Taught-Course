@@ -285,6 +285,43 @@ header .separator {
   background: linear-gradient(135deg, #22d3ee, #f97316);
 }
 
+/* DRAUGR CARD */
+.course-card.draugr:hover {
+  border-color: #a855f740;
+}
+
+.course-card.draugr::before {
+  background: linear-gradient(135deg, #a855f7, #ec4899);
+}
+
+.course-card.draugr:hover::before {
+  opacity: 1;
+}
+
+.course-card.draugr .card-banner {
+  background: linear-gradient(135deg, #a855f715, #ec489915);
+  border-bottom: 1px solid #a855f720;
+}
+
+.course-card.draugr .card-banner .icon-wrap {
+  background: linear-gradient(135deg, #a855f7, #ec4899);
+}
+
+.course-card.draugr .card-title {
+  background: linear-gradient(135deg, #a855f7, #ec4899);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.course-card.draugr .module-item .num {
+  background: #a855f720;
+  color: #a855f7;
+}
+
+.course-card.draugr .launch-btn {
+  background: linear-gradient(135deg, #a855f7, #ec4899);
+}
+
 /* CARD BANNER */
 .card-banner {
   padding: 28px 28px 24px;
@@ -475,11 +512,11 @@ footer {
 
 <div class="stats-bar">
   <div class="stat">
-    <div class="num">3</div>
+    <div class="num">4</div>
     <div class="label">Courses</div>
   </div>
   <div class="stat">
-    <div class="num">27</div>
+    <div class="num">35</div>
     <div class="label">Modules</div>
   </div>
   <div class="stat">
@@ -630,6 +667,58 @@ footer {
         <li class="module-item"><span class="num">05</span><span class="diff-dot diff-yellow"></span> Dual-Handler Architecture</li>
         <li class="module-item"><span class="num">06</span><span class="diff-dot diff-red"></span> Call Stack Construction</li>
         <li class="module-item"><span class="num">07</span><span class="diff-dot diff-red"></span> Argument Marshalling</li>
+        <li class="module-item"><span class="num">08</span><span class="diff-dot diff-red"></span> Full Chain &amp; Detection</li>
+      </ul>
+    </div>
+
+    <div class="card-footer">
+      <div class="meta">
+        <div class="meta-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
+          8 Modules
+        </div>
+        <div class="meta-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          Deep Dive
+        </div>
+      </div>
+      <button class="launch-btn" onclick="return true;">Launch &rarr;</button>
+    </div>
+  </a>
+
+  <!-- DRAUGR CARD -->
+  <a href="Project/Draugr/Draugr_index.html" class="course-card draugr">
+    <div class="card-banner">
+      <div class="icon-wrap">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 17.5L3 6V3h3l11.5 11.5"/><path d="M13 19l6-6"/><path d="M16 16l4 4"/><path d="M19 21l2-2"/><path d="M14.5 6.5L18 3h3v3l-3.5 3.5"/></svg>
+      </div>
+      <div>
+        <div class="card-title">Draugr</div>
+        <div class="card-subtitle">Synthetic Stack Frame Evasion</div>
+      </div>
+    </div>
+
+    <div class="card-body">
+      <p class="card-desc">
+        Construct synthetic call stacks that fool EDR stack walkers. Beacon Object Files, x64 unwind metadata parsing,
+        JMP RBX gadgets, and indirect syscalls &mdash; making shellcode look like normal thread initialization.
+      </p>
+
+      <div class="tags">
+        <span class="tag beginner">Beginner</span>
+        <span class="tag intermediate">Intermediate</span>
+        <span class="tag advanced">Advanced</span>
+        <span class="tag lang">C++ / ASM / BOF</span>
+      </div>
+
+      <ul class="module-list">
+        <li class="module-item"><span class="num">01</span><span class="diff-dot diff-green"></span> EDR Call Stack Analysis</li>
+        <li class="module-item"><span class="num">02</span><span class="diff-dot diff-green"></span> Beacon Object Files</li>
+        <li class="module-item"><span class="num">03</span><span class="diff-dot diff-green"></span> x64 Stack Unwinding</li>
+        <li class="module-item"><span class="num">04</span><span class="diff-dot diff-yellow"></span> SSN &amp; Indirect Syscalls</li>
+        <li class="module-item"><span class="num">05</span><span class="diff-dot diff-yellow"></span> Spoof Assembly Routine</li>
+        <li class="module-item"><span class="num">06</span><span class="diff-dot diff-red"></span> Synthetic Frame Construction</li>
+        <li class="module-item"><span class="num">07</span><span class="diff-dot diff-red"></span> Gadgets &amp; Clean Return</li>
         <li class="module-item"><span class="num">08</span><span class="diff-dot diff-red"></span> Full Chain &amp; Detection</li>
       </ul>
     </div>

@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 3: x64 Stack Unwinding - Draugr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2694;&#xFE0F;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#a855f7;--accent2:#ec4899;--gradient:linear-gradient(135deg,#a855f7,#ec4899)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Draugr Course</h2>
+<span>Synthetic Stack Frame Evasion</span>
+</div>
+<a class="home-link" href="../Draugr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. EDR Call Stack Analysis</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. Beacon Object Files</span><span class="diff d1">d1</span></a>
+<a class="mod-link active" href="module3.html"><span>3. x64 Stack Unwinding</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. SSN &amp; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Spoof Assembly Routine</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. Synthetic Frame Construction</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Gadgets &amp; Clean Return</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Full Chain &amp; Detection</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 3: x64 Stack Unwinding</h1>
+<p class="subtitle">How Windows navigates the call stack without frame pointers &mdash; and why Draugr must speak the same language.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Draugr constructs synthetic stack frames that must fool Windows' stack unwinder. To build convincing fakes, you need to understand the real thing: <strong>RUNTIME_FUNCTION</strong>, <strong>UNWIND_INFO</strong>, <strong>UNWIND_CODEs</strong>, and <strong>RtlVirtualUnwind</strong>. This module covers the entire x64 unwind mechanism from first principles.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. The Frame Pointer Problem</h2>
+
+<p>In 32-bit x86, stack walking was simple. Every function established a <strong>frame pointer</strong> by saving EBP, then setting EBP = ESP. To walk the stack, you simply followed the chain of saved EBP values &mdash; each one pointed to the previous frame's EBP, creating a linked list up the call stack:</p>
+
+<pre><code><span class="lang-tag">x86 ASM</span>; x86 standard function prolog:
+push ebp           ; Save caller's frame pointer
+mov  ebp, esp      ; Establish new frame pointer
+sub  esp, 0x20     ; Allocate local variables
+
+; Stack walking: follow EBP chain
+; [EBP]     = previous EBP (caller's frame pointer)
+; [EBP + 4] = return address (where to resume after RET)</code></pre>
+
+<p>x64 changed everything. The Microsoft x64 ABI <strong>does not require frame pointers</strong>. Most functions do not save or use RBP as a frame pointer. The reason: RBP is freed up as a general-purpose register, giving the compiler an extra register for optimization. On x64 with only 16 GPRs, that extra register matters.</p>
+
+<div class="card warn">
+<h4>The Consequence: No RBP Chain to Follow</h4>
+<p>Without mandatory frame pointers, the classic EBP-chain walking technique is useless on x64. Windows needed a completely different mechanism to walk the stack. The solution: <strong>metadata-driven unwinding</strong>. Instead of following a linked list at runtime, the unwinder reads compile-time metadata that describes exactly what each function's prolog does to the stack.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. RUNTIME_FUNCTION</h2>
+
+<p>Every non-leaf function (a function that calls other functions or modifies RSP) in a PE image has a corresponding <code>RUNTIME_FUNCTION</code> entry in the <strong>.pdata section</strong>. Leaf functions (which don't call anything and don't change RSP) don't need entries because their stack frame is zero-sized.</p>
+
+<pre><code><span class="lang-tag">C</span>typedef struct _RUNTIME_FUNCTION {
+    DWORD BeginAddress;   // RVA of function start
+    DWORD EndAddress;     // RVA of function end (exclusive)
+    DWORD UnwindData;     // RVA of UNWIND_INFO structure
+} RUNTIME_FUNCTION, *PRUNTIME_FUNCTION;</code></pre>
+
+<div class="card">
+<h4>Field Details</h4>
+<table>
+<tr><th>Field</th><th>Size</th><th>Description</th></tr>
+<tr><td><code>BeginAddress</code></td><td>4 bytes</td><td>Relative Virtual Address of the first instruction of the function</td></tr>
+<tr><td><code>EndAddress</code></td><td>4 bytes</td><td>RVA of the byte <em>after</em> the last instruction (exclusive end)</td></tr>
+<tr><td><code>UnwindData</code></td><td>4 bytes</td><td>RVA of the UNWIND_INFO that describes this function's prolog</td></tr>
+</table>
+</div>
+
+<p>Given a return address captured during stack walking, the unwinder calls <code>RtlLookupFunctionEntry</code> to search the .pdata section for a RUNTIME_FUNCTION whose <code>[BeginAddress, EndAddress)</code> range contains that address. This is a binary search &mdash; the .pdata entries are sorted by BeginAddress.</p>
+
+<pre><code><span class="lang-tag">C</span>// Given a return address (RIP), find its RUNTIME_FUNCTION
+PRUNTIME_FUNCTION RtlLookupFunctionEntry(
+    DWORD64                ControlPc,    // The return address to look up
+    PDWORD64               ImageBase,    // Output: base address of the module
+    PUNWIND_HISTORY_TABLE  HistoryTable  // Optional: cache for repeated lookups
+);
+
+// Returns NULL if the address is in a leaf function (no .pdata entry)
+// or if the address is not within any loaded module</code></pre>
+
+<div class="card">
+<h4>Important: What Happens When RtlLookupFunctionEntry Returns NULL</h4>
+<p>If a return address doesn't match any RUNTIME_FUNCTION (either because it's in a leaf function or in unbacked memory), the unwinder assumes the address at [RSP] is the return address and pops it. This is the <strong>leaf function convention</strong>. For Draugr, this is relevant because synthetic frames must ensure that when the unwinder looks up return addresses, it finds valid RUNTIME_FUNCTION entries for <code>BaseThreadInitThunk</code> and <code>RtlUserThreadStart</code>.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. UNWIND_INFO and UNWIND_CODEs</h2>
+
+<p>The UNWIND_INFO structure describes what a function's prolog does. The prolog is the sequence of instructions at the start of a function that sets up the stack frame &mdash; saving registers, allocating local variable space, establishing a frame pointer.</p>
+
+<pre><code><span class="lang-tag">C</span>typedef struct _UNWIND_INFO {
+    UBYTE Version       : 3;    // Must be 1 (or 2 for chained)
+    UBYTE Flags         : 5;    // UNW_FLAG_EHANDLER, UNW_FLAG_UHANDLER, UNW_FLAG_CHAININFO
+    UBYTE SizeOfProlog;         // Size of the function prolog in bytes
+    UBYTE CountOfCodes;         // Number of UNWIND_CODE entries
+    UBYTE FrameRegister : 4;    // Frame register (0 = no frame register)
+    UBYTE FrameOffset   : 4;    // Scaled offset of frame register from RSP
+    UNWIND_CODE UnwindCode[1];  // Variable-length array of unwind operations
+    // Followed by optional exception handler data
+} UNWIND_INFO, *PUNWIND_INFO;</code></pre>
+
+<p>The <code>UnwindCode</code> array contains one or more <code>UNWIND_CODE</code> entries, each describing a single prolog operation. The codes are stored in <strong>reverse order</strong> (last prolog instruction first) so the unwinder can process them in the order needed to reverse the prolog.</p>
+
+<pre><code><span class="lang-tag">C</span>typedef union _UNWIND_CODE {
+    struct {
+        UBYTE CodeOffset;    // Offset in prolog where this operation occurs
+        UBYTE UnwindOp : 4;  // Operation type (UWOP_*)
+        UBYTE OpInfo   : 4;  // Operation-specific data
+    };
+    USHORT FrameOffset;      // Used as a 16-bit value for some operations
+} UNWIND_CODE, *PUNWIND_CODE;</code></pre>
+
+<h3>UNWIND_CODE Operations</h3>
+
+<p>Each unwind code type describes a specific prolog instruction and its effect on the stack:</p>
+
+<div class="card">
+<h4>UWOP Types and Stack Effects</h4>
+<table>
+<tr><th>UWOP Code</th><th>Value</th><th>Prolog Instruction</th><th>Stack Effect</th><th>Extra Slots</th></tr>
+<tr><td><code>UWOP_PUSH_NONVOL</code></td><td>0</td><td><code>push rbx</code> / <code>push rdi</code> / etc.</td><td>+8 bytes (one QWORD)</td><td>0</td></tr>
+<tr><td><code>UWOP_ALLOC_LARGE</code></td><td>1</td><td><code>sub rsp, N</code> (large)</td><td>+N bytes</td><td>1 or 2</td></tr>
+<tr><td><code>UWOP_ALLOC_SMALL</code></td><td>2</td><td><code>sub rsp, N</code> (8 to 128)</td><td>+(OpInfo*8 + 8) bytes</td><td>0</td></tr>
+<tr><td><code>UWOP_SET_FPREG</code></td><td>3</td><td><code>lea rbp, [rsp+N]</code></td><td>No stack size change</td><td>0</td></tr>
+<tr><td><code>UWOP_SAVE_NONVOL</code></td><td>4</td><td><code>mov [rsp+N], rbx</code></td><td>No stack size change (saves to existing space)</td><td>1</td></tr>
+<tr><td><code>UWOP_SAVE_NONVOL_FAR</code></td><td>5</td><td><code>mov [rsp+N], rbx</code> (large offset)</td><td>No stack size change</td><td>2</td></tr>
+<tr><td><code>UWOP_SAVE_XMM128</code></td><td>8</td><td><code>movaps [rsp+N], xmm0</code></td><td>No stack size change</td><td>1</td></tr>
+<tr><td><code>UWOP_SAVE_XMM128_FAR</code></td><td>9</td><td><code>movaps [rsp+N], xmm0</code> (large offset)</td><td>No stack size change</td><td>2</td></tr>
+<tr><td><code>UWOP_PUSH_MACHFRAME</code></td><td>10</td><td>Hardware interrupt frame</td><td>+40 or +48 bytes</td><td>0</td></tr>
+</table>
+</div>
+
+<div class="card warn">
+<h4>The "Extra Slots" Column</h4>
+<p>Some UWOP codes consume additional UNWIND_CODE slots. For example, <code>UWOP_ALLOC_LARGE</code> with OpInfo=0 uses one extra slot (16-bit value: N/8 allocation), and with OpInfo=1 uses two extra slots (full 32-bit value). <code>UWOP_SAVE_NONVOL</code> uses one extra slot for the scaled offset. When iterating UNWIND_CODEs, Draugr must skip these extra slots correctly or the frame size calculation will be wrong.</p>
+</div>
+
+<h3>Concrete Example</h3>
+
+<p>Consider a function with this prolog:</p>
+
+<pre><code><span class="lang-tag">x86-64 ASM</span>; Function prolog:
+push rbx              ; Save non-volatile register  [UWOP_PUSH_NONVOL, reg=rbx]
+push rdi              ; Save non-volatile register  [UWOP_PUSH_NONVOL, reg=rdi]
+sub  rsp, 0x28        ; Allocate 40 bytes locals    [UWOP_ALLOC_SMALL, OpInfo=4]
+                       ;   (OpInfo * 8 + 8 = 4*8+8 = 40 = 0x28)
+
+; Total stack consumed = 8 (push rbx) + 8 (push rdi) + 40 (sub rsp) = 56 bytes
+; Plus the 8-byte return address pushed by CALL = 64 bytes total frame</code></pre>
+
+<p>The UNWIND_INFO for this function would contain 3 UNWIND_CODEs (in reverse order):</p>
+
+<pre><code><span class="lang-tag">UNWIND_CODEs (reverse order)</span>[0] UWOP_ALLOC_SMALL   OpInfo=4   (sub rsp, 0x28)     +40 bytes
+[1] UWOP_PUSH_NONVOL   OpInfo=7   (push rdi, reg=RDI)  +8 bytes
+[2] UWOP_PUSH_NONVOL   OpInfo=3   (push rbx, reg=RBX)  +8 bytes
+
+Total prolog stack consumption: 40 + 8 + 8 = 56 bytes
+Frame size (including return addr): 56 + 8 = 64 bytes</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. RtlVirtualUnwind</h2>
+
+<p><code>RtlVirtualUnwind</code> is the core Windows API that performs a single step of stack unwinding. Given the current PC (program counter/RIP) and a RUNTIME_FUNCTION, it reverses the prolog's effects to compute the caller's register state:</p>
+
+<pre><code><span class="lang-tag">C</span>PEXCEPTION_ROUTINE RtlVirtualUnwind(
+    ULONG                          HandlerType,      // UNW_FLAG_NHANDLER usually
+    DWORD64                        ImageBase,         // Module base address
+    DWORD64                        ControlPc,         // Current RIP
+    PRUNTIME_FUNCTION              FunctionEntry,     // From RtlLookupFunctionEntry
+    PCONTEXT                       ContextRecord,     // In/out: register state
+    PVOID                         *HandlerData,       // Output: exception handler data
+    PDWORD64                       EstablisherFrame,  // Output: caller's RSP
+    PKNONVOLATILE_CONTEXT_POINTERS ContextPointers    // Output: saved register locations
+);</code></pre>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">RtlVirtualUnwind: Step-by-Step</h4>
+<div class="flow">
+<div class="box">Input: current RIP<br>+ RUNTIME_FUNCTION</div>
+<div class="arrow">&rarr;</div>
+<div class="box">Read UNWIND_INFO<br>from UnwindData RVA</div>
+<div class="arrow">&rarr;</div>
+<div class="box">Process each<br>UNWIND_CODE</div>
+<div class="arrow">&rarr;</div>
+<div class="box">Reverse prolog:<br>restore RSP + regs</div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Output: caller's<br>RIP + RSP</div>
+</div>
+</div>
+
+<p>For each UNWIND_CODE, RtlVirtualUnwind reverses the corresponding prolog operation:</p>
+
+<div class="card">
+<h4>Unwind Reversal Logic</h4>
+<table>
+<tr><th>UWOP Code</th><th>Prolog Effect</th><th>Unwind Reversal</th></tr>
+<tr><td><code>UWOP_PUSH_NONVOL</code></td><td>RSP decreased by 8</td><td>Read saved reg from [RSP], RSP += 8</td></tr>
+<tr><td><code>UWOP_ALLOC_SMALL</code></td><td>RSP decreased by N</td><td>RSP += (OpInfo * 8 + 8)</td></tr>
+<tr><td><code>UWOP_ALLOC_LARGE</code></td><td>RSP decreased by N</td><td>RSP += N (from extra slot data)</td></tr>
+<tr><td><code>UWOP_SET_FPREG</code></td><td>Frame register set</td><td>RSP = FrameReg - FrameOffset * 16</td></tr>
+<tr><td><code>UWOP_SAVE_NONVOL</code></td><td>Register saved to stack</td><td>Read saved reg from [RSP + offset * 8]</td></tr>
+</table>
+<p style="margin-top:10px;color:var(--dim);font-size:.85rem;">After processing all codes, RSP points at the saved return address. Reading [RSP] gives the caller's RIP. The unwinder then increments RSP by 8 (to account for the return address) to get the caller's RSP value.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Chained Unwind Info</h2>
+
+<p>Some functions have complex prologs that can't be described by a single UNWIND_INFO. The <code>UNW_FLAG_CHAININFO</code> flag links one RUNTIME_FUNCTION to another, creating a chain of unwind data:</p>
+
+<pre><code><span class="lang-tag">C</span>// In the UNWIND_INFO for a function with chained info:
+// Flags field contains UNW_FLAG_CHAININFO (0x04)
+// After the UnwindCode array (padded to even count), there's another RUNTIME_FUNCTION
+
+// Draugr handles this in DraugrCalculateStackSize:
+// 1. Parse UNWIND_CODEs from the current UNWIND_INFO
+// 2. Check if UNW_FLAG_CHAININFO is set
+// 3. If yes, follow the chained RUNTIME_FUNCTION and repeat
+// 4. Sum all stack sizes from the entire chain</code></pre>
+
+<div class="card">
+<h4>When Chaining Occurs</h4>
+<p>Chained unwind info is used when:</p>
+<ul style="padding-left:20px;line-height:2;">
+<li>A function has a <strong>hot/cold code split</strong> (common in optimized builds) where parts of the function are moved to different locations</li>
+<li>The compiler generates a <strong>multi-part prolog</strong> that exceeds the 255-code limit of a single UNWIND_INFO</li>
+<li>The function uses <strong>dynamic stack allocation</strong> (<code>alloca</code>) with complex frame structures</li>
+</ul>
+<p>For BaseThreadInitThunk and RtlUserThreadStart, chained info is rare but must be handled correctly. If Draugr encounters a chain, it recursively follows it to accumulate the total stack frame size.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Why Draugr Must Parse UNWIND_CODEs</h2>
+
+<div class="card green">
+<h4>The Critical Requirement: Exact Frame Sizes</h4>
+<p>To construct synthetic frames for <code>BaseThreadInitThunk</code> and <code>RtlUserThreadStart</code>, Draugr must know the <strong>exact</strong> stack frame size of each function. This means parsing every UNWIND_CODE for each function and summing the stack contributions. Here's why precision is non-negotiable:</p>
+</div>
+
+<p>When the stack walker processes a synthetic frame, it performs these steps:</p>
+
+<ol style="padding-left:20px;line-height:2.2;">
+<li>Read a return address from the stack (this is the address Draugr placed)</li>
+<li>Call <code>RtlLookupFunctionEntry</code> to find the RUNTIME_FUNCTION for that address</li>
+<li>Read the UNWIND_INFO and compute the frame size from UNWIND_CODEs</li>
+<li><strong>Add the frame size to the current RSP to locate the next return address</strong></li>
+</ol>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">Why Frame Size Must Be Exact</h4>
+<div style="display:flex;gap:30px;justify-content:center;flex-wrap:wrap">
+<div style="flex:1;min-width:260px">
+<p style="text-align:center;color:var(--green);font-weight:700;margin-bottom:10px">Correct Frame Size</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box g" style="width:100%">RSP + frameSize = next return address</div>
+<div class="box g" style="width:100%">Unwinder finds RtlUserThreadStart</div>
+<div class="box g" style="width:100%">Stack walk terminates cleanly</div>
+</div>
+</div>
+<div style="flex:1;min-width:260px">
+<p style="text-align:center;color:var(--red);font-weight:700;margin-bottom:10px">Off By Even 1 Byte</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box r" style="width:100%">RSP + frameSize = garbage</div>
+<div class="box r" style="width:100%">Unwinder reads wrong return address</div>
+<div class="box r" style="width:100%">Stack walk produces nonsense / crash</div>
+</div>
+</div>
+</div>
+</div>
+
+<pre><code><span class="lang-tag">Stack Layout (Draugr's Synthetic Frames)</span>; After Draugr builds the synthetic stack:
+;
+; [RSP + 0]                    = return addr into syscall stub (ntdll)
+; [RSP + frameSize_BaseThread] = addr inside BaseThreadInitThunk
+; [RSP + frameSize_BaseThread
+;      + frameSize_RtlUser]    = addr inside RtlUserThreadStart
+; [RSP + ... + 8]              = 0x0 (stack walk terminator)
+;
+; If frameSize_BaseThread is wrong, the unwinder looks at the wrong
+; offset for the RtlUserThreadStart return address, and the entire
+; spoof collapses.</code></pre>
+
+<div class="card warn">
+<h4>Version Sensitivity</h4>
+<p>The frame sizes for <code>BaseThreadInitThunk</code> and <code>RtlUserThreadStart</code> can change between Windows versions because Microsoft may modify their prologs. This is why Draugr parses the UNWIND_CODEs dynamically at runtime rather than hardcoding frame sizes. By reading the actual .pdata metadata from kernel32.dll and ntdll.dll, Draugr automatically adapts to whatever Windows version is running.</p>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz" id="quiz1">
+<h4>Module 3 Quiz: x64 Stack Unwinding</h4>
+
+<div class="quiz-q" data-correct="1">
+<p>Q1: Why doesn't x64 Windows use RBP frame pointer chains for stack walking like x86 did?</p>
+<label data-opt="0"><input type="radio" name="q1_0"> RBP doesn't exist in x64 mode</label>
+<label data-opt="1"><input type="radio" name="q1_0"> x64 freed RBP as a general-purpose register for optimization; metadata-driven unwinding replaced it</label>
+<label data-opt="2"><input type="radio" name="q1_0"> Frame pointer chains are too slow on x64 processors</label>
+<label data-opt="3"><input type="radio" name="q1_0"> Windows x64 uses the red zone instead of frame pointers</label>
+<div class="explain">The x64 ABI dropped the requirement for frame pointers to free up RBP as a general-purpose register. With only 16 GPRs, every register matters for optimization. Instead, the compiler emits metadata (RUNTIME_FUNCTION + UNWIND_INFO) in the .pdata section that describes each function's stack layout, allowing metadata-driven unwinding without runtime frame pointer chains.</div>
+</div>
+
+<div class="quiz-q" data-correct="2">
+<p>Q2: What does UWOP_ALLOC_SMALL with OpInfo=4 encode?</p>
+<label data-opt="0"><input type="radio" name="q2_0"> <code>sub rsp, 4</code> (4-byte allocation)</label>
+<label data-opt="1"><input type="radio" name="q2_0"> <code>sub rsp, 32</code> (4 * 8 = 32 bytes)</label>
+<label data-opt="2"><input type="radio" name="q2_0"> <code>sub rsp, 40</code> (4 * 8 + 8 = 40 bytes)</label>
+<label data-opt="3"><input type="radio" name="q2_0"> <code>sub rsp, 48</code> (4 * 12 = 48 bytes)</label>
+<div class="explain">UWOP_ALLOC_SMALL encodes stack allocations from 8 to 128 bytes. The formula is: allocation = OpInfo * 8 + 8. So OpInfo=4 means 4 * 8 + 8 = 40 bytes, which corresponds to <code>sub rsp, 0x28</code>. This is the standard 32-byte shadow space (0x20) plus 8 bytes of alignment, commonly seen in functions that call other functions.</div>
+</div>
+
+<div class="quiz-q" data-correct="3">
+<p>Q3: Why does Draugr parse UNWIND_CODEs at runtime instead of hardcoding frame sizes?</p>
+<label data-opt="0"><input type="radio" name="q3_0"> Hardcoded sizes would be detected by EDR signature scans</label>
+<label data-opt="1"><input type="radio" name="q3_0"> The COFF object format doesn't support constant values</label>
+<label data-opt="2"><input type="radio" name="q3_0"> Parsing is faster than loading constants from memory</label>
+<label data-opt="3"><input type="radio" name="q3_0"> Frame sizes for BaseThreadInitThunk and RtlUserThreadStart can change between Windows versions</label>
+<div class="explain">Microsoft can modify the prologs of BaseThreadInitThunk and RtlUserThreadStart in any Windows update, changing their frame sizes. Hardcoding sizes would break on different Windows versions. By parsing the actual UNWIND_CODEs from the .pdata section at runtime, Draugr dynamically computes the correct frame sizes for whatever version of kernel32.dll and ntdll.dll is loaded, ensuring compatibility across all supported Windows builds.</div>
+</div>
+
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module2.html">&larr; Prev: Beacon Object Files</a>
+<a class="primary" href="module4.html">Next: SSN &amp; Indirect Syscalls &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

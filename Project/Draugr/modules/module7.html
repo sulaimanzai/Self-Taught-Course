@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 7: Gadgets, Fixup &amp; Clean Return - Draugr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2694;&#xFE0F;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#a855f7;--accent2:#ec4899;--gradient:linear-gradient(135deg,#a855f7,#ec4899)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Draugr Course</h2>
+<span>Synthetic Stack Frame Evasion</span>
+</div>
+<a class="home-link" href="../Draugr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. EDR Call Stack Analysis</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. Beacon Object Files</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. x64 Stack Unwinding</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. SSN &amp; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Spoof Assembly Routine</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. Synthetic Frame Construction</span><span class="diff d3">d3</span></a>
+<a class="mod-link active" href="module7.html"><span>7. Gadgets &amp; Clean Return</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Full Chain &amp; Detection</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 7: Gadgets, Fixup &amp; Clean Return</h1>
+<p class="subtitle">After the syscall, a two-byte gadget in kernelbase.dll redirects execution to a cleanup routine that restores the original world.</p>
+
+<div class="card highlight">
+<h4>Module Overview</h4>
+<p>The synthetic stack exists only while the syscall is in flight. Once the kernel returns to user mode, Draugr must <strong>dismantle</strong> the synthetic stack, <strong>restore</strong> all registers, and <strong>return</strong> to the original caller as if nothing happened. This module covers the three components that make this possible: the <code>JMP [RBX]</code> gadget, the Fixup assembly routine, and how the return value flows back seamlessly.</p>
+</div>
+
+<!-- ==================== SECTION 1: The JMP [RBX] Gadget ==================== -->
+<h2>The JMP [RBX] Gadget</h2>
+<p><code>DraugrFindGadget</code> scans the <code>.text</code> section of <code>kernelbase.dll</code> looking for the byte sequence <code>0xFF 0x23</code>. This two-byte sequence encodes the instruction <code>jmp qword ptr [rbx]</code>.</p>
+
+<pre><code><span class="lang-tag">C - DraugrFindGadget</span>ULONG_PTR DraugrFindGadget(ULONG_PTR kernelbaseBase) {
+    // Parse the PE headers to find the .text section
+    PIMAGE_DOS_HEADER    pDos = (PIMAGE_DOS_HEADER)kernelbaseBase;
+    PIMAGE_NT_HEADERS    pNt  = (PIMAGE_NT_HEADERS)(kernelbaseBase + pDos-&gt;e_lfanew);
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+
+    // Find .text section
+    for (WORD i = 0; i &lt; pNt-&gt;FileHeader.NumberOfSections; i++) {
+        if (memcmp(pSec[i].Name, ".text", 5) == 0) {
+            ULONG_PTR start = kernelbaseBase + pSec[i].VirtualAddress;
+            DWORD     size  = pSec[i].Misc.VirtualSize;
+
+            // Scan for 0xFF 0x23 (jmp qword ptr [rbx])
+            for (DWORD j = 0; j &lt; size - 1; j++) {
+                if (*(BYTE*)(start + j)     == 0xFF &amp;&amp;
+                    *(BYTE*)(start + j + 1)  == 0x23)
+                {
+                    return start + j;  // Found the gadget
+                }
+            }
+        }
+    }
+    return 0;  // Gadget not found
+}</code></pre>
+
+<div class="card">
+<h4>Why This Gadget Is in kernelbase.dll</h4>
+<p><code>kernelbase.dll</code> is a large, Microsoft-signed system DLL that is loaded into every process. Its <code>.text</code> section is hundreds of kilobytes of executable code. Within that much code, the byte sequence <code>0xFF 0x23</code> is virtually guaranteed to appear &mdash; possibly as an intentional indirect jump, or as a coincidental byte alignment within a longer instruction. Because the gadget resides in a signed, legitimate DLL, any EDR that checks return addresses against known modules will see a valid code address in <code>kernelbase.dll</code>.</p>
+</div>
+
+<!-- ==================== SECTION 2: Why JMP [RBX]? ==================== -->
+<h2>Why JMP [RBX]?</h2>
+<p>The choice of <code>JMP [RBX]</code> is not arbitrary. It depends on a fundamental property of the x64 calling convention and the behavior of the <code>syscall</code> instruction.</p>
+
+<div class="card green">
+<h4>RBX Is Callee-Saved (Non-Volatile)</h4>
+<p>In the Windows x64 ABI, RBX is a <strong>non-volatile register</strong>. Any function &mdash; including kernel-mode syscall handlers &mdash; must preserve RBX across the call. This means that after the syscall executes and returns to user mode, <strong>RBX still points to the PRM structure</strong>, exactly where Draugr set it before the syscall.</p>
+</div>
+
+<div class="card">
+<h4>The Dereference Chain</h4>
+<table>
+<tr><th>Step</th><th>State</th><th>Value</th></tr>
+<tr><td>Before syscall</td><td><code>RBX = &amp;PRM</code></td><td>Set by Spoof routine: <code>mov rbx, rcx</code></td></tr>
+<tr><td>During syscall</td><td><code>RBX = &amp;PRM</code></td><td>Preserved (non-volatile)</td></tr>
+<tr><td>After RET</td><td><code>RIP = gadget</code></td><td>Popped from RSP (top of synthetic stack)</td></tr>
+<tr><td>Gadget executes</td><td><code>JMP [RBX]</code></td><td>Reads <code>[&amp;PRM + 0x00]</code> = <code>Fixup address</code></td></tr>
+<tr><td>Result</td><td><code>RIP = Fixup</code></td><td>Execution enters the cleanup routine</td></tr>
+</table>
+</div>
+
+<div class="card warn">
+<h4>Alternative Gadgets</h4>
+<p>Other callee-saved registers (RDI, RSI, R12&ndash;R15) could theoretically be used for similar gadgets (e.g., <code>JMP [RDI]</code>, <code>JMP [R12]</code>). However, <code>JMP [RBX]</code> is the most common two-byte encoding (<code>0xFF 0x23</code>). Other register-based indirect jumps use three-byte encodings with REX prefixes, making them harder to find reliably across Windows versions. RBX gadgets are nearly universal in large DLLs.</p>
+</div>
+
+<!-- ==================== SECTION 3: Syscall Return Flow ==================== -->
+<h2>The Syscall Return Flow</h2>
+<p>Here is the complete step-by-step sequence from the moment the syscall returns from kernel mode to the moment execution reaches the Fixup routine.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Return Path: Kernel to Fixup</h4>
+<div class="flow">
+<div class="box">Kernel Returns<br><small>sysret to user mode</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">RET in ntdll<br><small>pop RIP from RSP</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box r">Gadget Executes<br><small>jmp [rbx]</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Dereference RBX<br><small>read PRM.Fixup</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Fixup Routine<br><small>cleanup &amp; restore</small></div>
+</div>
+</div>
+
+<div class="card">
+<h4>Detailed Sequence</h4>
+<ol>
+<li><strong>Kernel completes</strong>: The syscall handler finishes (e.g., NtAllocateVirtualMemory allocates memory). The return value is in RAX. The CPU transitions back to user mode via <code>sysret</code>.</li>
+<li><strong>Execution resumes at the <code>ret</code> in ntdll</strong>: The <code>syscall</code> instruction in the ntdll stub is followed by <code>ret</code>. The <code>ret</code> instruction pops the top of the stack (RSP) into RIP.</li>
+<li><strong>RIP = gadget address</strong>: The top of the synthetic stack held the <code>JMP [RBX]</code> gadget address. RSP now points into the BaseThreadInitThunk synthetic frame (one slot down from where it was).</li>
+<li><strong>Gadget executes</strong>: The CPU is now executing the <code>jmp qword ptr [rbx]</code> instruction inside kernelbase.dll. It reads the 8-byte value at the address stored in RBX.</li>
+<li><strong>RBX dereference</strong>: RBX points to <code>&amp;PRM</code>. Offset 0x00 of the PRM structure is the <code>Fixup</code> address. The CPU jumps there.</li>
+<li><strong>Fixup begins</strong>: Execution is now in the Fixup routine with RAX still holding the syscall return value and RBX still pointing to the PRM.</li>
+</ol>
+</div>
+
+<!-- ==================== SECTION 4: The Fixup Routine ==================== -->
+<h2>The Fixup Routine</h2>
+<p>The Fixup routine has three jobs: deallocate the entire synthetic stack, restore all non-volatile registers from the PRM, and jump back to the original caller.</p>
+
+<pre><code><span class="lang-tag">ASM - Fixup routine (from Stub.s)</span>Fixup:
+    ; ---- Deallocate the entire synthetic stack ----
+    ; RSP currently points into the BaseThreadInitThunk frame
+    ; We need to unwind: gadget(8) + BaseThreadInitThunk_Size
+    ;                   + RtlUserThreadStart_Size + 0x200 + NULL(8)
+    ; Plus any stack arguments that were copied
+
+    mov   r12, [rbx + 0x40]   ; BaseThreadInitThunk frame size
+    mov   r13, [rbx + 0x48]   ; RtlUserThreadStart frame size
+
+    ; Total synthetic allocation:
+    ; BaseThreadInitThunk_Size + RtlUserThreadStart_Size + 0x200 + 8 (NULL)
+    ; + 8 (gadget was already popped by RET) + stack_args
+    add   rsp, r12             ; Skip BaseThreadInitThunk frame
+    add   rsp, r13             ; Skip RtlUserThreadStart frame
+    add   rsp, 0x200           ; Skip reserved buffer
+    add   rsp, 8               ; Skip NULL terminator
+
+    ; ---- Restore non-volatile registers from PRM ----
+    mov   rdi, [rbx + 0x10]   ; Restore RDI
+    mov   rsi, [rbx + 0x18]   ; Restore RSI
+    mov   r12, [rbx + 0x20]   ; Restore R12
+    mov   r13, [rbx + 0x28]   ; Restore R13
+    mov   r14, [rbx + 0x30]   ; Restore R14
+    mov   r15, [rbx + 0x38]   ; Restore R15
+
+    ; ---- Return to the original caller ----
+    ; RAX still holds the syscall return value (NTSTATUS)
+    ; PRM.OG_retaddr holds the return address saved at Spoof entry
+    jmp   qword ptr [rbx + 0x08]  ; Jump to original return address</code></pre>
+
+<div class="card highlight">
+<h4>Why JMP Instead of RET?</h4>
+<p>The Fixup routine uses <code>jmp [rbx + 0x08]</code> instead of <code>ret</code> to return to the caller. After deallocating the synthetic stack, RSP is restored to its original position &mdash; but the original return address was saved in the PRM structure (at <code>OG_retaddr</code>), not on the stack. Using <code>JMP</code> to the saved address avoids any dependency on the stack state and ensures the return is clean regardless of how many stack manipulations occurred.</p>
+</div>
+
+<div class="card">
+<h4>State After Fixup Completes</h4>
+<table>
+<tr><th>Component</th><th>State</th></tr>
+<tr><td><strong>RAX</strong></td><td>Syscall return value (NTSTATUS) &mdash; untouched throughout</td></tr>
+<tr><td><strong>RSP</strong></td><td>Restored to pre-Spoof position</td></tr>
+<tr><td><strong>RDI, RSI, R12&ndash;R15</strong></td><td>Restored from PRM saved values</td></tr>
+<tr><td><strong>RBX</strong></td><td>Points to PRM (will be restored by the C compiler's epilogue)</td></tr>
+<tr><td><strong>RIP</strong></td><td>Back at the original call site (the instruction after the DRAUGR_SYSCALL macro)</td></tr>
+<tr><td><strong>Synthetic stack</strong></td><td>Fully deallocated &mdash; no trace remains</td></tr>
+</table>
+</div>
+
+<div class="card warn">
+<h4>Fixup Must Be Exact</h4>
+<p>The <code>add rsp</code> instructions in Fixup must deallocate <strong>exactly</strong> the number of bytes that Spoof allocated. If the deallocation is off by even one byte, RSP will be misaligned. On x64 Windows, the stack must be 16-byte aligned before any <code>CALL</code> instruction. A misaligned RSP causes <code>MOVAPS</code> instructions (used by the C runtime and many Windows APIs) to fault with an alignment exception. This is one of the most common bugs when implementing stack spoofing &mdash; and one of the hardest to debug because the crash occurs far from the actual mistake.</p>
+</div>
+
+<!-- ==================== SECTION 5: Why This Is Elegant ==================== -->
+<h2>Why This Return Mechanism Is Elegant</h2>
+
+<div class="card green">
+<h4>No Exception Handlers Needed</h4>
+<p>Unlike WithSecure's approach (which uses a Vectored Exception Handler to catch a crash at the fake return address), Draugr never crashes. The gadget redirects execution cleanly to the Fixup routine. No VEH registration, no exception dispatch overhead, no risk of interfering with the application's own exception handlers.</p>
+</div>
+
+<div class="card green">
+<h4>Native Execution Speed</h4>
+<p>The return path is three instructions: <code>RET</code> (pop gadget), <code>JMP [RBX]</code> (to Fixup), then Fixup's register restores and <code>JMP</code>. There are no timer callbacks, no thread pool work items, no context switches. The entire return happens at full CPU speed with zero overhead beyond the instructions themselves.</p>
+</div>
+
+<div class="card green">
+<h4>Return Value Preserved in RAX</h4>
+<p>Because the gadget and Fixup routine never touch RAX, the syscall's return value (typically an NTSTATUS code) flows back to the caller untouched. The calling C code can immediately check the return value: <code>if (NT_SUCCESS(status)) { ... }</code>. Other approaches (like timer-based restoration) struggle to return values because the syscall happens in a different execution context.</p>
+</div>
+
+<div class="card green">
+<h4>Stack Perfectly Restored</h4>
+<p>After Fixup, the stack pointer, all callee-saved registers, and the return address are exactly as they were before the Spoof routine was called. The C compiler-generated code around the <code>DRAUGR_SYSCALL</code> macro continues executing without any awareness that the stack was ever manipulated.</p>
+</div>
+
+<!-- ==================== SECTION 5b: Invisible to Stack Walkers ==================== -->
+<div class="card green">
+<h4>Invisible to Stack Walkers During Execution</h4>
+<p>While the syscall is executing in kernel mode, any stack walker (including EDR kernel callbacks) that inspects the thread's stack sees only the synthetic frames. The real return address is safely hidden inside the PRM structure in user-mode memory, not on the stack at all. The stack contains only legitimate-looking frames pointing into signed Microsoft DLLs. Once Fixup completes, the synthetic stack is fully deallocated and the PRM is just a local variable &mdash; no forensic trace of the spoofing remains on the stack.</p>
+</div>
+
+<div class="card">
+<h4>Contrast: Exception-Based Approaches Leave Traces</h4>
+<p>Approaches that rely on exception handlers (like WithSecure's VEH-based method) generate observable artifacts. The exception dispatch mechanism writes to the exception record chain, fires ETW events for the exception, and requires a registered VEH callback. Even after recovery, the exception metadata persists in system telemetry. Draugr's gadget-based approach generates no exceptions, no ETW exception events, and requires no handler registration. The entire operation completes as a series of normal memory reads, writes, and jumps.</p>
+</div>
+
+<!-- ==================== SECTION 6: Comparison ==================== -->
+<h2>Comparison: Return Mechanisms</h2>
+
+<div class="versus">
+<div class="card" style="border-left:3px solid var(--accent)">
+<h4>Draugr: Gadget-Based Fixup</h4>
+<ul>
+<li><strong>Mechanism</strong>: <code>JMP [RBX]</code> gadget &rarr; Fixup routine</li>
+<li><strong>Speed</strong>: Native &mdash; 3 instructions on the return path</li>
+<li><strong>Return value</strong>: Preserved in RAX, immediately available</li>
+<li><strong>Side effects</strong>: None &mdash; no exceptions, no callbacks</li>
+<li><strong>Complexity</strong>: Requires gadget scanning and PRM structure</li>
+</ul>
+</div>
+
+<div class="card" style="border-left:3px solid var(--red)">
+<h4>WithSecure: VEH Crash Recovery</h4>
+<ul>
+<li><strong>Mechanism</strong>: Fake return address causes ACCESS_VIOLATION; VEH handler catches it and restores context</li>
+<li><strong>Speed</strong>: Slower &mdash; exception dispatch is expensive (kernel roundtrip)</li>
+<li><strong>Return value</strong>: Difficult to extract (saved in CONTEXT structure)</li>
+<li><strong>Side effects</strong>: Generates exceptions visible to debuggers and ETW</li>
+<li><strong>Complexity</strong>: Requires VEH registration and context manipulation</li>
+</ul>
+</div>
+
+<div class="card" style="border-left:3px solid var(--yellow)">
+<h4>Timer-Based Restoration</h4>
+<ul>
+<li><strong>Mechanism</strong>: Thread pool callback restores the original stack after a sleep period</li>
+<li><strong>Speed</strong>: Non-deterministic &mdash; depends on timer resolution</li>
+<li><strong>Return value</strong>: Cannot retrieve &mdash; the syscall and restoration happen in different contexts</li>
+<li><strong>Side effects</strong>: Thread pool activity is logged; timing-dependent bugs</li>
+<li><strong>Complexity</strong>: Simpler setup but unreliable return flow</li>
+</ul>
+</div>
+
+<div class="card" style="border-left:3px solid var(--dim)">
+<h4>ThreadStackSpoofer: Overwrite During Sleep</h4>
+<ul>
+<li><strong>Mechanism</strong>: Overwrites return addresses on the real stack during Beacon sleep</li>
+<li><strong>Speed</strong>: N/A &mdash; only active during sleep, not during API calls</li>
+<li><strong>Return value</strong>: N/A &mdash; does not intercept individual syscalls</li>
+<li><strong>Side effects</strong>: Stack is only spoofed while sleeping; real stack visible during execution</li>
+<li><strong>Complexity</strong>: Simple but limited scope</li>
+</ul>
+</div>
+</div>
+
+<!-- ==================== QUIZ ==================== -->
+<div class="quiz" id="quiz7">
+<h4>Module 7 Quiz: Gadgets, Fixup &amp; Clean Return</h4>
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why does Draugr use a JMP [RBX] gadget found in kernelbase.dll rather than jumping directly to the Fixup routine?</p>
+<label data-opt="0"><input type="radio" name="q7_0"> Direct jumps are slower than indirect jumps</label>
+<label data-opt="1"><input type="radio" name="q7_0"> The Fixup routine's address is not known at compile time</label>
+<label data-opt="2"><input type="radio" name="q7_0"> The return address (gadget) must point into a legitimate signed DLL so EDR stack checks see a valid code address, not an address in shellcode memory</label>
+<label data-opt="3"><input type="radio" name="q7_0"> RBX cannot hold a direct address</label>
+<div class="explain">The gadget address is placed on the stack as a return address. EDRs validate return addresses against loaded modules. If the return address pointed directly to the Fixup routine (which lives in shellcode/BOF memory), the EDR would detect an unbacked caller. By routing through a gadget in kernelbase.dll, the return address appears legitimate.</div>
+</div>
+<div class="quiz-q" data-correct="3">
+<p>Q2: After the Fixup routine completes, what is the state of the syscall's return value?</p>
+<label data-opt="0"><input type="radio" name="q7_1"> It is stored in the PRM structure and must be read from there</label>
+<label data-opt="1"><input type="radio" name="q7_1"> It is lost because the Fixup routine overwrites RAX</label>
+<label data-opt="2"><input type="radio" name="q7_1"> It is placed on the stack for the caller to pop</label>
+<label data-opt="3"><input type="radio" name="q7_1"> It remains in RAX, untouched by the gadget and Fixup routine, and is immediately available to the calling code</label>
+<div class="explain">Neither the JMP [RBX] gadget nor the Fixup routine modifies RAX. The syscall return value (NTSTATUS) stays in RAX throughout the entire return path, so the C code that called DRAUGR_SYSCALL can check the result immediately, just like a normal function call.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz7')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module6.html">&larr; Prev: Synthetic Frame Construction</a>
+<a class="primary" href="module8.html">Next: Full Chain &amp; Detection &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>
