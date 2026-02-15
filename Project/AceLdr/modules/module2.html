@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 2: The PE File Format - AceLdr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F5A5;</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#00d4ff;--accent2:#7c3aed;--gradient:linear-gradient(135deg,#00d4ff,#7c3aed)}</style>
+</head>
+<body>
+
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>AceLdr Course</h2>
+<span>Memory Evasion Masterclass</span>
+</div>
+<a class="home-link" href="../AceLdr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">1</span> Windows Memory 101</a>
+<a class="mod-link active" href="module2.html"><span class="diff d1">2</span> PE File Format</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">3</span> PEB &amp; API Hashing</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">4</span> Reflective Loading</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">5</span> Position-Independent Code</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">6</span> IAT Hooking</a>
+<a class="mod-link" href="module7.html"><span class="diff d3">7</span> Return Addr Spoofing</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">8</span> FOLIAGE Sleep Mask</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">9</span> Full Chain &amp; Integration</a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 2: The PE File Format</h1>
+<p class="subtitle">Every .exe and .dll is a PE. AceLdr manually parses one in memory.</p>
+
+<div class="card highlight">
+<h4>The Big Picture</h4>
+<p>A <strong>Portable Executable (PE)</strong> is the file format for Windows executables, DLLs, and drivers. When AceLdr "reflectively loads" Beacon, it's manually doing what the Windows loader (<code>ntdll!LdrLoadDll</code>) normally does: parsing the PE, mapping sections, resolving imports, and applying relocations. Understanding the PE format is <strong>mandatory</strong>.</p>
+</div>
+
+<h2>PE Structure Overview</h2>
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">PE File Layout</h4>
+<div class="flow" style="flex-direction:column;gap:4px;align-items:stretch;max-width:500px;margin:0 auto">
+<div class="box hl" style="width:100%">DOS Header (IMAGE_DOS_HEADER) - starts with "MZ"</div>
+<div class="box" style="width:100%">DOS Stub (legacy, usually "This program cannot be run in DOS mode")</div>
+<div class="box hl" style="width:100%">NT Headers (IMAGE_NT_HEADERS) - starts with "PE\0\0"</div>
+<div class="box" style="width:100%;font-size:.75rem">&#x251C; Signature<br>&#x251C; FileHeader (machine, number of sections, timestamp)<br>&#x2514; OptionalHeader (entry point, image base, data directories)</div>
+<div class="box y" style="width:100%">Section Headers[] - .text, .rdata, .data, .reloc, etc.</div>
+<div class="box g" style="width:100%">Section Data (actual code and data)</div>
+</div>
+</div>
+
+<h3>The DOS Header</h3>
+<p>Every PE file starts with the <code>IMAGE_DOS_HEADER</code> structure. The very first two bytes are <code>0x4D 0x5A</code> ("MZ" - Mark Zbikowski's initials, one of the original MS-DOS architects). The most important field for modern use is <code>e_lfanew</code>, a 4-byte offset at position 0x3C that tells you where the NT Headers begin.</p>
+
+<h3>The NT Headers</h3>
+<p>Located at the offset specified by <code>e_lfanew</code>, the NT Headers start with the signature <code>0x50 0x45 0x00 0x00</code> ("PE\0\0"). They contain two sub-structures:</p>
+<ul>
+<li><strong>FileHeader</strong> (<code>IMAGE_FILE_HEADER</code>): Machine type, number of sections, timestamp, characteristics</li>
+<li><strong>OptionalHeader</strong> (<code>IMAGE_OPTIONAL_HEADER64</code>): Entry point RVA, image base, section alignment, size of image, data directories (imports, exports, relocations, etc.)</li>
+</ul>
+
+<h2>Key Structures in AceLdr</h2>
+<p>AceLdr's <code>ace.c</code> directly accesses these PE structures:</p>
+
+<pre><code><span class="lang-tag">C - from ace.c calculateRegions()</span>// The DOS header is the first thing in any PE
+pReg-&gt;Dos = C_PTR( G_END() );   // Points to start of Beacon PE
+
+// e_lfanew tells us where NT headers begin (offset from DOS header)
+pReg-&gt;NT  = C_PTR( U_PTR( pReg-&gt;Dos ) + pReg-&gt;Dos-&gt;e_lfanew );
+
+// SizeOfImage = total virtual size needed when mapped into memory
+ILn = ( ( ( pReg-&gt;NT-&gt;OptionalHeader.SizeOfImage ) + 0x1000 - 1 )
+        &amp;~( 0x1000 - 1 ) );  // Round up to page boundary</code></pre>
+
+<div class="card">
+<h4>Understanding the Page Alignment</h4>
+<p>The expression <code>(size + 0x1000 - 1) &amp; ~(0x1000 - 1)</code> is a common bit trick to round up to the nearest 4 KB page boundary. For example, if <code>SizeOfImage</code> is 0x3200 (12,800 bytes), this rounds it up to 0x4000 (16,384 = 4 pages). This ensures the allocation is properly aligned for virtual memory management.</p>
+</div>
+
+<h2>Sections: Where Code and Data Live</h2>
+<p>A PE is divided into <strong>sections</strong>. Each has a name, virtual address, raw data offset, and characteristics (permissions):</p>
+
+<table>
+<tr><th>Section</th><th>Contains</th><th>Typical Protection</th></tr>
+<tr><td><code>.text</code></td><td>Executable code</td><td>RX (Read + Execute)</td></tr>
+<tr><td><code>.rdata</code></td><td>Read-only data, import tables, strings</td><td>R (Read Only)</td></tr>
+<tr><td><code>.data</code></td><td>Global/static initialized variables</td><td>RW (Read + Write)</td></tr>
+<tr><td><code>.reloc</code></td><td>Base relocation table</td><td>R (Read Only)</td></tr>
+</table>
+
+<h3>How AceLdr Copies Sections</h3>
+<p>After allocating memory for the entire image, AceLdr iterates through each section header and copies the raw data to its correct virtual address offset:</p>
+
+<pre><code><span class="lang-tag">C - from ace.c copyBeaconSections()</span>// Map = destination base address (after our stub)
+Map = C_PTR( U_PTR( buffer ) + reg.Exec );
+
+// Get pointer to first section header
+Sec = IMAGE_FIRST_SECTION( reg.NT );
+
+// Copy each section to its virtual address
+for( int i = 0; i &lt; reg.NT-&gt;FileHeader.NumberOfSections; ++i )
+{
+    Destination = C_PTR( U_PTR( Map ) + Sec[i].VirtualAddress );
+    Source      = C_PTR( U_PTR( reg.Dos ) + Sec[i].PointerToRawData );
+    Length      = Sec[i].SizeOfRawData;
+    memcpy( Destination, Source, Length );
+}</code></pre>
+
+<div class="card green">
+<h4>Key Insight: Virtual vs Raw Addresses</h4>
+<p><code>VirtualAddress</code> is the RVA (Relative Virtual Address) where the section should be mapped in memory. <code>PointerToRawData</code> is the offset in the file where the section's data actually lives. These are different because the PE file on disk is packed tightly, but in memory each section is aligned to page boundaries (typically 0x1000).</p>
+</div>
+
+<h2>The Import Address Table (IAT)</h2>
+<p>When a PE calls <code>Sleep()</code> or <code>HeapAlloc()</code>, it doesn't know the addresses at compile time. Instead, it uses the <strong>IAT</strong> - a table of function pointers filled in at load time. AceLdr fills this table manually via <code>LdrProcessIat()</code> and then <strong>overwrites specific entries with hooks</strong>.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">IAT Hook Flow</h4>
+<div class="flow">
+<div class="box">Beacon calls<br><code>Sleep()</code></div>
+<div class="arrow">&rarr;</div>
+<div class="box y">IAT Entry<br>(overwritten)</div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">AceLdr's<br><code>Sleep_Hook()</code></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Encrypt + APC<br>chain sleep</div>
+</div>
+</div>
+
+<p>The IAT resolution process works in two passes:</p>
+<ol>
+<li><strong>First pass</strong> (<code>LdrProcessIat</code>): Walk each import descriptor, load the required DLL (or find it already loaded), and fill in every function pointer in the IAT with the real address.</li>
+<li><strong>Second pass</strong> (<code>installHooks</code>): Overwrite 6 specific IAT entries with pointers to AceLdr's hook functions. Beacon will call these hooks instead of the real Windows APIs.</li>
+</ol>
+
+<h2>Base Relocations</h2>
+<p>A PE is compiled with a <strong>preferred base address</strong> (<code>OptionalHeader.ImageBase</code>). If it gets loaded at a different address (which AceLdr guarantees, since it uses <code>NtAllocateVirtualMemory</code> with no preferred base), all absolute addresses in the code are wrong. <strong>Relocations</strong> fix this by adding the delta between the preferred and actual base:</p>
+
+<pre><code><span class="lang-tag">C - from util.c LdrProcessRel()</span>// Calculate offset between actual and preferred address
+Ofs = U_PTR( U_PTR( image ) - U_PTR( imageBase ) );
+
+while ( Ibr-&gt;VirtualAddress != 0 ) {
+    Rel = ( PIMAGE_RELOC )( Ibr + 1 );
+    while ( C_PTR( Rel ) != C_PTR( U_PTR( Ibr ) + Ibr-&gt;SizeOfBlock ) )
+    {
+        switch( Rel-&gt;Type ) {
+            case IMAGE_REL_BASED_DIR64:  // 64-bit absolute fixup
+                *( DWORD64 * )( U_PTR( image ) + Ibr-&gt;VirtualAddress
+                    + Rel-&gt;Offset ) += ( DWORD64 )( Ofs );
+                break;
+            case IMAGE_REL_BASED_HIGHLOW: // 32-bit absolute fixup
+                *( DWORD32 * )( U_PTR( image ) + Ibr-&gt;VirtualAddress
+                    + Rel-&gt;Offset ) += ( DWORD32 )( Ofs );
+                break;
+        }
+        ++Rel;
+    }
+    Ibr = C_PTR( Rel );
+}</code></pre>
+
+<div class="card">
+<h4>Understanding Relocations</h4>
+<p>The relocation table is organized into blocks. Each block covers a page (identified by <code>VirtualAddress</code>) and contains a list of entries. Each entry has a <code>Type</code> and an <code>Offset</code> within that page. For <code>IMAGE_REL_BASED_DIR64</code> (the most common on x64), the fix is simple: add the delta to the 8-byte value at the specified address. This patches all absolute addresses so the code works at its new location.</p>
+</div>
+
+<div class="quiz" id="quiz2">
+<h4>Pop Quiz: PE Format</h4>
+<div class="quiz-q" data-correct="2">
+<p>Q1: What does <code>e_lfanew</code> in the DOS header point to?</p>
+<label data-opt="0"><input type="radio" name="q2_0"> The entry point of the program</label>
+<label data-opt="1"><input type="radio" name="q2_0"> The first section header</label>
+<label data-opt="2"><input type="radio" name="q2_0"> The NT Headers (IMAGE_NT_HEADERS)</label>
+<label data-opt="3"><input type="radio" name="q2_0"> The import table</label>
+<div class="explain">e_lfanew is an offset from the start of the DOS header to the PE signature and NT headers. It's the bridge from the legacy DOS header to the modern PE structure.</div>
+</div>
+<div class="quiz-q" data-correct="1">
+<p>Q2: Why does AceLdr need to process base relocations?</p>
+<label data-opt="0"><input type="radio" name="q2_1"> To compress the PE file</label>
+<label data-opt="1"><input type="radio" name="q2_1"> Because Beacon is loaded at a different address than its preferred ImageBase</label>
+<label data-opt="2"><input type="radio" name="q2_1"> To hide the PE header from scanners</label>
+<label data-opt="3"><input type="radio" name="q2_1"> Relocations are always required by Windows</label>
+<div class="explain">When a PE is loaded at a different base address than it was compiled for, absolute addresses in the code are wrong. Relocations patch these addresses by adding the delta. AceLdr uses NtAllocateVirtualMemory which gives an arbitrary address, so relocations are essential.</div>
+</div>
+<div class="quiz-q" data-correct="3">
+<p>Q3: What does AceLdr do to the IAT after populating it normally?</p>
+<label data-opt="0"><input type="radio" name="q2_2"> Encrypts all entries</label>
+<label data-opt="1"><input type="radio" name="q2_2"> Deletes it to save memory</label>
+<label data-opt="2"><input type="radio" name="q2_2"> Nothing, it leaves it as-is</label>
+<label data-opt="3"><input type="radio" name="q2_2"> Overwrites specific entries with hook function pointers</label>
+<div class="explain">After LdrProcessIat() fills in all the normal function pointers, installHooks() uses LdrHookImport() to replace specific entries (Sleep, GetProcessHeap, HeapAlloc, InternetConnectA, NtWaitForSingleObject, RtlAllocateHeap) with AceLdr's custom hook functions.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz2')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module1.html">&larr; Previous: Windows Memory 101</a>
+<a class="primary" href="module3.html">Next: PEB &amp; API Hashing &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

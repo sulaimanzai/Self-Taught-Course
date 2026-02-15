@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 7: The symbol&lt;T&gt; Template - Stardust Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⭐</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#c084fc;--accent2:#38bdf8;--gradient:linear-gradient(135deg,#c084fc,#38bdf8)}</style>
+</head>
+<body>
+
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Stardust Course</h2>
+<span>Modern Implant Template Masterclass</span>
+</div>
+<a class="home-link" href="../Stardust_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">01</span> Why Stardust Exists</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">02</span> Modern C++ for Shellcode</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">03</span> Project Anatomy</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">04</span> Position-Independent Code</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">05</span> Compile-Time Hashing</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">06</span> PEB &amp; API Resolution</a>
+<a class="mod-link active" href="module7.html"><span class="diff d2">07</span> The symbol&lt;T&gt; Template</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">08</span> Linker Script &amp; Sections</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">09</span> Module Stomping</a>
+<a class="mod-link" href="module10.html"><span class="diff d3">10</span> Full Chain &amp; Extending</a>
+</nav>
+
+<main>
+<span class="diff-badge medium">Difficulty: Intermediate</span>
+<h1>Module 7: The symbol&lt;T&gt; Template</h1>
+<p class="subtitle">Position-independent string access &mdash; how shellcode references data without absolute addresses.</p>
+
+<div class="card highlight">
+<h4>Important Distinction</h4>
+<p>The <code>symbol&lt;T&gt;</code> template is for <strong>position-independent string access</strong>. It is <em>not</em> part of the API resolution system (which uses <code>resolve::module</code>, <code>resolve::_api</code>, and <code>RESOLVE_IMPORT</code> as covered in Module 6). <code>symbol&lt;T&gt;</code> solves a different problem: how does shellcode reference its own embedded string data when it doesn't know what address it was loaded at?</p>
+</div>
+
+<h2>The String Problem</h2>
+<p>When you write a string literal in C/C++, the compiler places it in the <code>.rdata</code> (read-only data) section and generates code that references it using an <strong>absolute address</strong>. For a normal executable, this works fine &mdash; the loader maps the binary at its preferred base address, and everything lines up.</p>
+<p>But shellcode has no loader. It gets injected at an <strong>arbitrary address</strong>. Those absolute references now point to garbage (or, more likely, an access violation).</p>
+
+<pre><code><span class="lang-tag">C++</span>// Normal code - compiler generates absolute address reference
+const char* msg = "Hello";
+// Compiled to something like: lea rax, [0x140003000]
+// If shellcode is loaded at 0x200000 instead of 0x140000000... CRASH
+
+// Shellcode needs: calculate the ACTUAL address of "Hello" at runtime
+// regardless of where in memory the shellcode was loaded</code></pre>
+
+<h2>The symbol&lt;T&gt; Implementation</h2>
+<p>Stardust's solution lives in <code>common.h</code>. The <code>symbol&lt;T&gt;</code> struct uses a function called <code>RipData()</code> whose own address serves as a known reference point. Because <code>RipData()</code> is a function, the CPU can find it via RIP-relative addressing (which works at any load address). The compile-time distance between <code>RipData()</code> and the string data is baked into the binary and <strong>never changes</strong>, regardless of where the shellcode is loaded.</p>
+
+<pre><code><span class="lang-tag">C++</span>// common.h - symbol&lt;T&gt; (simplified)
+template&lt;typename T&gt;
+struct symbol {
+    // 's' holds the compile-time distance from RipData to the string
+    uintptr_t s;
+
+    // RipData() returns its own runtime address
+    // The address of RipData itself is the anchor point
+    static auto RipData() -&gt; uintptr_t {
+        return (uintptr_t)&amp;RipData;
+    }
+
+    // To get the runtime string address:
+    // runtime_string_addr = RipData_runtime_addr - compile_time_distance
+    // Which is: &amp;RipData - s
+    auto get() -&gt; T {
+        return (T)( RipData() - s );
+    }
+};</code></pre>
+
+<h3>Step-by-Step: The Math</h3>
+<p>Here's what happens when Stardust accesses a string via <code>symbol&lt;T&gt;</code>:</p>
+
+<ol>
+<li><strong>At compile time:</strong> The linker calculates <code>s = &amp;RipData - &amp;string_data</code>. This is a fixed distance &mdash; it depends only on the relative layout of code and data in the binary, not on any absolute address.</li>
+<li><strong>At runtime:</strong> The shellcode is loaded at some unknown base address. <code>RipData()</code> uses RIP-relative addressing to return its own actual address.</li>
+<li><strong>The calculation:</strong> <code>RipData() - s</code> gives the actual runtime address of the string.</li>
+</ol>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Compile-Time vs Runtime Address Translation</h4>
+<div style="display:flex;gap:30px;justify-content:center;flex-wrap:wrap">
+<div style="flex:1;min-width:280px">
+<p style="text-align:center;color:var(--dim);font-weight:700;margin-bottom:10px">At Compile Time (base 0x1000)</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box b" style="width:100%">string "Hello" at 0x1200</div>
+<div class="box" style="width:100%">... other data ...</div>
+<div class="box hl" style="width:100%">RipData() at 0x1500</div>
+</div>
+<p style="text-align:center;color:var(--dim);margin-top:8px;font-size:.85rem">s = 0x1500 - 0x1200 = 0x300</p>
+</div>
+<div style="flex:1;min-width:280px">
+<p style="text-align:center;color:var(--green);font-weight:700;margin-bottom:10px">At Runtime (loaded at 0x7000)</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box g" style="width:100%">string "Hello" at 0x7200</div>
+<div class="box" style="width:100%">... other data ...</div>
+<div class="box g" style="width:100%">RipData() at 0x7500</div>
+</div>
+<p style="text-align:center;color:var(--green);margin-top:8px;font-size:.85rem">RipData() - s = 0x7500 - 0x300 = 0x7200 &#10004;</p>
+</div>
+</div>
+<p style="text-align:center;color:var(--accent2);margin-top:15px;font-size:.85rem;font-weight:600">The distance (0x300) stays constant &mdash; only the base address changes.</p>
+</div>
+
+<h2>The G_SYM Macro</h2>
+<p>For convenience, Stardust provides a <code>G_SYM</code> macro that wraps common uses of <code>symbol&lt;T&gt;</code>. Instead of manually constructing a <code>symbol&lt;T&gt;</code> and calling <code>.get()</code>, you can use <code>G_SYM</code> as a shorthand to access global symbol data in a position-independent way.</p>
+
+<pre><code><span class="lang-tag">C++</span>// Instead of manual symbol&lt;T&gt; usage:
+auto str = symbol&lt;const char*&gt;{ offset_value }.get();
+
+// G_SYM provides a cleaner interface:
+auto str = G_SYM( my_string );</code></pre>
+
+<h2>Comparison: AceLdr's OFFSET Macro</h2>
+<p>AceLdr solves the same problem with its <code>OFFSET</code> macro. Despite the different syntax (C macro vs C++ template), the <strong>underlying principle is identical</strong>:</p>
+
+<div class="versus">
+<div>
+<h5 style="color:var(--accent)">Stardust: symbol&lt;T&gt;</h5>
+<ul>
+<li>C++ template struct</li>
+<li>Uses <code>RipData()</code> function address as anchor</li>
+<li>Formula: <code>&amp;RipData - s</code></li>
+<li>Type-safe via template parameter</li>
+</ul>
+</div>
+<div>
+<h5 style="color:var(--accent2)">AceLdr: OFFSET Macro</h5>
+<ul>
+<li>C preprocessor macro</li>
+<li>Uses a known code label as anchor</li>
+<li>Formula: <code>known_addr - compile_time_distance</code></li>
+<li>Cast manually by the caller</li>
+</ul>
+</div>
+</div>
+
+<p>Both approaches rely on the same fundamental insight: the <strong>relative distance</strong> between two points in the binary is fixed at compile time. If you can determine the runtime address of one point (via RIP-relative addressing), you can calculate the runtime address of any other point by subtracting the known distance.</p>
+
+<div class="card green">
+<h4>Key Takeaway</h4>
+<p><code>symbol&lt;T&gt;</code> exists because shellcode cannot use absolute addresses for data access. It translates compile-time-known relative offsets into runtime-correct pointers using a simple anchor-point calculation. This is critical for accessing any embedded strings or data structures within the shellcode blob.</p>
+</div>
+
+<div class="quiz" id="quiz1">
+<h4>Knowledge Check</h4>
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why can't shellcode use string literals like normal programs?</p>
+<label data-opt="0"><input type="radio" name="q7_0"> String literals consume too much memory for shellcode</label>
+<label data-opt="1"><input type="radio" name="q7_0"> The Windows API blocks string access from injected code</label>
+<label data-opt="2"><input type="radio" name="q7_0"> The compiler generates absolute addresses for .rdata, which are wrong when loaded at an arbitrary address</label>
+<label data-opt="3"><input type="radio" name="q7_0"> Shellcode runs in kernel mode where .rdata is not accessible</label>
+<div class="explain">Correct! The compiler places string literals in .rdata and references them with absolute addresses based on the binary's preferred base address. When shellcode is injected at a different address, those absolute references point to invalid memory. symbol&lt;T&gt; solves this by computing string addresses relative to a known anchor point at runtime.</div>
+</div>
+<div class="quiz-q" data-correct="3">
+<p>Q2: In the symbol&lt;T&gt; calculation, what value stays constant regardless of where the shellcode is loaded?</p>
+<label data-opt="0"><input type="radio" name="q7_1"> The address of RipData()</label>
+<label data-opt="1"><input type="radio" name="q7_1"> The runtime address of the string</label>
+<label data-opt="2"><input type="radio" name="q7_1"> The base address of the shellcode</label>
+<label data-opt="3"><input type="radio" name="q7_1"> The compile-time distance (s) between RipData and the string data</label>
+<div class="explain">Correct! The distance 's' is calculated at compile/link time based on the relative positions of RipData() and the string within the binary. This relative layout is fixed in the binary and doesn't change when the shellcode is loaded at a different address. That's why the formula RipData() - s always yields the correct runtime address.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module6.html">&larr; Prev: PEB &amp; API Resolution</a>
+<a class="primary" href="module8.html">Next: Linker Script &amp; Sections &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

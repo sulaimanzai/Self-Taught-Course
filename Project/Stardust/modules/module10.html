@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 10: Full Chain &amp; Extending Stardust - Stardust Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⭐</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#c084fc;--accent2:#38bdf8;--gradient:linear-gradient(135deg,#c084fc,#38bdf8)}</style>
+</head>
+<body>
+
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Stardust Course</h2>
+<span>Modern Implant Template Masterclass</span>
+</div>
+<a class="home-link" href="../Stardust_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">01</span> Why Stardust Exists</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">02</span> Modern C++ for Shellcode</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">03</span> Project Anatomy</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">04</span> Position-Independent Code</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">05</span> Compile-Time Hashing</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">06</span> PEB &amp; API Resolution</a>
+<a class="mod-link" href="module7.html"><span class="diff d2">07</span> The symbol&lt;T&gt; Template</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">08</span> Linker Script &amp; Sections</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">09</span> Module Stomping</a>
+<a class="mod-link active" href="module10.html"><span class="diff d3">10</span> Full Chain &amp; Extending</a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 10: Full Chain &amp; Extending Stardust</h1>
+<p class="subtitle">Putting it all together, and building on top of the template.</p>
+
+<div class="card highlight">
+<h4>The Big Picture</h4>
+<p>You've now studied every major subsystem of Stardust individually. This final module connects them into a complete execution chain, shows you how to extend the template with new capabilities, and provides a comprehensive comparison with AceLdr.</p>
+</div>
+
+<h2>Complete Execution Chain</h2>
+<p>From source code to running implant, Stardust's lifecycle has four phases:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Stardust: 4-Phase Execution Chain</h4>
+
+<div style="margin-bottom:20px">
+<p style="color:var(--accent2);font-weight:700;margin-bottom:8px">Phase 1: Build</p>
+<div class="flow" style="flex-wrap:wrap">
+<div class="box b">C++ Source</div>
+<div class="arrow">&rarr;</div>
+<div class="box b">MinGW Compiler</div>
+<div class="arrow">&rarr;</div>
+<div class="box b">Linker Script<br><span style="font-size:.7rem">(.text$A, $B, .rdata*, $C)</span></div>
+<div class="arrow">&rarr;</div>
+<div class="box b">objcopy</div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">stardust.bin</div>
+</div>
+</div>
+
+<div style="margin-bottom:20px">
+<p style="color:var(--yellow);font-weight:700;margin-bottom:8px">Phase 2: Injection (Loader-Side)</p>
+<div class="flow" style="flex-wrap:wrap">
+<div class="box y">LoadLibraryExA<br><span style="font-size:.7rem">DONT_RESOLVE_DLL_REFERENCES</span></div>
+<div class="arrow">&rarr;</div>
+<div class="box y">Find .text section</div>
+<div class="arrow">&rarr;</div>
+<div class="box y">VirtualProtect RW</div>
+<div class="arrow">&rarr;</div>
+<div class="box y">memcpy shellcode</div>
+<div class="arrow">&rarr;</div>
+<div class="box y">VirtualProtect RX</div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">Call entry</div>
+</div>
+<p style="color:var(--dim);font-size:.8rem;margin-top:5px;text-align:center">(Module stomping shown here; any injection technique works)</p>
+</div>
+
+<div style="margin-bottom:20px">
+<p style="color:var(--green);font-weight:700;margin-bottom:8px">Phase 3: Initialization (Inside Stardust)</p>
+<div class="flow" style="flex-wrap:wrap">
+<div class="box g">RipStart<br><span style="font-size:.7rem">(.text$A, byte 0)</span></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">start()</div>
+<div class="arrow">&rarr;</div>
+<div class="box g">PEB Walk<br><span style="font-size:.7rem">resolve::module()</span></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">RESOLVE_IMPORT<br><span style="font-size:.7rem">ntdll, kernel32, ...</span></div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">APIs Ready</div>
+</div>
+</div>
+
+<div>
+<p style="color:var(--accent);font-weight:700;margin-bottom:8px">Phase 4: Implant Logic</p>
+<div class="flow" style="flex-wrap:wrap">
+<div class="box hl">Your Code Here</div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">Call resolved APIs</div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">Use symbol&lt;T&gt; for strings</div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">Implant running</div>
+</div>
+</div>
+</div>
+
+<h2>How to Extend Stardust</h2>
+<p>Stardust is designed as a <strong>template</strong>, not a finished product. Here's how to add new capabilities.</p>
+
+<h3>Adding New API Declarations</h3>
+<p>To call a new Windows API, you need two things in <code>common.h</code>:</p>
+
+<pre><code><span class="lang-tag">C++</span>// Step 1: Add a D_API declaration to your API struct
+// D_API defines the function pointer type and its DJB2 hash
+// Example: adding WSAStartup from ws2_32.dll
+
+// In the ws2_32 API struct:
+struct ws2_32_apis {
+    D_API( void*, base );                    // Index 0: module base
+    D_API( int, WSAStartup );               // Index 1: function pointer
+    D_API( SOCKET, WSASocketW );            // Index 2: function pointer
+    D_API( int, connect );                  // Index 3: function pointer
+};
+
+// Step 2: Add the RESOLVE_TYPE for the module hash
+// This associates the struct with the DJB2 hash of "ws2_32.dll"
+RESOLVE_TYPE( ws2_32_apis, H_MODULE_WS2_32 );</code></pre>
+
+<h3>Using New APIs in start()</h3>
+<p>Once declared, resolve and call the APIs in the <code>start()</code> function:</p>
+
+<pre><code><span class="lang-tag">C++</span>// In start() - resolve all ws2_32 APIs in one call
+ws2_32_apis ws2;
+RESOLVE_IMPORT( ws2, H_MODULE_WS2_32 );
+
+// Now call them like normal function pointers
+WSADATA wsaData;
+ws2.WSAStartup( MAKEWORD(2, 2), &amp;wsaData );
+
+SOCKET sock = ws2.WSASocketW(
+    AF_INET, SOCK_STREAM, IPPROTO_TCP,
+    NULL, 0, 0
+);
+
+// Use symbol&lt;T&gt; for any string data you need
+auto target = G_SYM( target_host );  // position-independent string access</code></pre>
+
+<h3>Adding a New Module (DLL)</h3>
+<p>To resolve APIs from a DLL that Stardust doesn't already use (e.g., <code>ws2_32.dll</code> for networking):</p>
+<ol>
+<li><strong>Add the module hash:</strong> Define <code>H_MODULE_WS2_32</code> as the DJB2 hash of the string "ws2_32.dll" in your hash constants.</li>
+<li><strong>Create the API struct:</strong> Define a struct with <code>D_API</code> entries for each function you need (as shown above).</li>
+<li><strong>Add RESOLVE_TYPE:</strong> Associate the struct with the module hash.</li>
+<li><strong>Resolve in start():</strong> Call <code>RESOLVE_IMPORT</code> with your struct and module hash.</li>
+</ol>
+
+<div class="card warn">
+<h4>Remember the Rules</h4>
+<p>Every string you use must go through <code>symbol&lt;T&gt;</code> or <code>G_SYM</code> for position-independent access. Every API call must go through the resolution system. No direct string literals, no import table &mdash; these are the constraints of PIC shellcode.</p>
+</div>
+
+<h2>AceLdr vs Stardust: Final Comparison</h2>
+
+<table>
+<tr><th>Feature</th><th>AceLdr</th><th>Stardust</th></tr>
+<tr>
+<td><strong>Purpose</strong></td>
+<td>Cobalt Strike UDRL (loads Beacon DLL reflectively)</td>
+<td>Standalone implant template (shellcode framework)</td>
+</tr>
+<tr>
+<td><strong>Language</strong></td>
+<td>C with assembly</td>
+<td>Modern C++ with assembly</td>
+</tr>
+<tr>
+<td><strong>Compiler</strong></td>
+<td>MinGW toolchain</td>
+<td>MinGW toolchain</td>
+</tr>
+<tr>
+<td><strong>Hash Algorithm</strong></td>
+<td>DJB2</td>
+<td>DJB2</td>
+</tr>
+<tr>
+<td><strong>PE in Memory</strong></td>
+<td>Yes (loads Beacon DLL)</td>
+<td>No (pure shellcode, no PE)</td>
+</tr>
+<tr>
+<td><strong>Sleep Evasion</strong></td>
+<td>Yes (FOLIAGE sleep mask)</td>
+<td>No (template only, no sleep loop)</td>
+</tr>
+<tr>
+<td><strong>Return Address Spoofing</strong></td>
+<td>Yes (JMP RBX gadget)</td>
+<td>No</td>
+</tr>
+<tr>
+<td><strong>Heap Redirection</strong></td>
+<td>Yes (private heap + hooks)</td>
+<td>No</td>
+</tr>
+<tr>
+<td><strong>x86 Support</strong></td>
+<td>No (x64 only)</td>
+<td>No (x64 only)</td>
+</tr>
+<tr>
+<td><strong>Test Harness</strong></td>
+<td>Cobalt Strike integration</td>
+<td>stomper.cc (module stomping demo)</td>
+</tr>
+<tr>
+<td><strong>Base Size (x64)</strong></td>
+<td>~8&ndash;12 KB (loader + hooks + sleep chain)</td>
+<td>~2&ndash;4 KB (minimal template)</td>
+</tr>
+</table>
+
+<div class="card highlight">
+<h4>The Key Difference</h4>
+<p>AceLdr is a <strong>complete loader</strong> with built-in evasion (sleep masking, heap redirection, return address spoofing). Stardust is a <strong>minimal template</strong> &mdash; it provides the scaffolding (PIC, API resolution, section layout) and expects you to build your implant logic on top. Stardust doesn't include sleep evasion, heap redirection, or return address spoofing because those are features you would add yourself based on your operational needs.</p>
+</div>
+
+<h2>References &amp; Further Study</h2>
+
+<h3>Project Links</h3>
+<ul>
+<li><strong>Stardust Repository</strong> &mdash; The source code and build system for the Stardust implant template</li>
+<li><strong>Stardust Blog Post</strong> &mdash; The author's walkthrough explaining design decisions and implementation details</li>
+</ul>
+
+<h3>Related Projects</h3>
+<ul>
+<li><strong>AceLdr</strong> &mdash; Cobalt Strike UDRL with FOLIAGE sleep mask (covered in the companion course)</li>
+<li><strong>TitanLdr</strong> &mdash; Another reflective loader with similar evasion capabilities</li>
+<li><strong>Havoc Framework</strong> &mdash; C2 framework that implements concepts similar to Stardust's shellcode approach</li>
+<li><strong>ShellcodeTemplate</strong> &mdash; Alternative shellcode templates for comparison</li>
+</ul>
+
+<h3>Topics for Further Study</h3>
+<ul>
+<li><strong>Sleep evasion techniques</strong> &mdash; FOLIAGE, Ekko, Zilean patterns for encrypting shellcode during sleep</li>
+<li><strong>Syscall stubs</strong> &mdash; Direct and indirect syscalls to bypass userland hooks (SysWhispers, HellsGate)</li>
+<li><strong>ETW patching</strong> &mdash; Disabling Event Tracing for Windows to reduce telemetry</li>
+<li><strong>AMSI bypass</strong> &mdash; Preventing the Antimalware Scan Interface from inspecting in-memory content</li>
+<li><strong>Custom C2 protocols</strong> &mdash; Building communication channels with DNS, HTTP/S, or named pipes</li>
+<li><strong>Process injection techniques</strong> &mdash; Beyond module stomping: process hollowing, thread hijacking, APC injection</li>
+</ul>
+
+<div class="quiz" id="quiz1">
+<h4>Final Knowledge Check</h4>
+<div class="quiz-q" data-correct="1">
+<p>Q1: What is the correct initialization order inside Stardust after RipStart executes?</p>
+<label data-opt="0"><input type="radio" name="q10_0"> RESOLVE_IMPORT &rarr; PEB walk &rarr; start() &rarr; implant logic</label>
+<label data-opt="1"><input type="radio" name="q10_0"> start() &rarr; PEB walk (resolve::module) &rarr; RESOLVE_IMPORT &rarr; implant logic</label>
+<label data-opt="2"><input type="radio" name="q10_0"> PEB walk &rarr; symbol&lt;T&gt; init &rarr; RESOLVE_IMPORT &rarr; start()</label>
+<label data-opt="3"><input type="radio" name="q10_0"> implant logic &rarr; PEB walk &rarr; RESOLVE_IMPORT &rarr; start()</label>
+<div class="explain">Correct! RipStart calls start(), which then walks the PEB via resolve::module() to find DLL base addresses, uses RESOLVE_IMPORT to fill in function pointers, and finally runs the implant logic with the resolved APIs.</div>
+</div>
+<div class="quiz-q" data-correct="2">
+<p>Q2: To add a new API from a new DLL, which files/locations need changes?</p>
+<label data-opt="0"><input type="radio" name="q10_1"> Only the linker script needs a new section entry</label>
+<label data-opt="1"><input type="radio" name="q10_1"> Only start() needs a new function pointer cast</label>
+<label data-opt="2"><input type="radio" name="q10_1"> common.h (D_API struct + RESOLVE_TYPE) and start() (RESOLVE_IMPORT call + usage)</label>
+<label data-opt="3"><input type="radio" name="q10_1"> A new .cpp file must be created for each DLL</label>
+<div class="explain">Correct! You define the API struct with D_API entries and associate it with a module hash via RESOLVE_TYPE in common.h. Then in start(), you call RESOLVE_IMPORT to fill in the function pointers and use them in your implant logic.</div>
+</div>
+<div class="quiz-q" data-correct="0">
+<p>Q3: Which of the following does Stardust NOT include, compared to AceLdr?</p>
+<label data-opt="0"><input type="radio" name="q10_2"> Sleep evasion, heap redirection, and return address spoofing</label>
+<label data-opt="1"><input type="radio" name="q10_2"> PEB walking and API resolution</label>
+<label data-opt="2"><input type="radio" name="q10_2"> Position-independent code via linker script</label>
+<label data-opt="3"><input type="radio" name="q10_2"> Compile-time hash generation with DJB2</label>
+<div class="explain">Correct! AceLdr includes sleep evasion (FOLIAGE), heap redirection (private heap + hooks), and return address spoofing (JMP RBX gadget) as built-in features. Stardust is a minimal template that provides PIC scaffolding, API resolution, and section layout, but expects you to add evasion features yourself based on your needs.</div>
+</div>
+<div class="quiz-q" data-correct="0">
+<p>Q4: Approximately how large is the base Stardust x64 shellcode (before adding custom logic)?</p>
+<label data-opt="0"><input type="radio" name="q10_3"> ~2&ndash;4 KB</label>
+<label data-opt="1"><input type="radio" name="q10_3"> ~16&ndash;32 KB</label>
+<label data-opt="2"><input type="radio" name="q10_3"> ~64 KB</label>
+<label data-opt="3"><input type="radio" name="q10_3"> ~128 KB</label>
+<div class="explain">Correct! Stardust's minimal template compiles to approximately 2-4 KB of shellcode. This is much smaller than AceLdr (~8-12 KB) because Stardust doesn't include sleep evasion, heap redirection, or return address spoofing. The small size makes it practical to embed and inject.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="card" style="border:2px solid var(--accent);text-align:center;padding:40px;margin-top:30px;background:linear-gradient(135deg,#c084fc10,#38bdf810)">
+<h2 style="background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:1.8rem;margin-bottom:15px;border:none">Course Complete!</h2>
+<p style="font-size:1.1rem;color:var(--text);margin-bottom:20px">You've completed all 10 modules of the Stardust Deep Dive.</p>
+<p style="color:var(--dim)">You now understand: position-independent code, compile-time hashing with DJB2, PEB walking and API resolution, the symbol&lt;T&gt; template for string access, linker scripts and section layout, module stomping as an injection technique, and how to extend the template with new capabilities.</p>
+<p style="color:var(--accent);font-weight:600;margin-top:20px">Go build something.</p>
+</div>
+
+<div class="nav-btns">
+<a href="module9.html">&larr; Prev: Module Stomping</a>
+<a class="primary" href="../Stardust_index.html">Back to Course Home &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 3: PEB Walking &amp; API Hashing - AceLdr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F5A5;</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#00d4ff;--accent2:#7c3aed;--gradient:linear-gradient(135deg,#00d4ff,#7c3aed)}</style>
+</head>
+<body>
+
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>AceLdr Course</h2>
+<span>Memory Evasion Masterclass</span>
+</div>
+<a class="home-link" href="../AceLdr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">1</span> Windows Memory 101</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">2</span> PE File Format</a>
+<a class="mod-link active" href="module3.html"><span class="diff d1">3</span> PEB &amp; API Hashing</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">4</span> Reflective Loading</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">5</span> Position-Independent Code</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">6</span> IAT Hooking</a>
+<a class="mod-link" href="module7.html"><span class="diff d3">7</span> Return Addr Spoofing</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">8</span> FOLIAGE Sleep Mask</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">9</span> Full Chain &amp; Integration</a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 3: PEB Walking &amp; API Hashing</h1>
+<p class="subtitle">How to find any Windows API without a single suspicious import.</p>
+
+<div class="card highlight">
+<h4>The Problem</h4>
+<p>Normal programs <code>#include &lt;windows.h&gt;</code> and call functions directly. The linker adds them to the import table, and anyone running <code>strings</code> on the binary can see exactly what APIs it uses. A binary importing <code>NtAllocateVirtualMemory</code>, <code>NtProtectVirtualMemory</code>, and <code>NtQueueApcThread</code> screams "shellcode loader." AceLdr imports <strong>zero</strong> functions. It finds everything at runtime.</p>
+</div>
+
+<h2>The PEB: Your Window Into the Process</h2>
+<p>Every Windows thread has a <strong>TEB (Thread Environment Block)</strong>. The TEB contains a pointer to the <strong>PEB (Process Environment Block)</strong>. The PEB contains, among other things, a linked list of all loaded DLLs. AceLdr walks this list to find modules like <code>ntdll.dll</code>.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">PEB Module Discovery Chain</h4>
+<div class="flow">
+<div class="box hl">TEB<br><small>(gs:[0x60] on x64)</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">PEB</div>
+<div class="arrow">&rarr;</div>
+<div class="box y">PEB_LDR_DATA</div>
+<div class="arrow">&rarr;</div>
+<div class="box g">InLoadOrderModuleList<br><small>(linked list of LDR_DATA_TABLE_ENTRY)</small></div>
+</div>
+</div>
+
+<div class="card">
+<h4>TEB and PEB Access on x64</h4>
+<p>On x64 Windows, the TEB is pointed to by the <code>gs</code> segment register. The PEB pointer is at offset <code>0x60</code> within the TEB. So <code>gs:[0x60]</code> gives you the PEB address directly. In C code, this is equivalent to <code>NtCurrentTeb()-&gt;ProcessEnvironmentBlock</code>. The PEB then contains a <code>Ldr</code> field (a <code>PEB_LDR_DATA</code> pointer) which holds the linked lists of loaded modules.</p>
+</div>
+
+<h3>Walking the Module List</h3>
+<p>The <code>PEB_LDR_DATA</code> structure contains three doubly-linked lists of loaded modules: <code>InLoadOrderModuleList</code>, <code>InMemoryOrderModuleList</code>, and <code>InInitializationOrderModuleList</code>. AceLdr uses the <code>InLoadOrderModuleList</code>. Each entry in the list is an <code>LDR_DATA_TABLE_ENTRY</code> containing the DLL's base address, name, and size.</p>
+
+<pre><code><span class="lang-tag">C - from util.c FindModule()</span>PVOID FindModule( ULONG hash, PPEB peb, PULONG size )
+{
+    PLIST_ENTRY             Hdr = NULL;
+    PLIST_ENTRY             Ent = NULL;
+    PLDR_DATA_TABLE_ENTRY   Ldr = NULL;
+
+    // Get head of the doubly-linked list
+    Hdr = &amp; peb-&gt;Ldr-&gt;InLoadOrderModuleList;
+    Ent = Hdr-&gt;Flink;  // First entry
+
+    // Walk the list until we wrap around to the head
+    for( ; Hdr != Ent; Ent = Ent-&gt;Flink )
+    {
+        Ldr = C_PTR( Ent );
+        // Compare hash of this module's name to our target hash
+        if( HashString( Ldr-&gt;BaseDllName.Buffer,
+                        Ldr-&gt;BaseDllName.Length ) == hash )
+        {
+            if( size != NULL )
+                *size = Ldr-&gt;SizeOfImage;
+            return Ldr-&gt;DllBase;  // Return base address of the DLL
+        }
+    }
+    return NULL;
+}</code></pre>
+
+<div class="card green">
+<h4>Why InLoadOrderModuleList?</h4>
+<p>The first two modules in the load order list are always the executable itself and <code>ntdll.dll</code>. Since AceLdr primarily needs <code>ntdll.dll</code> (for native API functions), using the load-order list is predictable and reliable. The hash comparison adds flexibility: AceLdr can find any module by name without hardcoding positions in the list.</p>
+</div>
+
+<h2>DJB2 Hashing: Names Without Strings</h2>
+<p>Instead of storing the string <code>"NtAllocateVirtualMemory"</code> (which defenders can search for), AceLdr stores its <strong>DJB2 hash</strong>: <code>0xf783b8ec</code>. At runtime, it hashes every export name until it finds a match.</p>
+
+<p>The DJB2 algorithm (created by Daniel J. Bernstein) is simple and fast:</p>
+<ol>
+<li>Start with the magic value <strong>5381</strong></li>
+<li>For each character: <code>hash = hash * 33 + character</code></li>
+<li>The multiplication by 33 is done as <code>(hash &lt;&lt; 5) + hash</code> for speed</li>
+<li>AceLdr converts to uppercase first for case-insensitive matching</li>
+</ol>
+
+<pre><code><span class="lang-tag">C - from util.c HashString()</span>UINT32 HashString( PVOID buffer, ULONG size )
+{
+    UCHAR  Cur = 0;
+    ULONG  Djb = 5381;   // DJB2 magic starting value
+    PUCHAR Ptr = buffer;
+
+    while ( TRUE )
+    {
+        Cur = *Ptr;
+        if( !size ) { if( !*Ptr ) break; }
+        else { if( (ULONG)(Ptr - (PUCHAR)buffer) &gt;= size ) break; }
+
+        if( Cur &gt;= 'a' ) Cur -= 0x20;  // Case-insensitive (to uppercase)
+
+        Djb = (( Djb &lt;&lt; 5 ) + Djb ) + Cur;  // hash * 33 + char
+        ++Ptr;
+    }
+    return Djb;
+}</code></pre>
+
+<h3>Python Companion Script</h3>
+<p>AceLdr includes a Python script to pre-compute hashes at build time. This is how the <code>#define</code> constants in <code>include.h</code> are generated:</p>
+
+<pre><code><span class="lang-tag">Python - scripts/hashstring.py</span>#!/usr/bin/env python3
+# The same algorithm in Python - used to pre-compute hashes
+def hash_string( string ):
+    hash = 5381
+    for x in string.upper():
+        hash = (( hash &lt;&lt; 5 ) + hash ) + ord(x)
+    return hash &amp; 0xFFFFFFFF
+
+# Example: python hashstring.py "NtAllocateVirtualMemory"
+# Output:  0xf783b8ec</code></pre>
+
+<div class="card warn">
+<h4>Why DJB2 Specifically?</h4>
+<p>DJB2 is popular in shellcode for several reasons: it's trivial to implement (a few instructions), it produces few collisions for typical Windows API names, and the 32-bit output is compact. The tradeoff is that since DJB2 is well-known, defenders can pre-compute hash tables for all Windows API names and reverse-lookup suspicious constants. Tools like <a href="https://hashdb.openanalysis.net/" style="color:var(--accent)">HashDB</a> do exactly this. AceLdr accepts this risk because the hashes are compiled into position-independent code that's harder to statically analyze than a normal import table.</p>
+</div>
+
+<h2>Finding Exported Functions</h2>
+<p>Once we have a module's base address (from <code>FindModule</code>), we walk its <strong>export table</strong> to find specific functions. The export directory contains three parallel arrays:</p>
+<ul>
+<li><strong>AddressOfNames</strong>: Array of RVAs pointing to function name strings</li>
+<li><strong>AddressOfNameOrdinals</strong>: Array of ordinal values (index into the functions array)</li>
+<li><strong>AddressOfFunctions</strong>: Array of RVAs pointing to actual function code</li>
+</ul>
+
+<pre><code><span class="lang-tag">C - from util.c FindFunction()</span>PVOID FindFunction( PVOID image, ULONG hash )
+{
+    // Navigate PE headers to the export directory
+    Hdr = image;
+    Nth = image + Hdr-&gt;e_lfanew;
+    Dir = &amp;Nth-&gt;OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    Exp = image + Dir-&gt;VirtualAddress;
+
+    // Three parallel arrays: names, functions, ordinals
+    Aon = image + Exp-&gt;AddressOfNames;
+    Aof = image + Exp-&gt;AddressOfFunctions;
+    Aoo = image + Exp-&gt;AddressOfNameOrdinals;
+
+    for( Idx = 0; Idx &lt; Exp-&gt;NumberOfNames; ++Idx )
+    {
+        // Hash each export name, compare to our target
+        if( HashString( image + Aon[Idx], 0 ) == hash )
+            return image + Aof[ Aoo[Idx] ];  // Found it!
+    }
+    return NULL;
+}</code></pre>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Complete API Resolution Chain</h4>
+<div class="flow">
+<div class="box">TEB</div>
+<div class="arrow">&rarr;</div>
+<div class="box">PEB</div>
+<div class="arrow">&rarr;</div>
+<div class="box y">Walk module list<br>(FindModule)</div>
+<div class="arrow">&rarr;</div>
+<div class="box y">Walk export table<br>(FindFunction)</div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Function pointer<br>ready to call!</div>
+</div>
+</div>
+
+<h3>AceLdr's Hash Constants</h3>
+<p>These are pre-computed in <code>include.h</code> using the Python script and matched at runtime:</p>
+<pre><code><span class="lang-tag">C - from include.h (selected hashes)</span>#define H_LIB_NTDLL                  0x1edab0ed  // "ntdll.dll"
+#define H_LIB_KERNEL32               0x6ddb9555  // "kernel32.dll"
+#define H_API_NTALLOCATEVIRTUALMEMORY 0xf783b8ec
+#define H_API_NTPROTECTVIRTUALMEMORY  0x50e92888
+#define H_API_RTLCREATEHEAP           0xe1af6849
+#define H_API_SLEEP                   0x0e07cd7e
+#define H_API_GETPROCESSHEAP          0x36c007a2
+// ... 50+ more hashes</code></pre>
+
+<div class="card">
+<h4>The Full Resolution Flow in Practice</h4>
+<p>When AceLdr starts, <code>resolveLoaderFunctions()</code> calls <code>FindModule(H_LIB_NTDLL, peb, NULL)</code> to get <code>ntdll.dll</code>'s base, then calls <code>FindFunction(ntdllBase, H_API_NTALLOCATEVIRTUALMEMORY)</code> to get the actual function pointer. This is stored in an <code>API</code> structure and called throughout AceLdr's loading sequence. The entire process happens without a single import table entry.</p>
+</div>
+
+<div class="quiz" id="quiz3">
+<h4>Pop Quiz: PEB &amp; Hashing</h4>
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why use DJB2 hashing instead of storing API name strings?</p>
+<label data-opt="0"><input type="radio" name="q3_0"> DJB2 is faster than string comparison</label>
+<label data-opt="1"><input type="radio" name="q3_0"> Strings would make the binary too large</label>
+<label data-opt="2"><input type="radio" name="q3_0"> To avoid suspicious plaintext API names that static analysis tools flag</label>
+<label data-opt="3"><input type="radio" name="q3_0"> Windows requires hashed imports for position-independent code</label>
+<div class="explain">Static analysis tools like YARA rules and strings analysis look for suspicious API names. By using hashes, the binary contains only opaque 32-bit integers that can't be easily identified. The tradeoff is a runtime cost of hashing every export name for comparison.</div>
+</div>
+<div class="quiz-q" data-correct="0">
+<p>Q2: The PEB is accessed through which structure?</p>
+<label data-opt="0"><input type="radio" name="q3_1"> The TEB (Thread Environment Block)</label>
+<label data-opt="1"><input type="radio" name="q3_1"> The IAT (Import Address Table)</label>
+<label data-opt="2"><input type="radio" name="q3_1"> The GDT (Global Descriptor Table)</label>
+<label data-opt="3"><input type="radio" name="q3_1"> The KPCR (Kernel Processor Control Region)</label>
+<div class="explain">On x64 Windows, the TEB is accessible via the gs segment register. The PEB pointer is at offset 0x60 within the TEB. So gs:[0x60] gives you the PEB address, which then provides access to loaded module lists and other process information.</div>
+</div>
+<div class="quiz-q" data-correct="1">
+<p>Q3: The DJB2 hash starts with a "magic number." What is it?</p>
+<label data-opt="0"><input type="radio" name="q3_2"> 0xDEADBEEF</label>
+<label data-opt="1"><input type="radio" name="q3_2"> 5381</label>
+<label data-opt="2"><input type="radio" name="q3_2"> 31337</label>
+<label data-opt="3"><input type="radio" name="q3_2"> 0</label>
+<div class="explain">DJB2 uses 5381 as its initial hash value. This was chosen by Daniel J. Bernstein and provides good distribution with minimal collisions for typical string inputs.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz3')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module2.html">&larr; Previous: PE File Format</a>
+<a class="primary" href="module4.html">Next: Reflective Loading &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

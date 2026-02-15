@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 2: Modern C++ for Shellcode - Stardust Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⭐</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#c084fc;--accent2:#38bdf8;--gradient:linear-gradient(135deg,#c084fc,#38bdf8)}</style>
+</head>
+<body>
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav id="sidenav">
+<div class="logo"><h2>Stardust Course</h2><span>Modern Implant Template Masterclass</span></div>
+<a class="home-link" href="../Stardust_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">01</span> Why Stardust Exists</a>
+<a class="mod-link active" href="module2.html"><span class="diff d1">02</span> C++ for Shellcode</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">03</span> Project Anatomy</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">04</span> Position-Independent Code</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">05</span> Compile-Time Hashing</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">06</span> PEB &amp; API Resolution</a>
+<a class="mod-link" href="module7.html"><span class="diff d2">07</span> The symbol&lt;T&gt; Template</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">08</span> Linker Script &amp; Sections</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">09</span> Module Stomping</a>
+<a class="mod-link" href="module10.html"><span class="diff d3">10</span> Full Chain &amp; Extending</a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 2: Modern C++ for Shellcode</h1>
+<p class="subtitle">How Stardust abuses modern C++ features for compile-time evasion.</p>
+
+<div class="card highlight">
+<h4>Wait, C++ for Shellcode?</h4>
+<p>Most shellcode is written in C or pure assembly. Using C++ sounds insane &mdash; classes, templates, virtual tables, exceptions... all that overhead. But Stardust carefully uses <strong>only the zero-cost features</strong> of modern C++. The compiler does heavy lifting at build time so the runtime binary stays tiny.</p>
+</div>
+
+<h2>The Three Modern C++ Features That Matter</h2>
+
+<h3>1. <code>constexpr</code> / <code>consteval</code> &mdash; Forced Compile-Time Execution</h3>
+<p><code>constexpr</code> (C++14+) tells the compiler a function <em>may</em> run at compile time. <code>consteval</code> (C++20) forces it &mdash; the result <strong>must</strong> be computed at compile time. Stardust uses these features so that strings like API names are hashed during compilation and never appear in the binary:</p>
+
+<pre><code><span class="lang-tag">C++ - constexpr.h</span>namespace expr {
+    template &lt;typename T = char&gt;
+    constexpr auto hash_string(       // constexpr = CAN run at compile time
+        const T* string               // consteval would FORCE compile time (C++20)
+    ) -&gt; uint32_t {
+        uint32_t hash = 5381;         // DJB2 initial value
+        uint8_t  byte = 0;
+
+        while ( *string ) {
+            byte = static_cast&lt;uint8_t&gt;( *string++ );
+            if ( byte &gt;= 'a' ) byte -= 0x20;  // Case-insensitive (uppercase)
+            hash = ( ( hash &lt;&lt; 5 ) + hash ) + byte;  // hash * 33 + byte
+        }
+        return hash;
+    }
+}</code></pre>
+
+<div class="card">
+<h4>What Happens at Build Time</h4>
+<pre><code><span class="lang-tag">What you write</span>auto hash = expr::hash_string( "NtAllocateVirtualMemory" );</code></pre>
+<pre><code><span class="lang-tag">What the compiler produces (pseudocode)</span>auto hash = 0x1A2B3C4D;  // Just a constant integer. No string. No function call.</code></pre>
+<p>The string <code>"NtAllocateVirtualMemory"</code> exists only in your source code. It never makes it into the binary. Defenders running <code>strings</code> on the shellcode see nothing.</p>
+</div>
+
+<div class="card warn">
+<h4>constexpr vs consteval</h4>
+<p><code>constexpr</code> functions <em>can</em> be evaluated at compile time but may also run at runtime if called with non-constant arguments. <code>consteval</code> (C++20) <em>must</em> be evaluated at compile time &mdash; the compiler errors if it cannot. When used with constant string literals, <code>constexpr</code> is typically sufficient since the compiler can and does resolve it at compile time. Whether Stardust uses <code>constexpr</code> or <code>consteval</code> may depend on the version or fork, but the effect is the same: hashes are baked into the binary as constants.</p>
+</div>
+
+<h3>2. Templates &mdash; Type-Safe API Resolution</h3>
+<p>Stardust uses templates to make API resolution type-safe. Instead of casting <code>void*</code> everywhere:</p>
+
+<pre><code><span class="lang-tag">C++ - resolve.h</span>namespace resolve {
+    template &lt;typename T&gt;
+    inline auto declfn api(
+        _In_ const uintptr_t module_base,
+        _In_ const uintptr_t symbol_hash
+    ) -&gt; T* {
+        return reinterpret_cast&lt;T*&gt;( _api( module_base, symbol_hash ) );
+    }
+}
+
+// Usage: compiler knows the exact function signature
+decltype(MessageBoxA)* msgbox = RESOLVE_API(
+    reinterpret_cast&lt;uintptr_t&gt;(user32), MessageBoxA
+);</code></pre>
+
+<h3>3. <code>decltype</code> &mdash; Automatic Type Deduction</h3>
+<pre><code><span class="lang-tag">C++ - macros.h</span>#define D_API( x )  decltype( x ) * x;
+
+// Inside the instance class:
+struct {
+    D_API( LoadLibraryA )    // expands to: decltype(LoadLibraryA)* LoadLibraryA;
+    D_API( GetProcAddress )  // expands to: decltype(GetProcAddress)* GetProcAddress;
+};</code></pre>
+<p><code>decltype(LoadLibraryA)</code> gives the compiler the <strong>exact function signature</strong> of the real Windows API. Your function pointer is automatically the right type. No manual <code>typedef</code> needed.</p>
+
+<h2>What C++ Features Stardust AVOIDS</h2>
+<table>
+<tr><th>Feature</th><th>Why It's Banned</th></tr>
+<tr><td>Exceptions (<code>try/catch</code>)</td><td>Requires runtime support tables, huge overhead</td></tr>
+<tr><td>RTTI (<code>dynamic_cast</code>)</td><td>Type info tables bloat the binary</td></tr>
+<tr><td>STL containers</td><td>Depend on the C++ standard library (heap, exceptions)</td></tr>
+<tr><td>Virtual functions</td><td>vtable pointers aren't position-independent</td></tr>
+<tr><td>Global constructors</td><td>Require CRT initialization that doesn't exist</td></tr>
+<tr><td>SSE instructions</td><td>Disabled via <code>-mno-sse</code> for compatibility</td></tr>
+</table>
+
+<div class="card warn">
+<h4>The -nostdlib Flag</h4>
+<p>Stardust compiles with <code>-nostdlib</code>, meaning there is <strong>no C runtime, no C++ standard library</strong>. No <code>printf</code>, no <code>malloc</code>, no <code>std::string</code>, no <code>new</code>/<code>delete</code>. Every memory operation is done manually via <code>memory::copy()</code>, <code>memory::zero()</code>, or Windows API calls.</p>
+</div>
+
+<div class="quiz" id="quiz2">
+<h4>Pop Quiz: Modern C++ Features</h4>
+<div class="quiz-q" data-correct="0">
+<p>Q1: What is the difference between <code>constexpr</code> and <code>consteval</code>?</p>
+<label data-opt="0"><input type="radio" name="q2_0"> constexpr MAY run at compile time; consteval MUST run at compile time</label>
+<label data-opt="1"><input type="radio" name="q2_0"> constexpr is for variables; consteval is for functions</label>
+<label data-opt="2"><input type="radio" name="q2_0"> They're the same thing with different syntax</label>
+<label data-opt="3"><input type="radio" name="q2_0"> consteval is slower but more portable</label>
+<div class="explain">constexpr functions CAN be evaluated at compile time but may also run at runtime if called with non-constant arguments. consteval functions MUST be evaluated at compile time &mdash; the compiler errors if it can't. When used with constant string literals in this context, both achieve the same goal: the string never appears in the binary.</div>
+</div>
+<div class="quiz-q" data-correct="3">
+<p>Q2: Why does Stardust use <code>decltype(LoadLibraryA)* LoadLibraryA;</code>?</p>
+<label data-opt="0"><input type="radio" name="q2_1"> To make the code shorter</label>
+<label data-opt="1"><input type="radio" name="q2_1"> Because Windows requires it</label>
+<label data-opt="2"><input type="radio" name="q2_1"> For backwards compatibility with C</label>
+<label data-opt="3"><input type="radio" name="q2_1"> To automatically get the correct function signature without manual typedefs</label>
+<div class="explain">decltype(LoadLibraryA) resolves to the exact function signature: HMODULE(LPCSTR). The * makes it a function pointer. This means you can call it with the same parameters as the real API and the compiler will type-check everything for you. No error-prone manual typedefs.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz2')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module1.html">&larr; Previous</a>
+<a class="primary" href="module3.html">Next: Project Anatomy &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

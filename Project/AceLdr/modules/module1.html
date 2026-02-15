@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 1: Windows Memory Fundamentals - AceLdr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F5A5;</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#00d4ff;--accent2:#7c3aed;--gradient:linear-gradient(135deg,#00d4ff,#7c3aed)}</style>
+</head>
+<body>
+
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>AceLdr Course</h2>
+<span>Memory Evasion Masterclass</span>
+</div>
+<a class="home-link" href="../AceLdr_index.html">&larr; Course Home</a>
+<a class="mod-link active" href="module1.html"><span class="diff d1">1</span> Windows Memory 101</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">2</span> PE File Format</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">3</span> PEB &amp; API Hashing</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">4</span> Reflective Loading</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">5</span> Position-Independent Code</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">6</span> IAT Hooking</a>
+<a class="mod-link" href="module7.html"><span class="diff d3">7</span> Return Addr Spoofing</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">8</span> FOLIAGE Sleep Mask</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">9</span> Full Chain &amp; Integration</a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 1: Windows Memory Fundamentals</h1>
+<p class="subtitle">What happens in RAM stays in RAM... unless a scanner finds it.</p>
+
+<div class="card highlight">
+<h4>Why This Module?</h4>
+<p>Before we reverse-engineer AceLdr (by <strong>kyleavery</strong>, presented at DEF CON 30), you need a mental model of how Windows manages memory. Every evasion technique in this project is basically a clever trick against these fundamentals. Think of it as learning the rules of chess before learning gambits.</p>
+</div>
+
+<h2>Virtual Memory: Your Private Universe</h2>
+<p>Every Windows process gets its own <strong>virtual address space</strong>. On a 64-bit system, that's a theoretical 128 TB playground. The CPU's <strong>MMU (Memory Management Unit)</strong> translates virtual addresses to physical RAM addresses using <strong>page tables</strong>.</p>
+<p>The smallest unit of memory Windows manages is a <strong>page</strong> (typically 4 KB = 4096 bytes). Each page has <strong>protection flags</strong> that determine what you can do with it:</p>
+
+<table>
+<tr><th>Protection</th><th>Constant</th><th>Hex</th><th>What it means</th></tr>
+<tr><td>Read Only</td><td><code>PAGE_READONLY</code></td><td>0x02</td><td>Can read, but not write or execute</td></tr>
+<tr><td>Read/Write</td><td><code>PAGE_READWRITE</code></td><td>0x04</td><td>Can read + write. Most heap memory.</td></tr>
+<tr><td>Execute/Read</td><td><code>PAGE_EXECUTE_READ</code></td><td>0x20</td><td>Can read + execute code. Normal .text sections.</td></tr>
+<tr><td>Execute/R/W</td><td><code>PAGE_EXECUTE_READWRITE</code></td><td>0x40</td><td>The red flag. Read + write + execute.</td></tr>
+</table>
+
+<div class="card warn">
+<h4>Why Defenders Care About RWX</h4>
+<p>Legitimate programs almost <strong>never</strong> need memory that is both writable AND executable at the same time. When a scanner like <strong>Moneta</strong> finds RWX pages, it's an immediate red flag. AceLdr avoids this by carefully toggling permissions: write when it needs to write, execute when it needs to execute, <strong>never both at once</strong> (except briefly during the sleep chain).</p>
+</div>
+
+<h2>Key Memory APIs</h2>
+<p>Windows provides these functions to manage virtual memory. AceLdr uses the <strong>Nt*</strong> (native) versions because they bypass some userland monitoring:</p>
+
+<pre><code><span class="lang-tag">C</span>// High-level (kernel32)
+LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect);
+BOOL   VirtualProtect(LPVOID addr, SIZE_T size, DWORD new, PDWORD old);
+
+// Low-level (ntdll) - what AceLdr actually uses
+NTSTATUS NtAllocateVirtualMemory(HANDLE proc, PVOID *base, ULONG_PTR zero,
+                                  PSIZE_T size, ULONG type, ULONG protect);
+NTSTATUS NtProtectVirtualMemory(HANDLE proc, PVOID *base,
+                                 PSIZE_T size, ULONG newprot, PULONG old);</code></pre>
+
+<h2>The Windows Heap</h2>
+<p>The <strong>heap</strong> is where dynamic allocations live (<code>malloc</code>, <code>HeapAlloc</code>, <code>new</code>). Each process has a <strong>default process heap</strong> accessible via <code>GetProcessHeap()</code>. Memory scanners inspect this heap looking for suspicious content.</p>
+<p>AceLdr's trick: it creates a <strong>separate, private heap</strong> via <code>RtlCreateHeap()</code> and redirects Beacon's allocations there. Scanners looking at the default process heap find nothing.</p>
+
+<pre><code><span class="lang-tag">C</span>// AceLdr creates a private heap and stores the handle in the STUB structure
+HANDLE privateHeap = RtlCreateHeap(
+    HEAP_GROWABLE | HEAP_CREATE_ALIGN_16,  // Flags
+    NULL,     // HeapBase - let the system choose
+    0,        // ReserveSize
+    0,        // CommitSize
+    NULL,     // Lock
+    NULL      // Parameters
+);
+
+// Later, when Beacon calls GetProcessHeap(), AceLdr's hook returns this instead:
+SECTION( D ) HANDLE GetProcessHeap_Hook()
+{
+    return ( ( PSTUB )OFFSET( Stub ) )-&gt;Heap;  // Returns the private heap
+}</code></pre>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Memory Layout: Normal vs AceLdr</h4>
+<div style="display:flex;gap:30px;justify-content:center;flex-wrap:wrap">
+<div style="flex:1;min-width:250px">
+<p style="text-align:center;color:var(--red);font-weight:700;margin-bottom:10px">Normal Beacon (Detectable)</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box r" style="width:100%">Process Default Heap &larr; contains Beacon data</div>
+<div class="box r" style="width:100%">.text section RWX &larr; Beacon code (always executable)</div>
+<div class="box" style="width:100%">Standard Thread Stack</div>
+</div>
+</div>
+<div style="flex:1;min-width:250px">
+<p style="text-align:center;color:var(--green);font-weight:700;margin-bottom:10px">AceLdr Beacon (Evasive)</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box g" style="width:100%">Process Default Heap &larr; clean, nothing suspicious</div>
+<div class="box g" style="width:100%">Private Heap (encrypted during sleep)</div>
+<div class="box g" style="width:100%">.text RX (encrypted + non-exec during sleep)</div>
+</div>
+</div>
+</div>
+</div>
+
+<h2>Memory Scanners: The Enemy</h2>
+<p>AceLdr was built to evade <strong>7 specific tools</strong>. Here's what each one looks for:</p>
+<table>
+<tr><th>Scanner</th><th>Detection Method</th><th>AceLdr's Counter</th></tr>
+<tr><td><strong>Moneta</strong></td><td>Finds RWX private memory, unbacked executable regions</td><td>Toggles permissions; memory is RW or RX, never RWX</td></tr>
+<tr><td><strong>PE-sieve</strong></td><td>Scans for PE headers and known signatures in memory</td><td>Encrypts all code during sleep with RC4</td></tr>
+<tr><td><strong>BeaconEye</strong></td><td>Pattern-matches Beacon config in heap memory</td><td>Separate heap + encryption = config invisible</td></tr>
+<tr><td><strong>Hunt-Sleeping-Beacons</strong></td><td>Inspects call stacks of sleeping threads</td><td>Return address spoofing + context manipulation</td></tr>
+<tr><td><strong>BeaconHunter</strong></td><td>Identifies Beacon by memory patterns and behavior</td><td>Full memory encryption + heap redirection</td></tr>
+<tr><td><strong>Patriot</strong></td><td>Walks thread stacks looking for suspicious frames</td><td>JMP RBX trampoline gadget to spoof stack</td></tr>
+<tr><td><strong>MalMemDetect</strong></td><td>Finds malicious artifacts in process memory</td><td>Everything encrypted and hidden during idle</td></tr>
+</table>
+
+<div class="card warn">
+<h4>Note on Hunt-Sleeping-Beacons</h4>
+<p>Hunt-Sleeping-Beacons was later updated with a detection specifically targeting FOLIAGE-style sleep obfuscation. The updated version checks for threads with a <code>UserRequest</code> wait reason that have <code>KiUserApcDispatcher</code> on their call stack. This combination is characteristic of the APC-based sleep chain that FOLIAGE employs. This means AceLdr's evasion against this scanner may no longer be fully effective against updated versions.</p>
+</div>
+
+<div class="quiz" id="quiz1">
+<h4>Pop Quiz: Memory Fundamentals</h4>
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why is PAGE_EXECUTE_READWRITE (RWX) suspicious to memory scanners?</p>
+<label data-opt="0"><input type="radio" name="q1_0"> It's slower than other protections</label>
+<label data-opt="1"><input type="radio" name="q1_0"> It uses more physical RAM</label>
+<label data-opt="2"><input type="radio" name="q1_0"> Legitimate programs rarely need writable + executable memory simultaneously</label>
+<label data-opt="3"><input type="radio" name="q1_0"> Windows doesn't officially support it</label>
+<div class="explain">Correct! Normal compiled code is mapped as RX (execute + read). Data is RW (read + write). Needing both at once strongly suggests runtime code generation or injection - exactly what shellcode does.</div>
+</div>
+<div class="quiz-q" data-correct="1">
+<p>Q2: AceLdr creates a private heap. Why?</p>
+<label data-opt="0"><input type="radio" name="q1_1"> For better performance</label>
+<label data-opt="1"><input type="radio" name="q1_1"> To isolate Beacon's data from scanners inspecting the default process heap</label>
+<label data-opt="2"><input type="radio" name="q1_1"> Because the default heap is too small</label>
+<label data-opt="3"><input type="radio" name="q1_1"> To avoid heap corruption bugs</label>
+<div class="explain">AceLdr hooks GetProcessHeap() to return a custom heap created with RtlCreateHeap(). Scanners like BeaconEye that walk the default process heap looking for Beacon config structures won't find anything.</div>
+</div>
+<div class="quiz-q" data-correct="0">
+<p>Q3: What is the typical page size on Windows x64?</p>
+<label data-opt="0"><input type="radio" name="q1_2"> 4096 bytes (4 KB)</label>
+<label data-opt="1"><input type="radio" name="q1_2"> 8192 bytes (8 KB)</label>
+<label data-opt="2"><input type="radio" name="q1_2"> 1024 bytes (1 KB)</label>
+<label data-opt="3"><input type="radio" name="q1_2"> 65536 bytes (64 KB)</label>
+<div class="explain">Windows uses 4 KB pages by default. The 64 KB value (65536) is the allocation granularity - the minimum size VirtualAlloc will reserve - but actual page granularity is 4 KB.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<span></span>
+<a class="primary" href="module2.html">Next: PE File Format &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

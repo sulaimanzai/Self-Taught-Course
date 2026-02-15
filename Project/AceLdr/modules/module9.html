@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 9: Full Chain &amp; Cobalt Strike Integration - AceLdr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖥️</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#00d4ff;--accent2:#7c3aed;--gradient:linear-gradient(135deg,#00d4ff,#7c3aed)}</style>
+</head>
+<body>
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+<nav>
+  <div class="logo">
+    <h2>AceLdr Course</h2>
+    <span>Memory Evasion Masterclass</span>
+  </div>
+  <a class="home-link" href="../AceLdr_index.html">&larr; Course Home</a>
+  <a class="mod-link" href="module1.html"><span>1. Windows Memory 101</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module2.html"><span>2. PE File Format</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module3.html"><span>3. PEB &amp; API Hashing</span><span class="diff d1">d1</span></a>
+  <a class="mod-link" href="module4.html"><span>4. Reflective Loading</span><span class="diff d2">d2</span></a>
+  <a class="mod-link" href="module5.html"><span>5. Position-Independent Code</span><span class="diff d2">d2</span></a>
+  <a class="mod-link" href="module6.html"><span>6. IAT Hooking</span><span class="diff d2">d2</span></a>
+  <a class="mod-link" href="module7.html"><span>7. Return Addr Spoofing</span><span class="diff d3">d3</span></a>
+  <a class="mod-link" href="module8.html"><span>8. FOLIAGE Sleep Mask</span><span class="diff d3">d3</span></a>
+  <a class="mod-link active" href="module9.html"><span>9. Full Chain &amp; Integration</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<h1>Module 9: Full Chain &amp; Cobalt Strike Integration</h1>
+<p class="subtitle">From Makefile to malleable C2 &mdash; shipping AceLdr as a production RDLL</p>
+<span class="diff-badge hard">Advanced</span>
+
+<!-- ===== Section 1: Build Pipeline ===== -->
+<h2>Build Pipeline</h2>
+
+<p>AceLdr's build system uses a <code>Makefile</code> that chains three tools: <strong>NASM</strong> (assembler), <strong>GCC</strong> (cross-compiler targeting x86-64 Windows), and a custom <strong>extract.py</strong> script:</p>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:15px;">Build Pipeline</h4>
+  <div class="flow">
+    <div class="box">*.asm files<br><small>spoof.asm, etc.</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">NASM<br><small>Assemble to .o</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box">*.c files<br><small>ace.c, util.c, hooks/</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">x86_64-w64-mingw32-gcc<br><small>Compile &amp; link</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">ace.exe<br><small>(raw PE)</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">extract.py<br><small>Extract .text</small></div>
+    <span class="arrow">&rarr;</span>
+    <div class="box r">ace.bin<br><small>(PIC shellcode)</small></div>
+  </div>
+</div>
+
+<pre><code><span class="lang-tag">Makefile</span>
+# Assemble the return-address spoofing stub
+nasm -f win64 spoof.asm -o spoof.o
+
+# Compile and link everything as position-independent code
+x86_64-w64-mingw32-gcc \
+    -nostdlib -fPIC -Os \
+    -ffunction-sections -fdata-sections \
+    -Wl,--no-seh,--image-base=0,-s,--gc-sections \
+    -o ace.exe \
+    ace.c util.c hooks/*.c spoof.o
+
+# Extract the .text section as raw shellcode
+python3 extract.py ace.exe ace.bin</code></pre>
+
+<h3>Compiler Flags Explained</h3>
+
+<table>
+  <thead>
+    <tr><th>Flag</th><th>Purpose</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>-nostdlib</code></td>
+      <td>Do not link against the C standard library. AceLdr resolves all APIs at runtime via PEB walking and API hashing &mdash; no CRT dependency.</td>
+    </tr>
+    <tr>
+      <td><code>-fPIC</code></td>
+      <td>Generate position-independent code. All references use RIP-relative addressing, so the code works at any load address.</td>
+    </tr>
+    <tr>
+      <td><code>-Os</code></td>
+      <td>Optimize for size. Smaller shellcode means faster injection and less suspicious memory footprint.</td>
+    </tr>
+    <tr>
+      <td><code>-ffunction-sections</code></td>
+      <td>Place each function in its own section. Combined with <code>--gc-sections</code>, the linker can discard unused functions.</td>
+    </tr>
+    <tr>
+      <td><code>--no-seh</code></td>
+      <td>Do not generate Structured Exception Handling tables. SEH data would break PIC and add unnecessary metadata.</td>
+    </tr>
+    <tr>
+      <td><code>--image-base=0</code></td>
+      <td>Set the preferred load address to 0. Forces all addresses to be offsets, ensuring true position-independence.</td>
+    </tr>
+    <tr>
+      <td><code>-s</code></td>
+      <td>Strip all symbols and debug information. Reduces size and removes reverse-engineering hints.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="card highlight">
+<h4>extract.py</h4>
+<p>The final step uses a Python script to parse the compiled PE and extract just the <code>.text</code> section as raw bytes. This is the actual shellcode (<code>ace.bin</code>) that gets injected into a target process. The PE headers, import table, and other sections are discarded &mdash; they were only needed for linking.</p>
+</div>
+
+<!-- ===== Section 2: Cobalt Strike Integration ===== -->
+<h2>Cobalt Strike CNA Script</h2>
+
+<p>AceLdr integrates with Cobalt Strike as a <strong>Reflective DLL (RDLL)</strong> replacement via an Aggressor script (<code>.cna</code> file). The key hook is <code>BEACON_RDLL_GENERATE</code>:</p>
+
+<pre><code><span class="lang-tag">Aggressor Script &mdash; aceldr.cna</span>
+# Hook into Cobalt Strike's RDLL generation
+set BEACON_RDLL_GENERATE {
+    # $1 = architecture (x86 or x64)
+    # $2 = raw beacon DLL bytes
+    # $3 = Cobalt Strike-generated RDLL (default loader)
+
+    # Only support x64
+    if ($1 eq "x64") {
+        # Read AceLdr shellcode
+        $loader = readb(script_resource("ace.bin"));
+
+        # Concatenate: AceLdr shellcode + beacon DLL
+        # AceLdr expects the beacon immediately after itself
+        # It finds the beacon by looking for the ACELDR marker
+        # at a known offset from its own base address
+        return $loader . $2;
+    }
+
+    # Fall back to default RDLL for x86
+    return $3;
+}</code></pre>
+
+<h3>How Concatenation Works</h3>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:15px;">RDLL Memory Layout</h4>
+  <div class="flow">
+    <div class="box hl" style="min-width:200px;">ace.bin<br><small>AceLdr PIC shellcode</small></div>
+    <span class="arrow">+</span>
+    <div class="box y" style="min-width:200px;">beacon.dll<br><small>Raw Cobalt Strike DLL</small></div>
+    <span class="arrow">=</span>
+    <div class="box g" style="min-width:200px;">Combined RDLL<br><small>Injected into target</small></div>
+  </div>
+</div>
+
+<p>The <code>BEACON_RDLL_GENERATE</code> hook replaces Cobalt Strike's default reflective loader with AceLdr. The concatenation (<code>$loader . $2</code>) places the AceLdr shellcode immediately before the raw beacon DLL bytes. When injected, execution starts at AceLdr's entry point, which:</p>
+
+<ol>
+  <li>Locates the beacon DLL appended after itself using a known marker</li>
+  <li>Reflectively loads the beacon into memory</li>
+  <li>Installs the 6 IAT hooks</li>
+  <li>Calls the beacon's DllMain to start execution</li>
+</ol>
+
+<div class="card warn">
+<h4>The ACELDR Marker</h4>
+<p>AceLdr embeds a marker (a magic byte sequence) at a known offset in its shellcode. After injection, it uses this marker to calculate where its own code ends and where the appended beacon DLL begins. This avoids hardcoding sizes &mdash; the same AceLdr binary works with any beacon DLL regardless of its size.</p>
+</div>
+
+<!-- ===== Section 3: Complete Lifecycle ===== -->
+<h2>Complete Lifecycle &mdash; 4 Phases</h2>
+
+<div class="diagram">
+  <h4 style="text-align:center;color:var(--accent);margin-bottom:20px;">AceLdr + Beacon Lifecycle</h4>
+
+  <h4 style="color:var(--yellow);margin-bottom:10px;">Phase 1: Injection</h4>
+  <div class="flow">
+    <div class="box">Operator sends<br>beacon payload</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">Injector writes<br>AceLdr+beacon<br>into target</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">Execution starts<br>at AceLdr entry</div>
+  </div>
+
+  <h4 style="color:var(--green);margin-top:20px;margin-bottom:10px;">Phase 2: Reflective Load</h4>
+  <div class="flow">
+    <div class="box">Find beacon via<br>ACELDR marker</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box">Map sections<br>&amp; fix relocations</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">Resolve imports<br>via PEB walking</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">Install 6<br>IAT hooks</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">Call beacon<br>DllMain</div>
+  </div>
+
+  <h4 style="color:var(--accent);margin-top:20px;margin-bottom:10px;">Phase 3: Running</h4>
+  <div class="flow">
+    <div class="box">Beacon executes<br>operator commands</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">Heap on private<br>heap (invisible)</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box hl">API calls use<br>spoofed returns</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box y">C2 comms via<br>InternetConnectA</div>
+  </div>
+
+  <h4 style="color:var(--red);margin-top:20px;margin-bottom:10px;">Phase 4: Sleeping</h4>
+  <div class="flow">
+    <div class="box">Beacon calls<br>Sleep(interval)</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box r">FOLIAGE:<br>encrypt heap</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box r">APC chain:<br>mask code +<br>spoof context</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box" style="border-color:var(--accent);">Sleep<br>(fully masked)</div>
+    <span class="arrow">&rarr;</span>
+    <div class="box g">Wakeup:<br>decrypt &amp;<br>restore</div>
+  </div>
+</div>
+
+<!-- ===== Section 4: Malleable C2 ===== -->
+<h2>Malleable C2 Profile Highlights</h2>
+
+<p>For optimal operation with AceLdr, the Cobalt Strike malleable C2 profile should include specific settings:</p>
+
+<div class="card highlight">
+<h4>Key Profile Settings</h4>
+<pre><code><span class="lang-tag">Malleable C2 Profile</span>
+# Use RDLL for reflective loading
+stage {
+    set userwx        "false";     # Don't use RWX memory
+    set stomppe       "true";      # Stomp PE headers after load
+    set cleanup       "true";      # Clean up loader artifacts
+    set sleep_mask    "false";     # Disable CS sleep mask (AceLdr handles this)
+    set smartinject   "true";      # Use smart injection techniques
+}
+
+# Process injection settings
+process-inject {
+    set startrwx "false";          # Don't start with RWX
+    set userwx   "false";          # Don't use RWX after injection
+}</code></pre>
+</div>
+
+<p>The critical setting is <code>set sleep_mask "false"</code>. Cobalt Strike has its own built-in sleep mask, but AceLdr's FOLIAGE implementation is more comprehensive (it includes heap encryption, context spoofing, and CFG-aware APC chains). Using both simultaneously would conflict.</p>
+
+<!-- ===== Section 5: References ===== -->
+<h2>References &amp; Further Reading</h2>
+
+<div class="card">
+<h4>Primary Sources</h4>
+<table>
+  <thead>
+    <tr><th>Resource</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>AceLdr Repository</strong></td>
+      <td>The original AceLdr source code &mdash; a Cobalt Strike RDLL with position-independent reflective loading, IAT hooking, return address spoofing, and FOLIAGE-based sleep masking</td>
+    </tr>
+    <tr>
+      <td><strong>FOLIAGE by SecIdiot</strong></td>
+      <td>The inspiration for AceLdr's sleep masking &mdash; demonstrates APC-based sleep encryption with thread context spoofing</td>
+    </tr>
+    <tr>
+      <td><strong>TitanLdr</strong></td>
+      <td>Another advanced reflective DLL loader with similar techniques &mdash; useful for comparing implementation approaches</td>
+    </tr>
+    <tr>
+      <td><strong>Return Address Spoofing</strong></td>
+      <td>Research and proof-of-concept code for spoofing call stack return addresses using ROP-like gadgets</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="card warn">
+<h4>Detection Tools to Study</h4>
+<p>Understanding detection is as important as understanding evasion. Study these tools to understand what defenders look for:</p>
+<table>
+  <thead>
+    <tr><th>Tool</th><th>What It Detects</th><th>What AceLdr Evades</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Moneta</strong></td>
+      <td>Unbacked executable memory, suspicious memory permissions</td>
+      <td>FOLIAGE changes permissions to RW during sleep; code is encrypted</td>
+    </tr>
+    <tr>
+      <td><strong>PE-sieve</strong></td>
+      <td>Hollowed processes, injected PEs, modified modules</td>
+      <td>AceLdr stomps PE headers and uses a private heap to avoid default heap artifacts</td>
+    </tr>
+    <tr>
+      <td><strong>BeaconEye</strong></td>
+      <td>Cobalt Strike beacon configuration blocks in memory</td>
+      <td>Private heap + FOLIAGE encryption masks config data during sleep</td>
+    </tr>
+    <tr>
+      <td><strong>Hunt-Sleeping-Beacons</strong></td>
+      <td>Threads sleeping with suspicious return addresses or contexts</td>
+      <td>Return address spoofing + thread context spoofing via FOLIAGE APCs</td>
+    </tr>
+    <tr>
+      <td><strong>Patriot</strong></td>
+      <td>Sleeping threads with RIP pointing to non-module memory</td>
+      <td>FOLIAGE APC chain sets RIP to ntdll during sleep</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ===== Section 6: Further Reading ===== -->
+<h2>Where to Go From Here</h2>
+
+<div class="card green">
+<h4>Suggested Next Steps</h4>
+<ul>
+  <li><strong>Read the full AceLdr source code</strong> &mdash; Now that you understand each technique, read through the actual implementation to see how they interconnect</li>
+  <li><strong>Study PE internals deeper</strong> &mdash; Explore the PE specification in detail, particularly the TLS directory, exception directory, and delay-load imports</li>
+  <li><strong>Learn about ETW (Event Tracing for Windows)</strong> &mdash; Understand how ETW telemetry can detect some of these techniques and how operators attempt to blind ETW consumers</li>
+  <li><strong>Explore hardware breakpoint-based hooking</strong> &mdash; An alternative to IAT hooking that uses debug registers (DR0-DR3) to intercept function calls</li>
+  <li><strong>Study indirect syscalls</strong> &mdash; Learn how to make system calls without going through ntdll, avoiding usermode hooks entirely</li>
+  <li><strong>Build your own loader</strong> &mdash; Apply what you've learned to write a minimal reflective loader from scratch, adding one evasion technique at a time</li>
+  <li><strong>Run detection tools against your work</strong> &mdash; Test your understanding by scanning with Moneta, PE-sieve, and Hunt-Sleeping-Beacons to see what gets caught and why</li>
+</ul>
+</div>
+
+<!-- ===== Quiz ===== -->
+<h2>Final Knowledge Check</h2>
+
+<div class="quiz" id="quiz9">
+  <h4>Module 9 Quiz</h4>
+
+  <div class="quiz-q" data-correct="1">
+    <p>1. How does AceLdr locate the appended beacon DLL in memory after injection?</p>
+    <label data-opt="0"><input type="radio" name="q9_1"> It reads the beacon size from a hardcoded offset in the shellcode header</label>
+    <label data-opt="1"><input type="radio" name="q9_1"> It searches for the ACELDR marker at a known offset to determine where the shellcode ends and the beacon begins</label>
+    <label data-opt="2"><input type="radio" name="q9_1"> It parses the PE headers of the combined binary to find the second executable section</label>
+    <label data-opt="3"><input type="radio" name="q9_1"> It receives the beacon offset as a parameter from the injector</label>
+    <div class="explain">AceLdr embeds a magic marker (the ACELDR marker) at a known offset in its shellcode. After injection, it locates this marker to calculate where its own code ends and where the concatenated beacon DLL begins. This avoids hardcoding sizes and works with any beacon DLL.</div>
+  </div>
+
+  <div class="quiz-q" data-correct="0">
+    <p>2. In the CNA script, what does the concatenation <code>$loader . $2</code> produce?</p>
+    <label data-opt="0"><input type="radio" name="q9_2"> AceLdr shellcode (ace.bin) followed by the raw beacon DLL bytes</label>
+    <label data-opt="1"><input type="radio" name="q9_2"> The default Cobalt Strike RDLL with AceLdr appended at the end</label>
+    <label data-opt="2"><input type="radio" name="q9_2"> A new PE file with AceLdr as the .text section and beacon as the .data section</label>
+    <label data-opt="3"><input type="radio" name="q9_2"> An encrypted payload containing both loader and beacon</label>
+    <div class="explain"><code>$loader</code> is the AceLdr shellcode (read from ace.bin) and <code>$2</code> is the raw beacon DLL bytes provided by Cobalt Strike. The dot operator concatenates them, producing a binary blob where AceLdr shellcode comes first (its entry point is at offset 0), immediately followed by the beacon DLL that AceLdr will reflectively load.</div>
+  </div>
+
+  <div class="quiz-q" data-correct="2">
+    <p>3. Which of the following is NOT true about the beacon during a FOLIAGE-masked sleep?</p>
+    <label data-opt="0"><input type="radio" name="q9_3"> The beacon's code region has RW permissions (not executable)</label>
+    <label data-opt="1"><input type="radio" name="q9_3"> The thread's saved RIP points into ntdll.dll</label>
+    <label data-opt="2"><input type="radio" name="q9_3"> The beacon's IAT hooks are removed and restored on wakeup</label>
+    <label data-opt="3"><input type="radio" name="q9_3"> The private heap contents are RC4-encrypted</label>
+    <div class="explain">The IAT hooks are <strong>never removed</strong> during sleep. They are installed once after reflective loading and persist for the entire beacon lifecycle. During FOLIAGE sleep, the beacon's code is encrypted, the heap is encrypted, memory permissions change to RW, and the thread context is spoofed &mdash; but the IAT entries themselves remain modified.</div>
+  </div>
+
+  <div class="quiz-q" data-correct="3">
+    <p>4. In the FOLIAGE APC chain, what is the correct ordering of the key operations?</p>
+    <label data-opt="0"><input type="radio" name="q9_4"> Sleep &rarr; Encrypt code &rarr; Change to RW &rarr; Spoof context &rarr; Decrypt &rarr; Restore</label>
+    <label data-opt="1"><input type="radio" name="q9_4"> Encrypt code &rarr; Sleep &rarr; Decrypt code &rarr; Change to RX &rarr; Signal done</label>
+    <label data-opt="2"><input type="radio" name="q9_4"> Spoof context &rarr; Sleep &rarr; Change to RW &rarr; Encrypt &rarr; Decrypt &rarr; Restore</label>
+    <label data-opt="3"><input type="radio" name="q9_4"> Get context &rarr; Spoof context &rarr; Change to RW &rarr; Encrypt code &rarr; Sleep &rarr; Decrypt code &rarr; Change to RX &rarr; Restore context &rarr; Signal</label>
+    <div class="explain">The correct order follows the APC chain: (1) Get context, (2) Spoof context (set RIP to ntdll), (3) Change permissions to RW, (4) Encrypt beacon code, (5) Sleep (the actual wait), (6) Decrypt beacon code, (7) Change permissions back to RX, (8) Restore original context, (9) Signal completion. The operations mirror each other around the sleep in the middle.</div>
+  </div>
+
+  <button class="quiz-btn" onclick="gradeQuiz('quiz9')">Check Answers</button>
+  <div class="quiz-result"></div>
+</div>
+
+<!-- ===== Course Complete ===== -->
+<div class="card" style="border:2px solid var(--accent);text-align:center;margin-top:40px;padding:40px;">
+  <h2 style="background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:1.8rem;border:none;margin:0 0 15px 0;padding:0;">Course Complete!</h2>
+  <p style="font-size:1.1rem;color:var(--text);margin-bottom:20px;">You've completed all 9 modules of the AceLdr Memory Evasion Masterclass.</p>
+
+  <div class="versus" style="text-align:left;margin:25px 0;">
+    <div>
+      <h5 style="color:var(--accent);">What You've Learned</h5>
+      <ul>
+        <li>Windows memory fundamentals and virtual memory</li>
+        <li>PE file format parsing and manipulation</li>
+        <li>PEB walking and API hashing for stealth</li>
+        <li>Reflective DLL loading without LoadLibrary</li>
+        <li>Position-independent code (PIC) development</li>
+        <li>IAT hooking for behavioral control</li>
+        <li>Return address spoofing with ROP gadgets</li>
+        <li>FOLIAGE sleep masking with APC chains</li>
+        <li>Full build pipeline and Cobalt Strike integration</li>
+      </ul>
+    </div>
+    <div>
+      <h5 style="color:var(--green);">Recommended Next Steps</h5>
+      <ul>
+        <li>Read AceLdr's full source code end-to-end</li>
+        <li>Build a minimal loader from scratch</li>
+        <li>Study indirect syscalls and ETW bypasses</li>
+        <li>Test with detection tools (Moneta, PE-sieve)</li>
+        <li>Explore hardware breakpoint hooking</li>
+        <li>Read the FOLIAGE and TitanLdr source code</li>
+        <li>Practice analyzing beacons with BeaconEye</li>
+      </ul>
+    </div>
+  </div>
+
+  <p style="color:var(--dim);font-size:.85rem;margin-top:15px;">Understanding these techniques is essential for both offensive security professionals and defenders building detection capabilities.</p>
+</div>
+
+<!-- ===== Navigation ===== -->
+<div class="nav-btns">
+  <a href="module8.html">&larr; Module 8: FOLIAGE Sleep Mask</a>
+  <a href="../AceLdr_index.html" class="primary">Back to Course Home</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

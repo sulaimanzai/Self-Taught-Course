@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 8: The Linker Script &amp; Section Layout - Stardust Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⭐</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#c084fc;--accent2:#38bdf8;--gradient:linear-gradient(135deg,#c084fc,#38bdf8)}</style>
+</head>
+<body>
+
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Stardust Course</h2>
+<span>Modern Implant Template Masterclass</span>
+</div>
+<a class="home-link" href="../Stardust_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">01</span> Why Stardust Exists</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">02</span> Modern C++ for Shellcode</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">03</span> Project Anatomy</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">04</span> Position-Independent Code</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">05</span> Compile-Time Hashing</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">06</span> PEB &amp; API Resolution</a>
+<a class="mod-link" href="module7.html"><span class="diff d2">07</span> The symbol&lt;T&gt; Template</a>
+<a class="mod-link active" href="module8.html"><span class="diff d3">08</span> Linker Script &amp; Sections</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">09</span> Module Stomping</a>
+<a class="mod-link" href="module10.html"><span class="diff d3">10</span> Full Chain &amp; Extending</a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 8: The Linker Script &amp; Section Layout</h1>
+<p class="subtitle">Why section order is everything when your code is its own loader.</p>
+
+<div class="card highlight">
+<h4>Why This Module?</h4>
+<p>In a normal executable, the OS loader handles section placement and address fixups. Shellcode has no loader &mdash; the <strong>byte layout of the binary IS the memory layout</strong>. If <code>RipStart</code> isn't at byte 0, the entry point is wrong. If <code>RipData</code> isn't immediately adjacent to the data section, <code>symbol&lt;T&gt;</code> calculations break. The linker script is what guarantees this layout.</p>
+</div>
+
+<h2>Why Section Order Matters</h2>
+<p>Stardust's position-independent code relies on <strong>precise spatial relationships</strong> between code and data:</p>
+<ul>
+<li><strong>RipStart</strong> must be at the very beginning (byte 0) &mdash; this is the shellcode entry point. When an injector calls the shellcode, it jumps to the first byte.</li>
+<li><strong>Main C++ code</strong> comes next &mdash; the bulk of the implant logic.</li>
+<li><strong>String data (.rdata)</strong> must be sandwiched between the main code and <code>RipData</code> &mdash; this is where all the embedded strings live.</li>
+<li><strong>RipData</strong> must be last, immediately after the data &mdash; <code>symbol&lt;T&gt;</code> uses it as an anchor point to calculate string addresses (as covered in Module 7).</li>
+</ul>
+
+<h2>The Linker Script: linker.ld</h2>
+<p>Stardust uses a custom linker script at <code>scripts/linker.ld</code> to enforce this layout. The MinGW toolchain's linker reads this script and places sections in exactly the specified order:</p>
+
+<pre><code><span class="lang-tag">Linker Script</span>SECTIONS
+{
+    .text :
+    {
+        *( .text$A )    /* RipStart - entry point, must be byte 0 */
+        *( .text$B )    /* Main C++ code (start(), resolve, etc.) */
+        *( .rdata* )    /* Read-only data: strings, constants */
+        *( .text$C )    /* RipData - anchor for symbol&lt;T&gt; */
+    }
+}</code></pre>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Final Shellcode Memory Layout</h4>
+<div class="flow" style="flex-direction:column;gap:0">
+<div class="box hl" style="width:100%;border-radius:8px 8px 0 0">
+<strong>.text$A</strong> &mdash; RipStart (entry point)<br>
+<span style="font-size:.75rem;color:var(--dim)">Byte 0. Saves registers, calls start(), restores, returns.</span>
+</div>
+<div class="box b" style="width:100%;border-radius:0">
+<strong>.text$B</strong> &mdash; Main C++ Code<br>
+<span style="font-size:.75rem;color:var(--dim)">start(), resolve::module(), resolve::_api(), implant logic</span>
+</div>
+<div class="box y" style="width:100%;border-radius:0">
+<strong>.rdata*</strong> &mdash; Read-Only Data<br>
+<span style="font-size:.75rem;color:var(--dim)">Embedded strings, constants, compile-time hash tables</span>
+</div>
+<div class="box g" style="width:100%;border-radius:0 0 8px 8px">
+<strong>.text$C</strong> &mdash; RipData (anchor)<br>
+<span style="font-size:.75rem;color:var(--dim)">symbol&lt;T&gt;::RipData() lives here, adjacent to data above</span>
+</div>
+</div>
+<p style="text-align:center;color:var(--dim);margin-top:10px;font-size:.85rem">Everything merges into a single .text section &mdash; the extracted shellcode is one flat blob.</p>
+</div>
+
+<h3>Why This Specific Order?</h3>
+<ol>
+<li><strong>.text$A first:</strong> The injector calls byte 0 of the shellcode. RipStart <em>must</em> be here.</li>
+<li><strong>.text$B second:</strong> The main implant code. Section ordering is alphabetical within .text sub-sections, so $B naturally follows $A.</li>
+<li><strong>.rdata* third:</strong> String data is sandwiched between code sections. By placing it inside the .text section (not as a separate PE section), it becomes part of the executable code blob. This is unconventional but necessary &mdash; shellcode is extracted as a single flat binary.</li>
+<li><strong>.text$C last:</strong> <code>RipData()</code> must be physically adjacent to the data it references. Placing it immediately after .rdata means the compile-time distance to any string is small and predictable.</li>
+</ol>
+
+<h2>The declfn Attribute</h2>
+<p>To place a function in a specific section, Stardust uses compiler attributes (via a <code>declfn</code> macro or direct section attributes). This tells the compiler which sub-section a function belongs to:</p>
+
+<pre><code><span class="lang-tag">C++</span>// Place RipStart in .text$A (first in the binary)
+__attribute__(( section(".text$A") ))
+void RipStart() {
+    // Entry point code...
+}
+
+// Place RipData in .text$C (last, after data)
+__attribute__(( section(".text$C") ))
+auto RipData() -&gt; uintptr_t {
+    return (uintptr_t)&amp;RipData;
+}
+
+// Regular functions go in .text$B by default
+// (or explicitly placed there via attribute)</code></pre>
+
+<h2>Comparison: AceLdr vs Stardust Section Layout</h2>
+
+<div class="versus">
+<div>
+<h5 style="color:var(--accent)">AceLdr: 6 Code Sections</h5>
+<ul>
+<li><code>.text$A</code> &mdash; Entry / Stub</li>
+<li><code>.text$B</code> &mdash; Hooks</li>
+<li><code>.text$C</code> &mdash; Core loader</li>
+<li><code>.text$D</code> &mdash; Data section</li>
+<li><code>.text$E</code> &mdash; Additional code</li>
+<li><code>.text$F</code> &mdash; End marker</li>
+<li>Written in C with assembly</li>
+</ul>
+</div>
+<div>
+<h5 style="color:var(--accent2)">Stardust: 3+1 Layout</h5>
+<ul>
+<li><code>.text$A</code> &mdash; RipStart (entry)</li>
+<li><code>.text$B</code> &mdash; All C++ code</li>
+<li><code>.rdata*</code> &mdash; Data (merged in)</li>
+<li><code>.text$C</code> &mdash; RipData (anchor)</li>
+<li>Simpler, fewer sections</li>
+<li>Modern C++ templates reduce section needs</li>
+</ul>
+</div>
+</div>
+
+<p>AceLdr needs more sections because its C-based design uses explicit section placement for different categories of code (hooks, loader logic, data). Stardust's C++ approach consolidates most logic into <code>.text$B</code>, relying on templates and the type system instead of manual section separation.</p>
+
+<h2>Extracting the Shellcode</h2>
+<p>After compilation, the shellcode blob is extracted from the PE using <code>objcopy</code>. This strips all PE headers and metadata, leaving just the raw contents of the merged <code>.text</code> section:</p>
+
+<pre><code><span class="lang-tag">Shell</span># Extract the .text section as a flat binary blob
+objcopy -O binary -j .text stardust.exe stardust.bin
+
+# The result is raw shellcode:
+# - Starts at RipStart (byte 0)
+# - Contains all code, data, and the RipData anchor
+# - No PE headers, no section table, no imports
+# - Ready to inject and execute</code></pre>
+
+<div class="card green">
+<h4>Key Takeaway</h4>
+<p>The linker script is the invisible backbone of Stardust. It ensures that every byte is in the right place so that position-independent code works, the entry point is at byte 0, and <code>symbol&lt;T&gt;</code> can find its data. Without it, the shellcode would be a jumbled mess of code and data at unpredictable offsets.</p>
+</div>
+
+<div class="quiz" id="quiz1">
+<h4>Knowledge Check</h4>
+<div class="quiz-q" data-correct="1">
+<p>Q1: Why is .rdata placed between .text$B and .text$C in the linker script?</p>
+<label data-opt="0"><input type="radio" name="q8_0"> To improve CPU cache performance</label>
+<label data-opt="1"><input type="radio" name="q8_0"> So that RipData (.text$C) is adjacent to the string data, making symbol&lt;T&gt; distance calculations work correctly</label>
+<label data-opt="2"><input type="radio" name="q8_0"> Because the PE format requires data sections between code sections</label>
+<label data-opt="3"><input type="radio" name="q8_0"> To prevent memory scanners from finding the strings</label>
+<div class="explain">Correct! symbol&lt;T&gt; calculates string addresses using the compile-time distance from RipData to the string. For this to work reliably, RipData (.text$C) must be physically adjacent to .rdata. If other code were placed between them, the distances would be larger and less predictable.</div>
+</div>
+<div class="quiz-q" data-correct="3">
+<p>Q2: What tool is used to extract the final shellcode blob from the compiled PE?</p>
+<label data-opt="0"><input type="radio" name="q8_1"> strip</label>
+<label data-opt="1"><input type="radio" name="q8_1"> nasm</label>
+<label data-opt="2"><input type="radio" name="q8_1"> windres</label>
+<label data-opt="3"><input type="radio" name="q8_1"> objcopy</label>
+<div class="explain">Correct! objcopy with the -O binary flag extracts the raw contents of the .text section, stripping all PE headers and metadata. The result is a flat binary blob that starts at RipStart and contains everything the shellcode needs.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module7.html">&larr; Prev: The symbol&lt;T&gt; Template</a>
+<a class="primary" href="module9.html">Next: Module Stomping &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

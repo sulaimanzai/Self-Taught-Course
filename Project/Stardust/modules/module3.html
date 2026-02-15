@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 3: Project Anatomy - Stardust Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⭐</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#c084fc;--accent2:#38bdf8;--gradient:linear-gradient(135deg,#c084fc,#38bdf8)}</style>
+</head>
+<body>
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav id="sidenav">
+<div class="logo"><h2>Stardust Course</h2><span>Modern Implant Template Masterclass</span></div>
+<a class="home-link" href="../Stardust_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">01</span> Why Stardust Exists</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">02</span> C++ for Shellcode</a>
+<a class="mod-link active" href="module3.html"><span class="diff d1">03</span> Project Anatomy</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">04</span> Position-Independent Code</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">05</span> Compile-Time Hashing</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">06</span> PEB &amp; API Resolution</a>
+<a class="mod-link" href="module7.html"><span class="diff d2">07</span> The symbol&lt;T&gt; Template</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">08</span> Linker Script &amp; Sections</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">09</span> Module Stomping</a>
+<a class="mod-link" href="module10.html"><span class="diff d3">10</span> Full Chain &amp; Extending</a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 3: Project Anatomy</h1>
+<p class="subtitle">Every file, every folder, and why it exists.</p>
+
+<h2>Directory Structure</h2>
+<pre><code><span class="lang-tag">File Tree</span>Stardust/
+├── Makefile              # Build system (MinGW cross-compilation)
+├── CMakeLists.txt        # Alt build for development/debugging
+├── README.md
+├── bin/
+│   └── obj/              # Compiled object files
+├── include/
+│   ├── common.h          # Master header, instance class, symbol&lt;T&gt;
+│   ├── constexpr.h       # Compile-time DJB2 hashing
+│   ├── macros.h          # D_API, G_SYM, RESOLVE_IMPORT macros
+│   ├── memory.h          # zero(), copy(), compare()
+│   ├── native.h          # Windows NT structures (22,000+ lines)
+│   └── resolve.h         # API/module resolution declarations
+├── scripts/
+│   └── linker.ld         # Custom section ordering
+├── src/
+│   ├── main.cc           # Entry point + implant logic
+│   ├── resolve.cc        # PEB walking + export table parsing
+│   └── asm/
+│       ├── entry.x64.asm # x64 entry point + RipStart
+│       ├── entry.x86.asm # x86 entry point + RipStart
+│       ├── utils.x64.asm # x64 RipData (data section locator)
+│       └── utils.x86.asm # x86 RipData
+├── test/
+│   └── stomper.cc        # Module stomping injection tester
+└── static/
+    └── *.png             # Demo screenshots</code></pre>
+
+<h2>File Dependency Graph</h2>
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">How Files Connect</h4>
+<div class="flow" style="flex-direction:column;gap:4px;max-width:550px;margin:0 auto">
+<div class="box hl" style="width:100%"><strong>main.cc</strong> &mdash; includes common.h, constexpr.h, resolve.h</div>
+<div style="text-align:center;color:var(--dim)">&darr; calls entry() from</div>
+<div class="box b" style="width:100%"><strong>entry.x64.asm / entry.x86.asm</strong> &mdash; stardust() entry, RipStart()</div>
+<div style="text-align:center;color:var(--dim)">&darr; main.cc uses APIs resolved by</div>
+<div class="box y" style="width:100%"><strong>resolve.cc</strong> &mdash; module() walks PEB, _api() walks exports</div>
+<div style="text-align:center;color:var(--dim)">&darr; string addresses found via</div>
+<div class="box b" style="width:100%"><strong>utils.x64.asm / utils.x86.asm</strong> &mdash; RipData()</div>
+<div style="text-align:center;color:var(--dim)">&darr; all section ordering controlled by</div>
+<div class="box g" style="width:100%"><strong>scripts/linker.ld</strong> &mdash; .text$A, .text$B, .rdata, .text$C</div>
+</div>
+</div>
+
+<h2>Build Pipeline</h2>
+<p>The Makefile orchestrates a four-step build process using a MinGW cross-compilation toolchain:</p>
+<pre><code><span class="lang-tag">Makefile - Build Steps (Simplified)</span># 1. Assemble entry points and utilities for both architectures
+#    (The assembler used depends on the toolchain - may be GAS or NASM)
+assemble src/asm/entry.x64.asm -&gt; bin/obj/entry.x64.obj
+assemble src/asm/utils.x64.asm -&gt; bin/obj/utils.x64.obj
+
+# 2. Compile C++ sources with MinGW cross-compilation toolchain
+compile src/main.cc    -&gt; bin/obj/main.x64.obj    $CFLAGS
+compile src/resolve.cc -&gt; bin/obj/resolve.x64.obj $CFLAGS
+
+# 3. Link everything with custom linker script
+link bin/obj/*.x64.obj -&gt; bin/stardust.x64.exe  -Tscripts/linker.ld
+
+# 4. Extract .text section as raw shellcode
+objcopy --dump-section .text=bin/stardust.x64.bin bin/stardust.x64.exe
+
+# 5. Delete the intermediate PE (we only need the .bin)
+rm bin/stardust.x64.exe</code></pre>
+
+<div class="card">
+<h4>Key Compiler Flags</h4>
+<table>
+<tr><th>Flag</th><th>Purpose</th></tr>
+<tr><td><code>-target x86_64-w64-mingw32</code></td><td>Cross-compile for Windows x64 via MinGW</td></tr>
+<tr><td><code>-Os</code></td><td>Optimize for size</td></tr>
+<tr><td><code>-nostdlib</code></td><td>No C/C++ standard library</td></tr>
+<tr><td><code>-fno-exceptions</code></td><td>Disable C++ exceptions</td></tr>
+<tr><td><code>-fPIC</code></td><td>Position-independent code</td></tr>
+<tr><td><code>-masm=intel</code></td><td>Use Intel assembly syntax</td></tr>
+<tr><td><code>-mno-sse</code></td><td>Disable SSE instructions for compatibility</td></tr>
+<tr><td><code>-fms-extensions</code></td><td>Microsoft extensions (SAL annotations, etc.)</td></tr>
+<tr><td><code>-Wl,-Tscripts/linker.ld</code></td><td>Custom linker script for section layout</td></tr>
+</table>
+</div>
+
+<div class="card warn">
+<h4>MinGW Toolchain Note</h4>
+<p>Both Stardust and AceLdr use MinGW-based cross-compilation toolchains to produce Windows PE binaries from a Linux build environment. AceLdr uses <code>x86_64-w64-mingw32-gcc</code> (GCC-based). Stardust also targets <code>x86_64-w64-mingw32</code> but the exact compiler frontend (Clang vs GCC) may vary by version or fork. The key difference is the linker script and <code>objcopy</code> extraction step that turns the PE into raw shellcode.</p>
+</div>
+
+<div class="quiz" id="quiz3">
+<h4>Pop Quiz: Project Structure</h4>
+<div class="quiz-q" data-correct="1">
+<p>Q1: How is the final shellcode extracted from the compiled PE?</p>
+<label data-opt="0"><input type="radio" name="q3_0"> A Python script searches for a marker string</label>
+<label data-opt="1"><input type="radio" name="q3_0"> objcopy dumps the .text section directly to a bin file</label>
+<label data-opt="2"><input type="radio" name="q3_0"> The PE is simply renamed to .bin</label>
+<label data-opt="3"><input type="radio" name="q3_0"> The build system produces shellcode natively</label>
+<div class="explain">Stardust uses <code>objcopy --dump-section .text=output.bin</code> to extract just the .text section from the compiled PE. This is different from AceLdr which used a Python script with an "ACELDR" end marker. The objcopy approach is cleaner since the linker script already ensures everything needed is in .text.</div>
+</div>
+<div class="quiz-q" data-correct="2">
+<p>Q2: How many C++ source files does Stardust have?</p>
+<label data-opt="0"><input type="radio" name="q3_1"> 6 (one per module)</label>
+<label data-opt="1"><input type="radio" name="q3_1"> 1 (everything in main.cc)</label>
+<label data-opt="2"><input type="radio" name="q3_1"> 2 (main.cc and resolve.cc)</label>
+<label data-opt="3"><input type="radio" name="q3_1"> 4 (main, resolve, hash, transport)</label>
+<div class="explain">Stardust is remarkably minimal: just main.cc (entry point + implant logic) and resolve.cc (PEB walking + export parsing). Everything else is in headers or assembly files. This minimalism is key to the tiny binary size.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz3')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module2.html">&larr; Previous</a>
+<a class="primary" href="module4.html">Next: Position-Independent Code &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

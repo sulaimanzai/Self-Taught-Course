@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 6: PEB Walking &amp; API Resolution - Stardust Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⭐</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#c084fc;--accent2:#38bdf8;--gradient:linear-gradient(135deg,#c084fc,#38bdf8)}</style>
+</head>
+<body>
+
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Stardust Course</h2>
+<span>Modern Implant Template Masterclass</span>
+</div>
+<a class="home-link" href="../Stardust_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">01</span> Why Stardust Exists</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">02</span> Modern C++ for Shellcode</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">03</span> Project Anatomy</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">04</span> Position-Independent Code</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">05</span> Compile-Time Hashing</a>
+<a class="mod-link active" href="module6.html"><span class="diff d2">06</span> PEB &amp; API Resolution</a>
+<a class="mod-link" href="module7.html"><span class="diff d2">07</span> The symbol&lt;T&gt; Template</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">08</span> Linker Script &amp; Sections</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">09</span> Module Stomping</a>
+<a class="mod-link" href="module10.html"><span class="diff d3">10</span> Full Chain &amp; Extending</a>
+</nav>
+
+<main>
+<span class="diff-badge medium">Difficulty: Intermediate</span>
+<h1>Module 6: PEB Walking &amp; API Resolution</h1>
+<p class="subtitle">Resolving DLL modules and exported functions at runtime, the modern C++ way.</p>
+
+<div class="card highlight">
+<h4>Why This Module?</h4>
+<p>Shellcode can't use the normal import table &mdash; there's no loader to fill it in. Instead, Stardust walks the <strong>Process Environment Block (PEB)</strong> to find loaded DLLs, then parses their export tables to locate function addresses. This is the same fundamental approach as AceLdr, but implemented with modern C++ templates and the DJB2 hash algorithm.</p>
+</div>
+
+<h2>Module Resolution: resolve::module()</h2>
+<p>The first step is finding a DLL's base address in memory. The PEB contains a linked list of all loaded modules via <code>PEB-&gt;Ldr-&gt;InLoadOrderModuleList</code>. Stardust's <code>resolve::module()</code> function walks this list, hashing each module name with DJB2 and comparing against a compile-time hash.</p>
+
+<pre><code><span class="lang-tag">C++</span>// resolve::module() - walks PEB to find a DLL base address
+// Accesses PEB-&gt;Ldr-&gt;InLoadOrderModuleList
+// Iterates using the RangeHeadList macro
+// Compares DJB2 hash of each module name against the target hash
+// Returns the DLL base address when a match is found
+
+auto module( u32 hash ) -&gt; void* {
+    auto peb = NtCurrentPeb();
+    auto head = &amp;peb-&gt;Ldr-&gt;InLoadOrderModuleList;
+
+    RangeHeadList( head, PLDR_DATA_TABLE_ENTRY, InLoadOrderLinks ) {
+        if ( entry-&gt;BaseDllName.Buffer ) {
+            if ( djb2( entry-&gt;BaseDllName ) == hash )
+                return entry-&gt;DllBase;
+        }
+    }
+    return nullptr;
+}</code></pre>
+
+<h3>The RangeHeadList Macro</h3>
+<p>The PEB's module list is a <strong>circular doubly-linked list</strong> of <code>LIST_ENTRY</code> structures. Manually iterating this requires boilerplate pointer arithmetic. Stardust defines a <code>RangeHeadList</code> macro in <code>macros.h</code> to simplify traversal:</p>
+
+<pre><code><span class="lang-tag">C++</span>// macros.h - RangeHeadList macro
+// Iterates a LIST_ENTRY linked list from head-&gt;Flink back to head
+// Casts each node to the containing structure type using CONTAINING_RECORD
+
+#define RangeHeadList( head, type, field )                         \
+    for ( auto entry = CONTAINING_RECORD( (head)-&gt;Flink, type, field ); \
+          &amp;entry-&gt;field != (head);                                 \
+          entry = CONTAINING_RECORD( entry-&gt;field.Flink, type, field ) )</code></pre>
+
+<p>This macro gives you a clean <code>for</code>-loop over every loaded module entry. The loop variable <code>entry</code> is automatically cast to the correct structure type (<code>PLDR_DATA_TABLE_ENTRY</code>), so you can directly access fields like <code>BaseDllName</code> and <code>DllBase</code>.</p>
+
+<h2>API Resolution: resolve::_api()</h2>
+<p>Once you have a DLL's base address, you need to find individual functions inside it. This means parsing the DLL's <strong>PE export table</strong> &mdash; the same structure the Windows loader uses when resolving imports.</p>
+
+<pre><code><span class="lang-tag">C++</span>// resolve::_api() - walks a DLL's export table to find a function
+// 1. Get DOS header from base address
+// 2. dos_header-&gt;e_lfanew gives offset to NT headers
+// 3. NT headers contain the export directory RVA
+// 4. Export directory points to three parallel arrays:
+//    - AddressOfFunctions    (array of function RVAs)
+//    - AddressOfNames        (array of name RVAs)
+//    - AddressOfNameOrdinals (array mapping name index to function index)
+
+auto _api( void* base, u32 hash ) -&gt; void* {
+    auto dos = (PIMAGE_DOS_HEADER)base;
+    auto nt  = RVA2VA&lt;PIMAGE_NT_HEADERS&gt;( base, dos-&gt;e_lfanew );
+    auto dir = &amp;nt-&gt;OptionalHeader.DataDirectory[ IMAGE_DIRECTORY_ENTRY_EXPORT ];
+    auto exp = RVA2VA&lt;PIMAGE_EXPORT_DIRECTORY&gt;( base, dir-&gt;VirtualAddress );
+
+    auto names    = RVA2VA&lt;u32*&gt;( base, exp-&gt;AddressOfNames );
+    auto funcs    = RVA2VA&lt;u32*&gt;( base, exp-&gt;AddressOfFunctions );
+    auto ordinals = RVA2VA&lt;u16*&gt;( base, exp-&gt;AddressOfNameOrdinals );
+
+    for ( u32 i = 0; i &lt; exp-&gt;NumberOfNames; i++ ) {
+        auto name = RVA2VA&lt;char*&gt;( base, names[i] );
+        if ( djb2( name ) == hash )
+            return RVA2VA&lt;void*&gt;( base, funcs[ ordinals[i] ] );
+    }
+    return nullptr;
+}</code></pre>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">PE Export Table: Three Parallel Arrays</h4>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:15px;text-align:center">
+<div>
+<p style="color:var(--accent2);font-weight:700;margin-bottom:8px">AddressOfNames</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box b" style="width:100%">[0] "CreateFileW"</div>
+<div class="box b" style="width:100%">[1] "ReadFile"</div>
+<div class="box b" style="width:100%">[2] "WriteFile"</div>
+</div>
+</div>
+<div>
+<p style="color:var(--yellow);font-weight:700;margin-bottom:8px">AddressOfNameOrdinals</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box y" style="width:100%">[0] &rarr; ordinal 5</div>
+<div class="box y" style="width:100%">[1] &rarr; ordinal 12</div>
+<div class="box y" style="width:100%">[2] &rarr; ordinal 18</div>
+</div>
+</div>
+<div>
+<p style="color:var(--green);font-weight:700;margin-bottom:8px">AddressOfFunctions</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box g" style="width:100%">[5] &rarr; 0x7FF81234</div>
+<div class="box g" style="width:100%">[12] &rarr; 0x7FF85678</div>
+<div class="box g" style="width:100%">[18] &rarr; 0x7FF89ABC</div>
+</div>
+</div>
+</div>
+<p style="text-align:center;color:var(--dim);margin-top:15px;font-size:.85rem">Match a name &rarr; get its ordinal &rarr; use ordinal as index into functions array</p>
+</div>
+
+<h2>Bulk Resolution: RESOLVE_IMPORT</h2>
+<p>Resolving APIs one at a time would be verbose and repetitive. Stardust provides the <code>RESOLVE_IMPORT</code> macro to resolve an entire batch of functions from a single DLL in one call. This macro works with a struct containing API declarations defined via <code>D_API</code>.</p>
+
+<pre><code><span class="lang-tag">C++</span>// Usage pattern:
+// 1. Define API declarations in a struct using D_API macros
+// 2. Call RESOLVE_IMPORT with the struct and module hash
+//
+// RESOLVE_IMPORT expands roughly to:
+//   base = resolve::module( module_hash );
+//   struct_count = sizeof(api_struct) / sizeof(void*);
+//   for ( int i = 1; i &lt; struct_count; i++ ) {
+//       ptrs[i] = resolve::_api( base, hashes[i] );
+//   }
+
+RESOLVE_IMPORT( ntdll, H_MODULE_NTDLL );
+RESOLVE_IMPORT( kernel32, H_MODULE_KERNEL32 );</code></pre>
+
+<div class="card warn">
+<h4>Why Does the Loop Start at Index 1?</h4>
+<p>The API struct's first element (index 0) stores the <strong>module base address</strong> itself, not a function pointer. The loop starts at index 1 to skip this base address and only resolve actual function pointers. The <code>struct_count</code> variable (calculated as <code>sizeof(struct) / sizeof(void*)</code>) tells the macro how many total slots exist, including that base address slot.</p>
+</div>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Before &amp; After RESOLVE_IMPORT</h4>
+<div style="display:flex;gap:30px;justify-content:center;flex-wrap:wrap">
+<div style="flex:1;min-width:250px">
+<p style="text-align:center;color:var(--dim);font-weight:700;margin-bottom:10px">Before (compile time)</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box" style="width:100%">[0] module base = NULL</div>
+<div class="box" style="width:100%">[1] NtAllocateVirtualMemory = NULL</div>
+<div class="box" style="width:100%">[2] NtProtectVirtualMemory = NULL</div>
+<div class="box" style="width:100%">[3] RtlCreateHeap = NULL</div>
+</div>
+</div>
+<div style="flex:1;min-width:250px">
+<p style="text-align:center;color:var(--green);font-weight:700;margin-bottom:10px">After (runtime)</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box g" style="width:100%">[0] module base = 0x7FFB1000</div>
+<div class="box g" style="width:100%">[1] NtAllocateVirtualMemory = 0x7FFB1A20</div>
+<div class="box g" style="width:100%">[2] NtProtectVirtualMemory = 0x7FFB1B40</div>
+<div class="box g" style="width:100%">[3] RtlCreateHeap = 0x7FFB2C60</div>
+</div>
+</div>
+</div>
+</div>
+
+<h2>How It All Connects</h2>
+<ol>
+<li><strong>At compile time:</strong> DJB2 hashes are computed for each module name and function name using <code>constexpr</code> functions. No plaintext strings appear in the final shellcode.</li>
+<li><strong>At runtime (initialization):</strong> <code>RESOLVE_IMPORT</code> calls <code>resolve::module()</code> to walk the PEB and find the DLL base, then loops through the struct calling <code>resolve::_api()</code> for each function hash.</li>
+<li><strong>After resolution:</strong> The struct's slots are filled with live function pointers that Stardust can call directly.</li>
+</ol>
+
+<div class="card green">
+<h4>Key Takeaway</h4>
+<p>This resolution subsystem (<code>resolve::module</code>, <code>resolve::_api</code>, <code>RESOLVE_IMPORT</code>) is Stardust's mechanism for calling Windows APIs without an import table. It is a <strong>separate system</strong> from the <code>symbol&lt;T&gt;</code> template, which handles position-independent string access (covered in the next module).</p>
+</div>
+
+<div class="quiz" id="quiz1">
+<h4>Knowledge Check</h4>
+<div class="quiz-q" data-correct="1">
+<p>Q1: Why does the RESOLVE_IMPORT loop start at index 1 instead of index 0?</p>
+<label data-opt="0"><input type="radio" name="q6_0"> Index 0 is reserved for the hash value</label>
+<label data-opt="1"><input type="radio" name="q6_0"> Index 0 stores the module base address, not a function pointer</label>
+<label data-opt="2"><input type="radio" name="q6_0"> Index 0 is intentionally left as a null sentinel</label>
+<label data-opt="3"><input type="radio" name="q6_0"> Arrays in C++ are 1-indexed when used with templates</label>
+<div class="explain">Correct! The first slot (index 0) in the API struct holds the DLL's base address returned by resolve::module(). The actual function pointers begin at index 1, so the resolution loop skips index 0.</div>
+</div>
+<div class="quiz-q" data-correct="2">
+<p>Q2: What does <code>struct_count</code> represent in the RESOLVE_IMPORT macro?</p>
+<label data-opt="0"><input type="radio" name="q6_1"> The number of functions to resolve</label>
+<label data-opt="1"><input type="radio" name="q6_1"> The size of each function pointer in bytes</label>
+<label data-opt="2"><input type="radio" name="q6_1"> The total number of pointer-sized slots in the struct (base address + functions)</label>
+<label data-opt="3"><input type="radio" name="q6_1"> The number of DLLs to iterate through</label>
+<div class="explain">Correct! struct_count is calculated as sizeof(api_struct) / sizeof(void*), giving the total number of pointer-sized entries. This includes the module base address at index 0 plus all the function pointers. The loop uses this count to know when to stop iterating.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module5.html">&larr; Prev: Compile-Time Hashing</a>
+<a class="primary" href="module7.html">Next: The symbol&lt;T&gt; Template &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

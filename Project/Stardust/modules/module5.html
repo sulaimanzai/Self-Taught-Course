@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 5: Compile-Time DJB2 Hashing - Stardust Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⭐</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#c084fc;--accent2:#38bdf8;--gradient:linear-gradient(135deg,#c084fc,#38bdf8)}</style>
+</head>
+<body>
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav id="sidenav">
+<div class="logo"><h2>Stardust Course</h2><span>Modern Implant Template Masterclass</span></div>
+<a class="home-link" href="../Stardust_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">01</span> Why Stardust Exists</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">02</span> C++ for Shellcode</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">03</span> Project Anatomy</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">04</span> Position-Independent Code</a>
+<a class="mod-link active" href="module5.html"><span class="diff d2">05</span> Compile-Time Hashing</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">06</span> PEB &amp; API Resolution</a>
+<a class="mod-link" href="module7.html"><span class="diff d2">07</span> The symbol&lt;T&gt; Template</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">08</span> Linker Script &amp; Sections</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">09</span> Module Stomping</a>
+<a class="mod-link" href="module10.html"><span class="diff d3">10</span> Full Chain &amp; Extending</a>
+</nav>
+
+<main>
+<span class="diff-badge medium">Difficulty: Intermediate</span>
+<h1>Module 5: Compile-Time DJB2 Hashing</h1>
+<p class="subtitle">Strings disappear at build time. Only hashes remain.</p>
+
+<div class="card highlight">
+<h4>Stardust Uses DJB2</h4>
+<p>Stardust uses the <strong>DJB2</strong> hash algorithm (hash * 33 + char, starting from 5381) &mdash; the same fundamental algorithm used by AceLdr. The key difference is <em>when</em> the hash is computed: AceLdr pre-computes hashes with a Python script and stores them as <code>#define</code> constants, while Stardust computes them at <strong>compile time</strong> using C++ <code>constexpr</code>/<code>consteval</code>. The string never appears in the binary either way, but Stardust's approach is more maintainable.</p>
+</div>
+
+<div class="card warn">
+<h4>Note on Hash Algorithm Variations</h4>
+<p>Different versions or forks of Stardust may use different hash algorithms. Some forks use FNV-1a (offset basis: 0x811c9dc5, prime: 0x01000193) instead of DJB2. The technique and purpose remain identical regardless of which hash function is used &mdash; only the constants change. Always check the source code of the specific version you are working with.</p>
+</div>
+
+<h2>The DJB2 Algorithm</h2>
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">DJB2 Hash Computation</h4>
+<div class="flow">
+<div class="box hl">hash = 5381<br><small>(DJB2 initial value)</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box y">For each byte:<br>toupper(byte)</div>
+<div class="arrow">&rarr;</div>
+<div class="box y">hash = (hash &lt;&lt; 5)<br>+ hash + byte</div>
+<div class="arrow">&rarr;</div>
+<div class="box g">32-bit hash<br>output</div>
+</div>
+</div>
+
+<p>The core operation <code>(hash &lt;&lt; 5) + hash + byte</code> is equivalent to <code>hash * 33 + byte</code>. The shift-and-add form is preferred because it avoids an explicit multiply instruction, though modern compilers optimize both forms identically.</p>
+
+<h2>Two Versions: Compile-Time and Runtime</h2>
+
+<h3>Compile-Time (constexpr) &mdash; Used for Constants</h3>
+<pre><code><span class="lang-tag">C++ - constexpr.h</span>template &lt;typename T = char&gt;
+constexpr auto hash_string( const T* string ) -&gt; uint32_t {
+    uint32_t hash = 5381;             // DJB2 initial value
+    uint8_t  byte = 0;
+    while ( *string ) {
+        byte = static_cast&lt;uint8_t&gt;( *string++ );
+        if ( byte &gt;= 'a' ) byte -= 0x20;  // uppercase (case-insensitive)
+        hash = ( ( hash &lt;&lt; 5 ) + hash ) + byte;  // hash * 33 + byte
+    }
+    return hash;
+}
+
+// Usage (compile time - string NEVER in binary):
+auto h = expr::hash_string( "NtAllocateVirtualMemory" ); // =&gt; constant</code></pre>
+
+<h3>Runtime &mdash; Used for PEB Walking</h3>
+<pre><code><span class="lang-tag">C++ - common.h</span>// Same algorithm but callable at runtime (for hashing DLL export names)
+template&lt;typename T = char&gt;
+inline auto declfn hash_string( const T* string ) -&gt; uint32_t {
+    uint32_t hash = 5381;
+    uint8_t  byte = 0;
+    while ( *string ) {
+        byte = static_cast&lt;uint8_t&gt;( *string++ );
+        if ( byte &gt;= 'a' ) byte -= 0x20;
+        hash = ( ( hash &lt;&lt; 5 ) + hash ) + byte;
+    }
+    return hash;
+}
+
+// Usage (runtime - hashing export names found in DLL memory):
+if ( stardust::hash_string( exportName ) == target_hash ) { ... }</code></pre>
+
+<div class="card">
+<h4>Why Two Identical Functions?</h4>
+<p>The compile-time version lives in the <code>expr</code> namespace and is marked <code>constexpr</code> (or <code>consteval</code> in C++20). It runs inside the compiler. The runtime version lives in the <code>stardust</code> namespace and is a regular inline function that runs when the shellcode executes. They use the same algorithm so that a hash computed at build time matches a hash computed at runtime against real export names.</p>
+</div>
+
+<h2>Wide String Support (UTF-16)</h2>
+<p>Module names in the PEB are stored as <strong>wide strings</strong> (wchar_t, UTF-16). The template parameter <code>&lt;wchar_t&gt;</code> handles this:</p>
+<pre><code><span class="lang-tag">C++</span>// Compile-time hash of a wide string (for matching DLL names from PEB)
+resolve::module( expr::hash_string&lt;wchar_t&gt;( L"ntdll.dll" ) )
+//                                 ^^^^^^^^    ^^
+//                                 template     wide string literal
+//                                 param</code></pre>
+
+<h2>AceLdr vs Stardust: Hash Comparison</h2>
+<table>
+<tr><th>Property</th><th>AceLdr</th><th>Stardust</th></tr>
+<tr><td>Algorithm</td><td>DJB2</td><td>DJB2</td></tr>
+<tr><td>Initial value</td><td>5381</td><td>5381</td></tr>
+<tr><td>Operation</td><td>(hash &lt;&lt; 5) + hash + char</td><td>(hash &lt;&lt; 5) + hash + char</td></tr>
+<tr><td>Multiplier</td><td>33 (implicit via shift)</td><td>33 (implicit via shift)</td></tr>
+<tr><td>Case handling</td><td>Case-insensitive (uppercase)</td><td>Case-insensitive (uppercase)</td></tr>
+<tr><td>When computed?</td><td>Python script pre-computes</td><td>constexpr computes in compiler</td></tr>
+<tr><td>String in binary?</td><td>No (hashes in <code>#define</code>)</td><td>No (constexpr eliminates them)</td></tr>
+<tr><td>Adding new API</td><td>Run Python script, paste hash</td><td>Just write the API name in code</td></tr>
+</table>
+
+<div class="card green">
+<h4>The Clever Bit: RESOLVE_TYPE</h4>
+<pre><code>#define RESOLVE_TYPE( s ) .s = reinterpret_cast&lt;decltype(s)*&gt;( expr::hash_string( #s ) )</code></pre>
+<p>The <code>#s</code> operator "stringifies" the macro argument. So <code>RESOLVE_TYPE(LoadLibraryA)</code> expands to:</p>
+<pre><code>.LoadLibraryA = reinterpret_cast&lt;decltype(LoadLibraryA)*&gt;( expr::hash_string("LoadLibraryA") )</code></pre>
+<p>At compile time, the hash is computed and the function pointer is temporarily set to the hash value. Later, <code>RESOLVE_IMPORT</code> replaces these hash values with real function addresses.</p>
+</div>
+
+<div class="card">
+<h4>Why This Matters for Development</h4>
+<p>With AceLdr's approach, adding a new API call means: (1) run the Python hash script, (2) copy the hex value, (3) paste it as a <code>#define</code>. With Stardust, you just write <code>RESOLVE_TYPE(NewFunction)</code> and the compiler does the rest. This is a significant quality-of-life improvement for implant development while producing identical runtime behavior.</p>
+</div>
+
+<div class="quiz" id="quiz5">
+<h4>Pop Quiz: DJB2 Hashing</h4>
+<div class="quiz-q" data-correct="1">
+<p>Q1: What is the DJB2 initial hash value and core operation?</p>
+<label data-opt="0"><input type="radio" name="q5_0"> Initial: 0x811c9dc5, Operation: hash ^= byte; hash *= prime</label>
+<label data-opt="1"><input type="radio" name="q5_0"> Initial: 5381, Operation: hash = (hash &lt;&lt; 5) + hash + byte</label>
+<label data-opt="2"><input type="radio" name="q5_0"> Initial: 0, Operation: hash += byte * 31</label>
+<label data-opt="3"><input type="radio" name="q5_0"> Initial: 0xDEADBEEF, Operation: hash = hash ^ byte</label>
+<div class="explain">DJB2 uses an initial value of 5381 and the operation (hash &lt;&lt; 5) + hash + byte, which is equivalent to hash * 33 + byte. This is the same algorithm used in both AceLdr and Stardust, with the difference being that Stardust computes it at compile time via constexpr.</div>
+</div>
+<div class="quiz-q" data-correct="3">
+<p>Q2: What does the <code>#</code> operator do in <code>RESOLVE_TYPE(#s)</code>?</p>
+<label data-opt="0"><input type="radio" name="q5_1"> Comments out the argument</label>
+<label data-opt="1"><input type="radio" name="q5_1"> Converts to a number</label>
+<label data-opt="2"><input type="radio" name="q5_1"> Dereferences a pointer</label>
+<label data-opt="3"><input type="radio" name="q5_1"> Stringifies the macro argument (LoadLibraryA becomes "LoadLibraryA")</label>
+<div class="explain">The # operator in a macro converts the argument to a string literal. So #s where s=LoadLibraryA produces "LoadLibraryA". This string is then fed to the constexpr hash_string function which computes the DJB2 hash at compile time. The string never appears in the final binary.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz5')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module4.html">&larr; Previous</a>
+<a class="primary" href="module6.html">Next: PEB &amp; API Resolution &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

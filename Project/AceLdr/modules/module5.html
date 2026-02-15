@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 5: Position-Independent Code - AceLdr Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F5A5;</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#00d4ff;--accent2:#7c3aed;--gradient:linear-gradient(135deg,#00d4ff,#7c3aed)}</style>
+</head>
+<body>
+
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>AceLdr Course</h2>
+<span>Memory Evasion Masterclass</span>
+</div>
+<a class="home-link" href="../AceLdr_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">1</span> Windows Memory 101</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">2</span> PE File Format</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">3</span> PEB &amp; API Hashing</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">4</span> Reflective Loading</a>
+<a class="mod-link active" href="module5.html"><span class="diff d2">5</span> Position-Independent Code</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">6</span> IAT Hooking</a>
+<a class="mod-link" href="module7.html"><span class="diff d3">7</span> Return Addr Spoofing</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">8</span> FOLIAGE Sleep Mask</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">9</span> Full Chain &amp; Integration</a>
+</nav>
+
+<main>
+<span class="diff-badge medium">Difficulty: Intermediate</span>
+<h1>Module 5: Position-Independent Code (PIC)</h1>
+<p class="subtitle">Code that doesn't know where it lives - and doesn't need to.</p>
+
+<div class="card highlight">
+<h4>Why PIC Matters</h4>
+<p>Shellcode gets injected at an unknown, random address. It can't use global variables or absolute addresses because it doesn't know where it is. Every data reference must be <strong>relative to the current instruction pointer</strong>. AceLdr is entirely position-independent - from its ASM entry point to its C hook functions.</p>
+</div>
+
+<div class="card">
+<h4>The Core Challenge</h4>
+<p>When you compile a normal C program, the compiler generates code that references data at fixed addresses. For example, a global variable might live at <code>0x00404000</code>. But shellcode could be injected at <code>0x7FFE1234</code>, <code>0x0012AB00</code>, or anywhere else. If the code refers to <code>0x00404000</code>, it will crash or read garbage. Position-independent code solves this by computing addresses at runtime relative to the current position.</p>
+</div>
+
+<h2>The GetIp Trick</h2>
+<p>The foundation of PIC: "Where am I right now?" On x64, you can use RIP-relative addressing natively, but AceLdr uses a classic technique that has been a staple of shellcode development for decades:</p>
+
+<pre><code><span class="lang-tag">ASM - from misc.asm</span>GetIp:
+    call   get_ret_ptr    ; CALL pushes the address of the next instruction
+
+get_ret_ptr:
+    pop    rax            ; RAX = address of get_ret_ptr (= our current location)
+    sub    rax, 5         ; Adjust back to GetIp's address (CALL is 5 bytes)
+    ret                   ; Return with RAX = address of GetIp()</code></pre>
+
+<div class="card">
+<h4>How It Works Step by Step</h4>
+<ol>
+<li><code>call get_ret_ptr</code> pushes the return address (address of the <code>pop rax</code> instruction) onto the stack. This is what <code>CALL</code> always does - it pushes the address of the <strong>next instruction</strong> so <code>RET</code> can return there.</li>
+<li><code>pop rax</code> retrieves that address from the stack into RAX. Now RAX holds the runtime address of <code>get_ret_ptr</code>.</li>
+<li><code>sub rax, 5</code> adjusts back by the size of the CALL instruction (5 bytes on x64 for a near call). Now RAX points to <code>GetIp</code> itself.</li>
+<li><code>ret</code> returns to the caller with RAX containing the absolute runtime address of <code>GetIp</code>.</li>
+</ol>
+<p>Since we know where <code>GetIp</code> is <strong>relative to the rest of our code</strong> (determined at compile time by the linker), we can calculate the address of anything.</p>
+</div>
+
+<h2>The OFFSET Macro</h2>
+<p>With <code>GetIp()</code> giving us a known runtime anchor point, the <code>OFFSET</code> macro calculates the runtime address of any symbol:</p>
+
+<pre><code><span class="lang-tag">C - from include.h</span>// "Where is X right now, in this process's memory?"
+#define OFFSET( x ) ( ULONG_PTR )( GetIp() - ( (ULONG_PTR)&amp;GetIp - (ULONG_PTR)x ) )
+
+// At compile time: &amp;GetIp - x = distance between GetIp and x
+// At runtime:      GetIp() returns actual address of GetIp
+// So:              GetIp() - distance = actual address of x</code></pre>
+
+<h3>Breaking Down the Math</h3>
+<p>Let's trace through a concrete example. Suppose at compile time:</p>
+<ul>
+<li><code>&amp;GetIp</code> = 0x1000 (compile-time address of GetIp)</li>
+<li><code>&amp;Stub</code> = 0x0800 (compile-time address of Stub)</li>
+<li>Distance = 0x1000 - 0x0800 = 0x200</li>
+</ul>
+<p>At runtime, the code is loaded at a completely different location:</p>
+<ul>
+<li><code>GetIp()</code> returns 0x7FFE3000 (actual runtime address)</li>
+<li><code>OFFSET(Stub)</code> = 0x7FFE3000 - 0x200 = 0x7FFE2E00 (actual runtime address of Stub)</li>
+</ul>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">OFFSET Macro Visualization</h4>
+<div style="max-width:500px;margin:0 auto;font-size:.85rem;font-family:monospace">
+<div style="display:flex;gap:0;align-items:stretch">
+<div style="width:80px;text-align:right;padding:5px;color:var(--dim)">0x????</div>
+<div style="flex:1;border-left:3px solid var(--accent);padding:5px 15px">
+<div style="padding:6px 0;border-bottom:1px dashed var(--border)"><span style="color:var(--yellow)">Stub:</span> (data we want to find)</div>
+<div style="padding:6px 0;border-bottom:1px dashed var(--border);color:var(--dim)">... other code ...</div>
+<div style="padding:6px 0;border-bottom:1px dashed var(--border)"><span style="color:var(--green)">GetIp:</span> (we know this address at runtime)</div>
+<div style="padding:6px 0;color:var(--dim)">... more code ...</div>
+</div>
+</div>
+<div style="margin-top:10px;color:var(--accent)">distance = &amp;GetIp - &amp;Stub (known at compile time)<br>OFFSET(Stub) = GetIp() - distance = actual address of Stub</div>
+</div>
+</div>
+
+<div class="card green">
+<h4>Why This Works</h4>
+<p>The key insight is that while absolute addresses change when code is loaded at different locations, <strong>relative distances between symbols remain constant</strong>. The linker computes the distance between <code>GetIp</code> and any target symbol at compile time. At runtime, <code>GetIp()</code> provides the actual anchor address, and simple arithmetic gives us the actual address of any target. This is the foundation of all position-independent code in AceLdr.</p>
+</div>
+
+<h2>The Custom Linker Script</h2>
+<p>For the <code>OFFSET</code> macro to work correctly, AceLdr must control the <strong>exact layout of code in memory</strong>. Without a custom linker script, the linker is free to reorder functions, which would break all the distance calculations. AceLdr uses a linker script that assigns each component to a <strong>named subsection</strong>:</p>
+
+<pre><code><span class="lang-tag">LD - from link.ld</span>SECTIONS
+{
+    .text :
+    {
+        *( .text$A )    /* start.asm - Entry point (Start) */
+        *( .text$B )    /* ace.c     - Loader/Ace functions */
+        *( .text$C )    /* misc.asm  - Stub data + GetIp */
+        *( .text$D )    /* hooks     - Sleep_Hook, Spoof hooks, Heap hook */
+        *( .text$E )    /* util.c    - HashString, FindModule, etc. */
+        *( .rdata* )    /* Read-only data (strings, etc.) */
+        *( .text$F )    /* misc.asm  - GetIp impl + "ACELDR" marker */
+    }
+}</code></pre>
+
+<div class="card">
+<h4>Understanding the Section Ordering</h4>
+<p>The subsections (<code>.text$A</code> through <code>.text$F</code>) are ordered alphabetically by the linker and merged into a single <code>.text</code> section. This ensures:</p>
+<ul>
+<li><strong>.text$A</strong> (entry point) comes first - the shellcode starts executing here</li>
+<li><strong>.text$B</strong> (core loader) comes next - <code>Ace()</code> and <code>Loader()</code></li>
+<li><strong>.text$C</strong> (Stub data) is in the middle - accessible via OFFSET from any hook</li>
+<li><strong>.text$D</strong> (hooks) follow - these are the functions that intercept Beacon API calls</li>
+<li><strong>.text$E</strong> (utilities) - helper functions like <code>HashString</code> and <code>FindModule</code></li>
+<li><strong>.text$F</strong> (end) comes last - contains the <code>GetIp</code> implementation and the end marker</li>
+</ul>
+<p>Note that <code>.rdata</code> (read-only data) is also merged into <code>.text</code>. This is because shellcode has only one section - everything must be in the executable code section.</p>
+</div>
+
+<h3>The SECTION() Macro</h3>
+<p>Each C function uses the <code>SECTION()</code> macro to declare which subsection it belongs to:</p>
+
+<pre><code><span class="lang-tag">C - Section assignment macro</span>#define SECTION( x ) __attribute__(( section( ".text$" #x ) ))
+
+// Usage:
+SECTION( B ) VOID Loader( VOID ) { ... }      // Goes into .text$B
+SECTION( D ) VOID Sleep_Hook( ... ) { ... }    // Goes into .text$D
+SECTION( E ) PVOID FindModule( ... ) { ... }   // Goes into .text$E</code></pre>
+
+<p>The <code>__attribute__((section(...)))</code> is a GCC/Clang extension that tells the compiler to place the function's code into the specified section instead of the default <code>.text</code>. The <code>#x</code> uses the C preprocessor's stringification operator to convert the argument to a string, so <code>SECTION(B)</code> becomes <code>__attribute__((section(".text$B")))</code>.</p>
+
+<h2>The ACELDR End Marker</h2>
+<p>After compilation, the extraction script needs to know where the shellcode ends. AceLdr places the string <code>"ACELDR"</code> at the very end of <code>.text$F</code> to serve as a delimiter:</p>
+
+<pre><code><span class="lang-tag">ASM - from misc.asm</span>[SECTION .text$F]
+GetIp:
+    call    get_ret_ptr
+get_ret_ptr:
+    pop    rax
+    sub    rax, 5
+    ret
+
+Leave:
+    db 'A', 'C', 'E', 'L', 'D', 'R'   ; End marker</code></pre>
+
+<p>The Python extraction script (<code>extract.py</code>) then finds this marker and extracts everything before it as the final shellcode blob:</p>
+
+<pre><code><span class="lang-tag">Python - from extract.py</span># Find the marker and extract everything before it
+PeSec = PeExe.sections[0].get_data()
+ScRaw = PeSec[ : PeSec.find( b'ACELDR' ) ]  # Shellcode = bytes before marker</code></pre>
+
+<div class="card">
+<h4>The Build Pipeline</h4>
+<p>The full build process for AceLdr is:</p>
+<ol>
+<li><strong>Compile</strong>: Each .c file is compiled to an object file with <code>SECTION()</code> attributes</li>
+<li><strong>Assemble</strong>: Assembly files (start.asm, misc.asm) are assembled with NASM</li>
+<li><strong>Link</strong>: The custom linker script (<code>link.ld</code>) merges everything into a single .text section in the correct order</li>
+<li><strong>Extract</strong>: <code>extract.py</code> reads the compiled PE, finds the "ACELDR" marker, and dumps everything before it as raw shellcode</li>
+<li><strong>Prepend</strong>: The shellcode is prepended to the Beacon DLL, creating the final payload</li>
+</ol>
+</div>
+
+<div class="card warn">
+<h4>Common PIC Pitfalls</h4>
+<p>Writing position-independent C code is tricky. Common mistakes include:</p>
+<ul>
+<li><strong>String literals</strong>: In normal C, <code>"hello"</code> is stored in <code>.rdata</code> and referenced by absolute address. AceLdr's linker script pulls <code>.rdata</code> into <code>.text</code> to solve this.</li>
+<li><strong>Global variables</strong>: These live in <code>.data</code> or <code>.bss</code> and are referenced absolutely. AceLdr avoids globals entirely, using the STUB structure and OFFSET() instead.</li>
+<li><strong>Switch statements</strong>: Compilers may generate jump tables with absolute addresses. AceLdr uses if-else chains or carefully written switch statements.</li>
+<li><strong>Function pointers</strong>: Taking the address of a function (<code>&amp;MyFunc</code>) gives a compile-time address. AceLdr uses <code>OFFSET(MyFunc)</code> instead.</li>
+</ul>
+</div>
+
+<div class="quiz" id="quiz5">
+<h4>Pop Quiz: Position-Independent Code</h4>
+<div class="quiz-q" data-correct="1">
+<p>Q1: The GetIp function uses <code>call + pop</code>. What does CALL push onto the stack?</p>
+<label data-opt="0"><input type="radio" name="q5_0"> The address of the CALL instruction itself</label>
+<label data-opt="1"><input type="radio" name="q5_0"> The address of the instruction AFTER the CALL (the return address)</label>
+<label data-opt="2"><input type="radio" name="q5_0"> The value of the stack pointer</label>
+<label data-opt="3"><input type="radio" name="q5_0"> The base pointer (RBP)</label>
+<div class="explain">CALL pushes the address of the next instruction (the return address) and then jumps to the target. POP then retrieves this address into a register. This is the classic way to get the current instruction pointer in shellcode.</div>
+</div>
+<div class="quiz-q" data-correct="2">
+<p>Q2: Why does AceLdr use a custom linker script?</p>
+<label data-opt="0"><input type="radio" name="q5_1"> To make the binary smaller</label>
+<label data-opt="1"><input type="radio" name="q5_1"> To add debug symbols</label>
+<label data-opt="2"><input type="radio" name="q5_1"> To control the exact order of code sections so OFFSET() calculations work correctly</label>
+<label data-opt="3"><input type="radio" name="q5_1"> Because MinGW requires one</label>
+<div class="explain">The OFFSET() macro relies on knowing the compile-time distance between functions. The linker script ensures functions are placed in a predictable order (.text$A through .text$F). Without it, the linker could reorder functions and break all the position-independent addressing.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz5')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module4.html">&larr; Previous: Reflective Loading</a>
+<a class="primary" href="module6.html">Next: IAT Hooking &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>

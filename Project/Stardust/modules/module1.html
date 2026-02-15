@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 1: Why Stardust Exists - Stardust Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⭐</text></svg>">
+<link rel="stylesheet" href="../../assets/course.css">
+<style>:root{--accent:#c084fc;--accent2:#38bdf8;--gradient:linear-gradient(135deg,#c084fc,#38bdf8)}</style>
+</head>
+<body>
+<button class="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">&#9776;</button>
+
+<nav id="sidenav">
+<div class="logo"><h2>Stardust Course</h2><span>Modern Implant Template Masterclass</span></div>
+<a class="home-link" href="../Stardust_index.html">&larr; Course Home</a>
+<a class="mod-link active" href="module1.html"><span class="diff d1">01</span> Why Stardust Exists</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">02</span> C++ for Shellcode</a>
+<a class="mod-link" href="module3.html"><span class="diff d1">03</span> Project Anatomy</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">04</span> Position-Independent Code</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">05</span> Compile-Time Hashing</a>
+<a class="mod-link" href="module6.html"><span class="diff d2">06</span> PEB &amp; API Resolution</a>
+<a class="mod-link" href="module7.html"><span class="diff d2">07</span> The symbol&lt;T&gt; Template</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">08</span> Linker Script &amp; Sections</a>
+<a class="mod-link" href="module9.html"><span class="diff d3">09</span> Module Stomping</a>
+<a class="mod-link" href="module10.html"><span class="diff d3">10</span> Full Chain &amp; Extending</a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 1: Why Stardust Exists</h1>
+<p class="subtitle">The problem with old-school shellcode loaders, and a modern answer.</p>
+
+<div class="card highlight">
+<h4>Context Check</h4>
+<p>If you completed the AceLdr course, you already know how reflective DLL loaders work. Stardust takes a <strong>radically different approach</strong>. Instead of loading a DLL reflectively, Stardust IS the implant &mdash; pure position-independent C++ code compiled directly into shellcode. No PE headers, no DLL, no loader stub. Just raw code.</p>
+</div>
+
+<h2>The Problem with Reflective Loaders</h2>
+<p>Traditional reflective DLL injection (like AceLdr) works well but leaves artifacts:</p>
+
+<div class="versus">
+<div>
+<h5 style="color:var(--red)">Reflective DLL Loader (Traditional)</h5>
+<ul>
+<li>Full PE still exists in memory (headers, sections, IAT)</li>
+<li>Loader stub + DLL = larger payload</li>
+<li>Must parse PE headers, process relocations, resolve IAT</li>
+<li>PE signatures detectable by PE-sieve, Moneta</li>
+<li>Two components: the loader and the payload</li>
+</ul>
+</div>
+<div>
+<h5 style="color:var(--green)">Stardust (PIC Template)</h5>
+<ul>
+<li>No PE headers in memory at all</li>
+<li>~752 bytes (x64) / ~672 bytes (x86) base size</li>
+<li>No PE parsing, no relocations, no IAT</li>
+<li>Nothing for PE scanners to find</li>
+<li>One component: the shellcode IS the implant</li>
+</ul>
+</div>
+</div>
+
+<h2>What Stardust Actually Is</h2>
+<p>Stardust is a <strong>template</strong> &mdash; a skeleton you fill in with your implant logic. Out of the box, it demonstrates:</p>
+<ul>
+<li><strong>Position-independent code</strong> that works at any memory address</li>
+<li><strong>Compile-time DJB2 hashing</strong> using modern C++ <code>constexpr</code>/<code>consteval</code></li>
+<li><strong>Dynamic API resolution</strong> via PEB walking + export table parsing</li>
+<li><strong>Dual architecture</strong> support (x86 and x64 from the same codebase)</li>
+<li><strong>Raw string support</strong> with the <code>symbol&lt;T&gt;</code> template</li>
+<li><strong>Module stomping</strong> test harness for injection</li>
+</ul>
+
+<h2>Stardust at a Glance</h2>
+<table>
+<tr><th>Metric</th><th>Value</th></tr>
+<tr><td>Author</td><td>Cracked5pider (C5), also creator of Havoc C2 Framework</td></tr>
+<tr><td>Language</td><td>C++ + Assembly</td></tr>
+<tr><td>Compiler</td><td>MinGW cross-compilation toolchain</td></tr>
+<tr><td>x64 Release Size</td><td>~752 bytes</td></tr>
+<tr><td>x86 Release Size</td><td>~672 bytes</td></tr>
+<tr><td>Dependencies</td><td>None (nostdlib)</td></tr>
+<tr><td>Blog Post</td><td>5pider.net/blog/2024/01/27/modern-shellcode-implant-design</td></tr>
+</table>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Architecture Comparison</h4>
+<div style="display:flex;gap:20px;justify-content:center;flex-wrap:wrap">
+<div style="flex:1;min-width:280px">
+<p style="text-align:center;color:var(--red);font-weight:700;margin-bottom:10px">Traditional: Reflective DLL Loader</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box r" style="width:100%">Shellcode (Loader Stub)</div>
+<div class="box r" style="width:100%">PE Headers (MZ, NT, Sections)</div>
+<div class="box" style="width:100%">.text - Beacon Code</div>
+<div class="box" style="width:100%">.rdata - Import Table (IAT)</div>
+<div class="box" style="width:100%">.reloc - Base Relocations</div>
+</div>
+</div>
+<div style="flex:1;min-width:280px">
+<p style="text-align:center;color:var(--green);font-weight:700;margin-bottom:10px">Stardust: Pure PIC Shellcode</p>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box g" style="width:100%">.text$A - Entry + RipStart (ASM)</div>
+<div class="box g" style="width:100%">.text$B - All C++ implant code</div>
+<div class="box g" style="width:100%">.rdata - Strings (position-independent)</div>
+<div class="box g" style="width:100%">.text$C - RipData utility (ASM)</div>
+<div style="text-align:center;color:var(--green);font-size:.8rem">That's it. No headers. No tables. Just code.</div>
+</div>
+</div>
+</div>
+</div>
+
+<div class="quiz" id="quiz1">
+<h4>Pop Quiz: Why Stardust?</h4>
+<div class="quiz-q" data-correct="2">
+<p>Q1: What is the fundamental difference between a reflective loader and Stardust?</p>
+<label data-opt="0"><input type="radio" name="q1_0"> Stardust is written in C++ instead of C</label>
+<label data-opt="1"><input type="radio" name="q1_0"> Stardust supports more Windows versions</label>
+<label data-opt="2"><input type="radio" name="q1_0"> Stardust compiles directly to PIC shellcode with no PE structure in memory</label>
+<label data-opt="3"><input type="radio" name="q1_0"> Stardust uses encryption while reflective loaders don't</label>
+<div class="explain">Reflective loaders take a full DLL and manually map it into memory, leaving PE artifacts. Stardust eliminates this entirely &mdash; C++ code compiles directly into position-independent shellcode. The final binary is extracted from the .text section with no PE headers, no IAT, no relocations.</div>
+</div>
+<div class="quiz-q" data-correct="1">
+<p>Q2: Approximately how large is the Stardust x64 release binary?</p>
+<label data-opt="0"><input type="radio" name="q1_1"> ~50 KB</label>
+<label data-opt="1"><input type="radio" name="q1_1"> ~752 bytes</label>
+<label data-opt="2"><input type="radio" name="q1_1"> ~4 KB</label>
+<label data-opt="3"><input type="radio" name="q1_1"> ~15 KB</label>
+<div class="explain">The base template compiles to approximately 752 bytes on x64 and 672 bytes on x86. This tiny size is achieved through aggressive optimization flags (-Os, -nostdlib, -s) and the elimination of all standard library dependencies.</div>
+</div>
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<span></span>
+<a class="primary" href="module2.html">Next: C++ for Shellcode &rarr;</a>
+</div>
+</main>
+
+<script src="../../assets/course.js"></script>
+</body>
+</html>
