@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 3: PE Internals & Custom Sections - FunctionPeekaboo Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F441;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f97316;--accent2:#ef4444;--gradient:linear-gradient(135deg,#f97316,#ef4444)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>FunctionPeekaboo</h2>
+<span>LLVM Self-Masking Functions</span>
+</div>
+<a class="home-link" href="../FunctionPeekaboo_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. Memory Scanning &amp; Sleep</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. LLVM Compiler Architecture</span><span class="diff d1">d1</span></a>
+<a class="mod-link active" href="module3.html"><span>3. PE Internals &amp; Sections</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. Registration &amp; X86RetModPass</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Prologue &amp; Epilogue Stubs</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. The Handler &amp; XOR Engine</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Init &amp; Runtime Flow</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Detection, CET &amp; Nighthawk</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 3: PE Internals &amp; Custom Sections</h1>
+<p class="subtitle">How FunctionPeekaboo embeds metadata and initialization code into the PE file using custom sections.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Understand the PE (Portable Executable) file format at the level needed to comprehend FunctionPeekaboo&rsquo;s use of custom sections: <code>.funcmeta</code> for function metadata and <code>.stub</code> for initialization code. Learn how section alignment, permissions, and the entry point work together, and how <code>modifyEP.py</code> post-processes the binary.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. PE File Format Overview</h2>
+
+<p>Every Windows executable (.exe, .dll) follows the <strong>Portable Executable</strong> format. The key structures relevant to FunctionPeekaboo are:</p>
+
+<pre><span class="lang-tag">Text</span>PE File Layout:
++-----------------------------+
+| DOS Header (MZ)             |  &larr; Legacy header, contains e_lfanew pointer
++-----------------------------+
+| PE Signature ("PE\0\0")     |  &larr; Identifies file as PE
++-----------------------------+
+| COFF File Header            |  &larr; Machine type, number of sections, timestamp
++-----------------------------+
+| Optional Header             |  &larr; Entry point RVA, image base, section alignment
+|   - Data Directories        |  &larr; Import/export tables, relocations, etc.
++-----------------------------+
+| Section Headers             |  &larr; Array of IMAGE_SECTION_HEADER structures
+|   .text  | .rdata | .data   |
+|   .funcmeta | .stub         |  &larr; FunctionPeekaboo's custom sections
++-----------------------------+
+| Section Bodies              |  &larr; Actual code, data, metadata bytes
+|   .text body                |
+|   .rdata body               |
+|   .data body                |
+|   .funcmeta body            |  &larr; Function registration metadata
+|   .stub body                |  &larr; Initialization entry point
++-----------------------------+</pre>
+
+<!-- ============================================================ -->
+<h2>2. Critical PE Header Fields</h2>
+
+<p>Several fields in the PE Optional Header are directly relevant to how FunctionPeekaboo operates:</p>
+
+<table>
+<tr><th>Field</th><th>Location</th><th>Relevance to FunctionPeekaboo</th></tr>
+<tr><td><strong>AddressOfEntryPoint</strong></td><td>Optional Header</td><td>Modified by <code>modifyEP.py</code> to point to the <code>.stub</code> section instead of the original entry point</td></tr>
+<tr><td><strong>ImageBase</strong></td><td>Optional Header</td><td>The handler uses this to locate the PE headers in memory for section traversal</td></tr>
+<tr><td><strong>SectionAlignment</strong></td><td>Optional Header</td><td>Determines how sections are aligned in memory (typically 0x1000 = 4096 bytes)</td></tr>
+<tr><td><strong>FileAlignment</strong></td><td>Optional Header</td><td>Determines how sections are aligned on disk (typically 0x200 = 512 bytes)</td></tr>
+<tr><td><strong>SizeOfImage</strong></td><td>Optional Header</td><td>Total virtual size of the loaded PE; includes all sections</td></tr>
+<tr><td><strong>NumberOfSections</strong></td><td>COFF Header</td><td>The handler iterates section headers to find <code>.funcmeta</code></td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>3. Section Headers</h2>
+
+<p>Each section has an <code>IMAGE_SECTION_HEADER</code> that describes its name, size, location, and permissions:</p>
+
+<pre><span class="lang-tag">C</span>// IMAGE_SECTION_HEADER structure (40 bytes each)
+typedef struct {
+    BYTE  Name[8];           // Section name (".text", ".funcmeta", etc.)
+    DWORD VirtualSize;       // Size in memory
+    DWORD VirtualAddress;    // RVA (offset from ImageBase) when loaded
+    DWORD SizeOfRawData;     // Size on disk
+    DWORD PointerToRawData;  // File offset to section data
+    DWORD PointerToRelocations;
+    DWORD PointerToLinenumbers;
+    WORD  NumberOfRelocations;
+    WORD  NumberOfLinenumbers;
+    DWORD Characteristics;   // Flags: readable, writable, executable, etc.
+} IMAGE_SECTION_HEADER;</pre>
+
+<p>The <strong>Characteristics</strong> field is a bitmask of flags that control the section&rsquo;s memory permissions:</p>
+
+<table>
+<tr><th>Flag</th><th>Value</th><th>Meaning</th></tr>
+<tr><td><code>IMAGE_SCN_MEM_EXECUTE</code></td><td><code>0x20000000</code></td><td>Section contains executable code</td></tr>
+<tr><td><code>IMAGE_SCN_MEM_READ</code></td><td><code>0x40000000</code></td><td>Section is readable</td></tr>
+<tr><td><code>IMAGE_SCN_MEM_WRITE</code></td><td><code>0x80000000</code></td><td>Section is writable</td></tr>
+<tr><td><code>IMAGE_SCN_CNT_CODE</code></td><td><code>0x00000020</code></td><td>Section contains code</td></tr>
+<tr><td><code>IMAGE_SCN_CNT_INITIALIZED_DATA</code></td><td><code>0x00000040</code></td><td>Section contains initialized data</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>4. The .funcmeta Custom Section</h2>
+
+<p>FunctionPeekaboo creates a custom PE section called <code>.funcmeta</code> that stores metadata about every registered (peekaboo-attributed) function. This section is the &ldquo;registry&rdquo; that the handler consults at runtime to know which regions to encrypt/decrypt.</p>
+
+<div class="card green">
+<h4>.funcmeta Section Structure</h4>
+<p>The section contains an array of metadata entries, one per registered function:</p>
+<pre><span class="lang-tag">C</span>// Each entry in .funcmeta describes one registered function
+typedef struct {
+    DWORD FunctionRVA;     // RVA of the function start (after prologue stub)
+    DWORD FunctionSize;    // Size of the function body in bytes
+    BYTE  XorKey;          // Single-byte XOR key for this function
+    BYTE  IsEncrypted;     // Current state: 1 = encrypted, 0 = decrypted
+    WORD  Reserved;        // Alignment padding
+} FUNC_META_ENTRY;
+
+// The section is a flat array:
+// [entry_0][entry_1][entry_2]...[entry_N][null terminator]</pre>
+</div>
+
+<p>The section permissions are <code>READ | WRITE</code> (<strong>not</strong> execute). It contains data only &mdash; the handler reads from it to find function locations and writes to it to update the <code>IsEncrypted</code> flag.</p>
+
+<div class="card">
+<h4>How the Handler Finds .funcmeta</h4>
+<p>At runtime, the handler walks the PE section headers (starting from the DOS header &rarr; PE signature &rarr; section headers array) and compares each section name against the string <code>.funcmeta</code>. When found, it uses the <code>VirtualAddress</code> field to locate the section&rsquo;s data in memory. This is a standard PE parsing technique &mdash; no imports or API calls are needed.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. The .stub Custom Section</h2>
+
+<p>The <code>.stub</code> section contains the <strong>initialization entry point</strong> for FunctionPeekaboo. The PE&rsquo;s <code>AddressOfEntryPoint</code> is modified (by <code>modifyEP.py</code>) to point here instead of the original entry point.</p>
+
+<div class="card">
+<h4>.stub Execution Flow</h4>
+<ol>
+<li>Windows loader calls <code>AddressOfEntryPoint</code>, which now points to <code>.stub</code></li>
+<li>The stub initialization code runs: sets up TEB fields, XOR-encrypts all registered function bodies for the first time</li>
+<li>After initialization, the stub jumps to the <strong>original entry point</strong> (which was saved during post-processing)</li>
+<li>The program starts normally &mdash; but now every registered function is encrypted at rest</li>
+</ol>
+</div>
+
+<p>The <code>.stub</code> section has <code>READ | EXECUTE</code> permissions (it contains code). It is small &mdash; typically a few hundred bytes &mdash; containing just the initialization logic and a jump to the original entry point.</p>
+
+<pre><span class="lang-tag">x86 Assembly</span>; Simplified .stub pseudocode
+_stub_entry:
+    ; Save all registers (we're hijacking the entry point)
+    pushfq
+    push rax
+    push rcx
+    push rdx
+    ; ... save all volatile registers ...
+
+    ; Initialize TEB UserReserved fields
+    mov qword ptr gs:[0x1488], 0    ; UserReserved[0] = NULL (no active function)
+    mov qword ptr gs:[0x1490], 0    ; UserReserved[1] = flags
+
+    ; Walk .funcmeta and XOR-encrypt each function body
+    call _initial_encrypt_all
+
+    ; Restore all registers
+    ; ... pop all registers ...
+    popfq
+
+    ; Jump to original entry point
+    jmp original_entry_point</pre>
+
+<!-- ============================================================ -->
+<h2>6. Section Alignment and Virtual Addresses</h2>
+
+<p>When the Windows PE loader maps a binary into memory, sections are aligned to <code>SectionAlignment</code> boundaries (typically 4096 bytes / one page). This means:</p>
+
+<div class="card warn">
+<h4>Alignment Matters for VirtualProtect</h4>
+<p>The handler uses <code>VirtualProtect</code> to change memory permissions (RX &rarr; RW for decryption, RW &rarr; RX after). <code>VirtualProtect</code> operates on <strong>page boundaries</strong> (4096-byte aligned). If a function spans a page boundary, the handler must protect multiple pages. If two registered functions share the same page, protecting one affects the other &mdash; the handler must account for this to avoid corrupting a function that&rsquo;s currently executing.</p>
+</div>
+
+<p>The relationship between RVAs and virtual addresses:</p>
+
+<pre><span class="lang-tag">C</span>// Converting between RVA and Virtual Address
+// RVA = Relative Virtual Address (offset from image base)
+// VA  = Virtual Address (actual memory address)
+
+VA = ImageBase + RVA
+
+// Example:
+// ImageBase    = 0x00400000  (loaded PE base)
+// Function RVA = 0x00001234  (from .funcmeta entry)
+// Function VA  = 0x00401234  (actual address in memory)</pre>
+
+<!-- ============================================================ -->
+<h2>7. The modifyEP.py Post-Processor</h2>
+
+<p>After compilation, the binary has the standard CRT entry point (e.g., <code>mainCRTStartup</code>). FunctionPeekaboo needs to intercept execution <em>before</em> the CRT runs, so it uses a Python script to modify the PE:</p>
+
+<div class="card">
+<h4>What modifyEP.py Does</h4>
+<ol>
+<li><strong>Reads the current entry point</strong> from the PE Optional Header&rsquo;s <code>AddressOfEntryPoint</code></li>
+<li><strong>Finds the .stub section</strong> by walking section headers</li>
+<li><strong>Patches the original entry point address</strong> into the .stub&rsquo;s jump target (so .stub can redirect to it after initialization)</li>
+<li><strong>Overwrites <code>AddressOfEntryPoint</code></strong> with the RVA of the .stub section</li>
+<li><strong>Recalculates PE checksums</strong> if needed</li>
+</ol>
+</div>
+
+<pre><span class="lang-tag">Python</span># Simplified modifyEP.py logic
+import pefile
+
+def modify_entry_point(pe_path):
+    pe = pefile.PE(pe_path)
+
+    # Save original entry point
+    original_ep = pe.OPTIONAL_HEADER.AddressOfEntryPoint
+
+    # Find .stub section
+    stub_section = None
+    for section in pe.sections:
+        if section.Name.rstrip(b'\x00') == b'.stub':
+            stub_section = section
+            break
+
+    # Write original EP into .stub's reserved field
+    stub_va = stub_section.VirtualAddress
+    # The .stub code has a placeholder for the original EP
+    pe.set_dword_at_rva(stub_va + ORIGINAL_EP_OFFSET, original_ep)
+
+    # Set new entry point to .stub
+    pe.OPTIONAL_HEADER.AddressOfEntryPoint = stub_va
+
+    pe.write(pe_path)
+    pe.close()</pre>
+
+<div class="card warn">
+<h4>Order of Operations</h4>
+<p>The build pipeline must be: (1) compile with the modified Clang, (2) link normally, (3) run <code>modifyEP.py</code>. If you skip step 3, the binary will start at the normal entry point and no functions will be encrypted &mdash; the <code>.stub</code> and <code>.funcmeta</code> sections will exist but be unused.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Inspecting Custom Sections</h2>
+
+<p>You can verify FunctionPeekaboo&rsquo;s sections using standard PE analysis tools:</p>
+
+<pre><span class="lang-tag">Bash</span># Using dumpbin (Visual Studio)
+dumpbin /headers implant.exe
+
+# Look for:
+# SECTION HEADER #5
+#    .funcmeta name
+#    ...
+#    40000040 flags
+#            Initialized Data
+#            Read Write
+#
+# SECTION HEADER #6
+#    .stub name
+#    ...
+#    60000020 flags
+#            Code
+#            Execute Read
+
+# Using Python pefile
+python3 -c "
+import pefile
+pe = pefile.PE('implant.exe')
+for s in pe.sections:
+    print(f'{s.Name.decode().rstrip(chr(0)):10} VA=0x{s.VirtualAddress:08x} Size=0x{s.Misc_VirtualSize:08x} Chars=0x{s.Characteristics:08x}')
+print(f'Entry Point: 0x{pe.OPTIONAL_HEADER.AddressOfEntryPoint:08x}')
+"</pre>
+
+<!-- ============================================================ -->
+<h2>9. Section Security Implications</h2>
+
+<table>
+<tr><th>Section</th><th>Permissions</th><th>Detection Risk</th></tr>
+<tr><td><code>.text</code></td><td>Read + Execute</td><td>Normal &mdash; every executable has this</td></tr>
+<tr><td><code>.funcmeta</code></td><td>Read + Write</td><td>Unusual section name; EDR could flag binaries with non-standard sections</td></tr>
+<tr><td><code>.stub</code></td><td>Read + Execute</td><td>Unusual name; entry point not in <code>.text</code> is a potential red flag</td></tr>
+</table>
+
+<div class="card">
+<h4>Mitigation: Section Name Randomization</h4>
+<p>A production deployment might rename <code>.funcmeta</code> and <code>.stub</code> to less suspicious names (e.g., <code>.rsrc2</code>, <code>.tls2</code>) or merge them into existing sections. The FunctionPeekaboo PoC uses descriptive names for clarity, but the concept does not depend on specific section names &mdash; the handler can search by section characteristics rather than names.</p>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz">
+<h2>Knowledge Check</h2>
+
+<div class="quiz-q" data-answer="B">
+<p>Q1: What does the .funcmeta section contain?</p>
+<div class="quiz-btn" data-choice="A">A) The handler's executable code</div>
+<div class="quiz-btn" data-choice="B">B) Metadata entries describing each registered function (RVA, size, XOR key, state)</div>
+<div class="quiz-btn" data-choice="C">C) The original unmodified entry point code</div>
+<div class="quiz-btn" data-choice="D">D) Encrypted copies of all function bodies</div>
+</div>
+
+<div class="quiz-q" data-answer="A">
+<p>Q2: What is the purpose of modifyEP.py?</p>
+<div class="quiz-btn" data-choice="A">A) It changes the PE entry point to the .stub section so initialization runs before the program starts</div>
+<div class="quiz-btn" data-choice="B">B) It encrypts the entire binary for distribution</div>
+<div class="quiz-btn" data-choice="C">C) It removes debug symbols from the PE</div>
+<div class="quiz-btn" data-choice="D">D) It signs the binary with a code signing certificate</div>
+</div>
+
+<div class="quiz-q" data-answer="C">
+<p>Q3: Why does VirtualProtect alignment matter for per-function masking?</p>
+<div class="quiz-btn" data-choice="A">A) Functions must be exactly 4096 bytes</div>
+<div class="quiz-btn" data-choice="B">B) Alignment determines the XOR key length</div>
+<div class="quiz-btn" data-choice="C">C) VirtualProtect operates on page boundaries, so functions sharing a page can affect each other</div>
+<div class="quiz-btn" data-choice="D">D) Alignment is only needed for 32-bit binaries</div>
+</div>
+</div>
+
+<div class="nav-btns">
+<a href="module2.html">&larr; Previous: LLVM Architecture</a>
+<a class="primary" href="module4.html">Next: Registration &amp; X86RetModPass &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

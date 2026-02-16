@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 6: The Handler & XOR Engine - FunctionPeekaboo Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F441;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f97316;--accent2:#ef4444;--gradient:linear-gradient(135deg,#f97316,#ef4444)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>FunctionPeekaboo</h2>
+<span>LLVM Self-Masking Functions</span>
+</div>
+<a class="home-link" href="../FunctionPeekaboo_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. Memory Scanning &amp; Sleep</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. LLVM Compiler Architecture</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. PE Internals &amp; Sections</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. Registration &amp; X86RetModPass</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Prologue &amp; Epilogue Stubs</span><span class="diff d2">d2</span></a>
+<a class="mod-link active" href="module6.html"><span>6. The Handler &amp; XOR Engine</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Init &amp; Runtime Flow</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Detection, CET &amp; Nighthawk</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 6: The Handler &amp; XOR Engine</h1>
+<p class="subtitle">The ~380-byte core routine that performs memory permission changes, PE header parsing, and byte-level XOR encryption/decryption.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Deep dive into the handler &mdash; the shared routine called by every prologue and epilogue stub. Understand its PE header validation logic, <code>.funcmeta</code> section traversal, <code>VirtualProtect</code> permission transitions (RX &rarr; RW &rarr; RX), byte-level XOR implementation, and the TEB UserReserved field usage for per-thread state management via the GS segment register.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. Handler Overview</h2>
+
+<p>The handler is a single shared routine (~380 bytes) called by every prologue and epilogue stub. It receives two arguments:</p>
+
+<table>
+<tr><th>Parameter</th><th>Register</th><th>Description</th></tr>
+<tr><td><strong>Function Pointer</strong></td><td>RCX</td><td>Pointer to the function body that needs to be encrypted or decrypted</td></tr>
+<tr><td><strong>Operation Flag</strong></td><td>RDX</td><td>0 = decrypt (called from prologue), 1 = encrypt (called from epilogue)</td></tr>
+</table>
+
+<p>The handler&rsquo;s job is to:</p>
+
+<div class="card">
+<h4>Handler Steps</h4>
+<ol>
+<li>Find the PE image base by walking backward from the handler&rsquo;s own address to find the MZ header</li>
+<li>Parse PE headers to locate the <code>.funcmeta</code> section</li>
+<li>Search <code>.funcmeta</code> entries to find the metadata for the target function (matching by RVA)</li>
+<li>Check the <code>IsEncrypted</code> flag to determine if the requested operation is valid</li>
+<li>Call <code>VirtualProtect</code> to change the function&rsquo;s memory to RW (writable)</li>
+<li>XOR the function body bytes with the stored key</li>
+<li>Call <code>VirtualProtect</code> to restore RX (executable) permissions</li>
+<li>Update the <code>IsEncrypted</code> flag in <code>.funcmeta</code></li>
+<li>Update TEB UserReserved fields to track the currently active function</li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Finding the Image Base</h2>
+
+<p>The handler needs to find the PE image base to locate the section headers. Since ASLR randomizes the load address, the handler uses a backward-scanning technique:</p>
+
+<pre><span class="lang-tag">x86-64 Assembly</span>; Find image base by scanning backward from current address
+; PE images are aligned to 64KB boundaries (0x10000)
+find_image_base:
+    ; Start from the handler's own address (known from CALL/POP)
+    mov     rax, handler_address
+    and     rax, 0xFFFFFFFFFFFF0000  ; Align down to 64KB boundary
+
+.scan_loop:
+    ; Check for MZ signature at this address
+    cmp     word ptr [rax], 0x5A4D   ; "MZ" in little-endian
+    je      .found_mz
+    sub     rax, 0x10000             ; Move back 64KB
+    jmp     .scan_loop
+
+.found_mz:
+    ; RAX = image base
+    ; Validate: check PE signature
+    mov     ecx, dword ptr [rax + 0x3C]   ; e_lfanew (offset to PE header)
+    cmp     dword ptr [rax + rcx], 0x4550  ; "PE\0\0"
+    jne     .scan_loop                     ; Not a valid PE, keep scanning
+    ; Valid PE found - RAX = ImageBase</pre>
+
+<div class="card warn">
+<h4>Why Not Use GetModuleHandle?</h4>
+<p>Calling <code>GetModuleHandle(NULL)</code> would be simpler, but it requires importing the function from kernel32.dll. The handler is designed to be <strong>import-free</strong> where possible, reducing the API footprint visible to EDR. The backward MZ scan is a well-known technique used in shellcode and reflective loaders &mdash; it works because the Windows PE loader maps executables at 64KB-aligned boundaries.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. PE Header Traversal</h2>
+
+<p>Once the image base is found, the handler parses the PE headers to locate the <code>.funcmeta</code> section:</p>
+
+<pre><span class="lang-tag">x86-64 Assembly</span>; Navigate PE headers to find .funcmeta section
+; RAX = ImageBase (from step 2)
+parse_pe:
+    mov     ecx, [rax + 0x3C]        ; e_lfanew
+    lea     rdx, [rax + rcx]          ; RDX = PE signature address
+    ; PE signature at [RDX+0]  = "PE\0\0"
+    ; COFF header at  [RDX+4]  (20 bytes)
+    ; Optional hdr at [RDX+24] (variable size)
+
+    ; Get number of sections
+    movzx   ecx, word ptr [rdx + 6]   ; NumberOfSections
+
+    ; Get size of optional header
+    movzx   r8d, word ptr [rdx + 20]  ; SizeOfOptionalHeader
+
+    ; First section header starts after optional header
+    lea     r9, [rdx + 24 + r8]       ; R9 = first IMAGE_SECTION_HEADER
+
+    ; Iterate section headers (40 bytes each)
+.section_loop:
+    ; Compare section name with ".funcmeta"
+    ; Section name is 8 bytes at [R9+0]
+    cmp     dword ptr [r9], 0x6E75662E    ; ".fun" in little-endian
+    jne     .next_section
+    cmp     dword ptr [r9 + 4], 0x74656D63 ; "cmet" in little-endian
+    je      .found_funcmeta
+
+.next_section:
+    add     r9, 40                    ; sizeof(IMAGE_SECTION_HEADER)
+    dec     ecx
+    jnz     .section_loop
+    ret                               ; .funcmeta not found (shouldn't happen)
+
+.found_funcmeta:
+    ; R9 = pointer to .funcmeta section header
+    mov     ecx, [r9 + 12]           ; VirtualAddress (RVA)
+    lea     rsi, [rax + rcx]          ; RSI = .funcmeta data in memory</pre>
+
+<!-- ============================================================ -->
+<h2>4. .funcmeta Entry Lookup</h2>
+
+<p>The <code>.funcmeta</code> section is a flat array of entries. The handler searches for the entry matching the target function (whose address was passed in RCX by the stub):</p>
+
+<pre><span class="lang-tag">x86-64 Assembly</span>; Search .funcmeta for the target function
+; RSI = .funcmeta data pointer
+; RCX = target function body address (from stub)
+; RAX = ImageBase
+search_funcmeta:
+    ; Convert target address to RVA
+    sub     rcx, rax                  ; RCX = function RVA
+
+.entry_loop:
+    ; Each entry: [4B RVA][4B Size][1B Key][1B IsEncrypted][2B Pad]
+    mov     edi, [rsi]                ; Entry's FunctionRVA
+    test    edi, edi                  ; NULL terminator?
+    jz      .not_found                ; Shouldn't happen for valid calls
+
+    cmp     edi, ecx                  ; Compare with target RVA
+    je      .found_entry
+
+    add     rsi, 12                   ; Next entry (12 bytes per entry)
+    jmp     .entry_loop
+
+.found_entry:
+    ; RSI points to the matching entry
+    ; [RSI+0]  = FunctionRVA (DWORD)
+    ; [RSI+4]  = FunctionSize (DWORD)
+    ; [RSI+8]  = XorKey (BYTE)
+    ; [RSI+9]  = IsEncrypted (BYTE)
+    ; [RSI+10] = Reserved (WORD)</pre>
+
+<!-- ============================================================ -->
+<h2>5. VirtualProtect Permission Changes</h2>
+
+<p>Before XOR-ing the function body, the handler must change memory permissions. The function&rsquo;s <code>.text</code> section is normally <code>PAGE_EXECUTE_READ</code> (RX), which prevents writing. The handler toggles to <code>PAGE_READWRITE</code> (RW) for the XOR operation, then back to <code>PAGE_EXECUTE_READ</code> after:</p>
+
+<pre><span class="lang-tag">C (Pseudocode)</span>// Permission change sequence in the handler
+void handler(void* func_body, int operation) {
+    FUNC_META_ENTRY* entry = find_entry(func_body);
+    DWORD oldProtect;
+
+    // Step 1: Change to RW (writable, non-executable)
+    VirtualProtect(
+        func_body,
+        entry->FunctionSize,
+        PAGE_READWRITE,         // 0x04
+        &oldProtect             // Saves previous protection (PAGE_EXECUTE_READ)
+    );
+
+    // Step 2: XOR the function body
+    xor_memory(func_body, entry->FunctionSize, entry->XorKey);
+
+    // Step 3: Restore to RX (executable, non-writable)
+    VirtualProtect(
+        func_body,
+        entry->FunctionSize,
+        PAGE_EXECUTE_READ,      // 0x20
+        &oldProtect
+    );
+
+    // Step 4: Update state
+    entry->IsEncrypted = !entry->IsEncrypted;
+}</pre>
+
+<div class="card warn">
+<h4>VirtualProtect is the Main Detection Surface</h4>
+<p><code>VirtualProtect</code> is a well-monitored API. EDR products hook it to detect memory permission changes (a classic indicator of shellcode injection and sleep obfuscation). The per-function granularity of FunctionPeekaboo means many small <code>VirtualProtect</code> calls rather than one large one, which could be either harder or easier to detect depending on the EDR&rsquo;s heuristics. An advanced implementation might use <code>NtProtectVirtualMemory</code> syscalls directly to bypass user-mode hooks.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. The XOR Engine</h2>
+
+<p>The actual encryption/decryption is a simple byte-level XOR loop. Since XOR is its own inverse, the same operation encrypts and decrypts:</p>
+
+<pre><span class="lang-tag">x86-64 Assembly</span>; XOR engine - encrypt or decrypt function body
+; RDI = pointer to function body
+; ECX = function body size (bytes)
+; AL  = XOR key
+xor_engine:
+    test    ecx, ecx
+    jz      .xor_done
+
+.xor_loop:
+    xor     byte ptr [rdi], al    ; XOR single byte
+    inc     rdi                    ; Next byte
+    dec     ecx                    ; Decrement counter
+    jnz     .xor_loop
+
+.xor_done:
+    ret</pre>
+
+<p>This is intentionally simple. The loop processes one byte at a time, which is not the fastest possible implementation but is the smallest and most reliable. Optimization options include:</p>
+
+<table>
+<tr><th>Optimization</th><th>Approach</th><th>Trade-off</th></tr>
+<tr><td><strong>8-byte blocks</strong></td><td>Broadcast XOR key to 8 bytes, XOR QWORD at a time</td><td>8x faster, slightly more code, alignment handling needed</td></tr>
+<tr><td><strong>SSE/AVX</strong></td><td>Use <code>PXOR</code> with 16/32/64-byte vectors</td><td>16-64x faster, much more code, register save overhead</td></tr>
+<tr><td><strong>REP STOSB variant</strong></td><td>Use string operations with XOR</td><td>Simple but no direct REP XOR instruction exists</td></tr>
+</table>
+
+<div class="card green">
+<h4>Why Byte-by-Byte?</h4>
+<p>Function bodies vary in size and are not guaranteed to be aligned to any particular boundary. A byte-by-byte loop handles all sizes correctly without alignment checks. For typical function sizes (hundreds to low thousands of bytes), the performance difference between byte-by-byte and QWORD XOR is microseconds &mdash; negligible compared to the <code>VirtualProtect</code> syscall overhead.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. TEB UserReserved Fields</h2>
+
+<p>The Thread Environment Block (TEB) contains three <code>UserReserved</code> PVOID fields at offsets <code>0x1478</code>, <code>0x1480</code>, and <code>0x1488</code> (on x86-64 Windows). These fields are reserved for application use &mdash; Windows does not use them, making them ideal for per-thread state storage:</p>
+
+<pre><span class="lang-tag">x86-64 Assembly</span>; Access TEB via GS segment register (x86-64 Windows)
+; GS:[0x30] = pointer to TEB itself (self-reference)
+; GS:[0x1478] = UserReserved[0]
+; GS:[0x1480] = UserReserved[1]
+; GS:[0x1488] = UserReserved[2]
+
+; FunctionPeekaboo uses these for per-thread tracking:
+; UserReserved[0] = pointer to currently active (decrypted) function body
+; UserReserved[1] = operation flags / recursion counter
+
+; In the handler - update active function tracking:
+update_teb:
+    ; On decrypt (prologue): store function pointer
+    mov     qword ptr gs:[0x1478], rcx    ; Store active function ptr
+
+    ; On encrypt (epilogue): clear active function pointer
+    mov     qword ptr gs:[0x1478], 0      ; No function currently active</pre>
+
+<div class="card">
+<h4>Why TEB and Not a Global Variable?</h4>
+<p>A global variable would work for single-threaded implants, but most C2 implants are multithreaded (handling multiple tasks concurrently). The TEB is <strong>per-thread</strong>, so each thread can independently track which function it is currently executing. This prevents thread A&rsquo;s function state from interfering with thread B&rsquo;s function state.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. GS Segment Register on Windows x64</h2>
+
+<p>On x86-64 Windows, the GS segment register points to the TEB for the current thread. The processor swaps GS on context switches, so <code>GS:[offset]</code> always refers to the current thread&rsquo;s TEB:</p>
+
+<table>
+<tr><th>GS Offset</th><th>TEB Field</th><th>Purpose</th></tr>
+<tr><td><code>GS:[0x00]</code></td><td>ExceptionList</td><td>SEH chain</td></tr>
+<tr><td><code>GS:[0x08]</code></td><td>StackBase</td><td>Stack top</td></tr>
+<tr><td><code>GS:[0x10]</code></td><td>StackLimit</td><td>Stack bottom</td></tr>
+<tr><td><code>GS:[0x30]</code></td><td>Self</td><td>TEB self-pointer</td></tr>
+<tr><td><code>GS:[0x48]</code></td><td>ProcessId</td><td>PID</td></tr>
+<tr><td><code>GS:[0x50]</code></td><td>ThreadId</td><td>TID</td></tr>
+<tr><td><code>GS:[0x60]</code></td><td>ProcessEnvironmentBlock</td><td>PEB pointer</td></tr>
+<tr><td><code>GS:[0x1478]</code></td><td>UserReserved[0]</td><td>FunctionPeekaboo: active function ptr</td></tr>
+<tr><td><code>GS:[0x1480]</code></td><td>UserReserved[1]</td><td>FunctionPeekaboo: flags</td></tr>
+<tr><td><code>GS:[0x1488]</code></td><td>UserReserved[2]</td><td>FunctionPeekaboo: reserved</td></tr>
+</table>
+
+<div class="card warn">
+<h4>GS vs FS</h4>
+<p>On x86-64 Windows, GS points to the TEB. On x86-32, it was FS. This is a common source of confusion. FunctionPeekaboo targets x86-64 and uses GS exclusively. On Linux, the segment register usage is reversed (FS for TLS on x86-64), but FunctionPeekaboo is Windows-specific.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Complete Handler Pseudocode</h2>
+
+<pre><span class="lang-tag">C (Pseudocode)</span>// Complete handler logic (~380 bytes compiled)
+void __fastcall handler(void* func_body_ptr, uint64_t operation) {
+    // 1. Find image base (backward MZ scan)
+    uintptr_t base = find_image_base();
+
+    // 2. Parse PE headers to find .funcmeta
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+
+    FUNC_META_ENTRY* meta = NULL;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (memcmp(sections[i].Name, ".funcmeta", 8) == 0) {
+            meta = (FUNC_META_ENTRY*)(base + sections[i].VirtualAddress);
+            break;
+        }
+    }
+
+    // 3. Find matching entry
+    uintptr_t func_rva = (uintptr_t)func_body_ptr - base;
+    while (meta->FunctionRVA != 0) {
+        if (meta->FunctionRVA == func_rva)
+            break;
+        meta++;
+    }
+
+    // 4. Validate operation
+    if (operation == 0 && !meta->IsEncrypted)
+        return;  // Already decrypted, skip
+    if (operation == 1 && meta->IsEncrypted)
+        return;  // Already encrypted, skip
+
+    // 5. Change permissions to RW
+    DWORD old;
+    VirtualProtect(func_body_ptr, meta->FunctionSize, PAGE_READWRITE, &old);
+
+    // 6. XOR the function body
+    uint8_t* bytes = (uint8_t*)func_body_ptr;
+    for (DWORD i = 0; i < meta->FunctionSize; i++) {
+        bytes[i] ^= meta->XorKey;
+    }
+
+    // 7. Restore permissions to RX
+    VirtualProtect(func_body_ptr, meta->FunctionSize, PAGE_EXECUTE_READ, &old);
+
+    // 8. Update metadata
+    meta->IsEncrypted = !meta->IsEncrypted;
+
+    // 9. Update TEB tracking
+    if (operation == 0) {  // decrypt
+        __writegsqword(0x1478, (uint64_t)func_body_ptr);
+    } else {               // encrypt
+        __writegsqword(0x1478, 0);
+    }
+}</pre>
+
+<!-- ============================================================ -->
+<h2>10. Handler as Position-Independent Code</h2>
+
+<p>The handler itself must be position-independent. It cannot contain absolute addresses or rely on the import table (since it runs before the CRT initializes imports in some configurations). The only external dependency is <code>VirtualProtect</code> from kernel32.dll, which can be resolved via:</p>
+
+<div class="card">
+<h4>VirtualProtect Resolution Options</h4>
+<ul>
+<li><strong>PEB walking</strong>: Traverse PEB &rarr; Ldr &rarr; InMemoryOrderModuleList to find kernel32.dll, then parse its export table for VirtualProtect</li>
+<li><strong>IAT reuse</strong>: If the main binary already imports VirtualProtect, use the IAT entry (already resolved by the loader)</li>
+<li><strong>Hardcoded syscall</strong>: Call <code>NtProtectVirtualMemory</code> with the system call number directly, bypassing kernel32/ntdll entirely</li>
+</ul>
+<p>The PoC uses the IAT approach for simplicity. A production implementation (like Nighthawk) would likely use direct syscalls.</p>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz">
+<h2>Knowledge Check</h2>
+
+<div class="quiz-q" data-answer="C">
+<p>Q1: How does the handler find the PE image base at runtime?</p>
+<div class="quiz-btn" data-choice="A">A) It reads the ImageBase field from a global variable</div>
+<div class="quiz-btn" data-choice="B">B) It calls GetModuleHandle(NULL)</div>
+<div class="quiz-btn" data-choice="C">C) It scans backward from its own address on 64KB boundaries looking for the MZ signature</div>
+<div class="quiz-btn" data-choice="D">D) The linker stores it in the .stub section</div>
+</div>
+
+<div class="quiz-q" data-answer="A">
+<p>Q2: Why does FunctionPeekaboo use TEB UserReserved fields instead of global variables?</p>
+<div class="quiz-btn" data-choice="A">A) TEB is per-thread, allowing multithreaded implants to track each thread's active function independently</div>
+<div class="quiz-btn" data-choice="B">B) Global variables are not supported on Windows</div>
+<div class="quiz-btn" data-choice="C">C) TEB fields are encrypted by the OS for security</div>
+<div class="quiz-btn" data-choice="D">D) Global variables would be too slow to access</div>
+</div>
+
+<div class="quiz-q" data-answer="B">
+<p>Q3: What is the primary detection surface of the handler?</p>
+<div class="quiz-btn" data-choice="A">A) The XOR operation itself</div>
+<div class="quiz-btn" data-choice="B">B) VirtualProtect calls to change memory permissions (RX &rarr; RW &rarr; RX)</div>
+<div class="quiz-btn" data-choice="C">C) The TEB field writes</div>
+<div class="quiz-btn" data-choice="D">D) The PE header parsing</div>
+</div>
+</div>
+
+<div class="nav-btns">
+<a href="module5.html">&larr; Previous: Prologue &amp; Epilogue Stubs</a>
+<a class="primary" href="module7.html">Next: Init &amp; Runtime Flow &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

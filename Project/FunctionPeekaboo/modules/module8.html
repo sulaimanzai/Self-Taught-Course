@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 8: Detection, CET & Nighthawk - FunctionPeekaboo Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F441;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f97316;--accent2:#ef4444;--gradient:linear-gradient(135deg,#f97316,#ef4444)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>FunctionPeekaboo</h2>
+<span>LLVM Self-Masking Functions</span>
+</div>
+<a class="home-link" href="../FunctionPeekaboo_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. Memory Scanning &amp; Sleep</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. LLVM Compiler Architecture</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. PE Internals &amp; Sections</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. Registration &amp; X86RetModPass</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Prologue &amp; Epilogue Stubs</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. The Handler &amp; XOR Engine</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Init &amp; Runtime Flow</span><span class="diff d3">d3</span></a>
+<a class="mod-link active" href="module8.html"><span>8. Detection, CET &amp; Nighthawk</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 8: Detection, CET &amp; Nighthawk</h1>
+<p class="subtitle">Real-world deployment, hardware security compatibility, detection strategies, and the Nighthawk &ldquo;Evanesco&rdquo; production implementation.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Understand how FunctionPeekaboo relates to Intel CET (Control-flow Enforcement Technology) and Shadow Stacks, why it is compatible while Ekko/Zilean are not, how MDSec&rsquo;s Nighthawk C2 implements this technique in production as &ldquo;Evanesco,&rdquo; and what detection strategies defenders can employ against per-function self-masking.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. Intel CET and Shadow Stacks</h2>
+
+<p>Intel <strong>Control-flow Enforcement Technology (CET)</strong> is a hardware-based security feature in recent Intel processors (11th gen+ Alder Lake and later) that prevents Return-Oriented Programming (ROP) and Jump-Oriented Programming (JOP) attacks. It has two components:</p>
+
+<table>
+<tr><th>CET Component</th><th>What It Does</th><th>Mechanism</th></tr>
+<tr><td><strong>Shadow Stack</strong></td><td>Maintains a hardware-protected copy of return addresses</td><td>On <code>CALL</code>, return address is pushed to both the normal stack and the shadow stack. On <code>RET</code>, both are compared. If they differ &rarr; <code>#CP</code> (Control Protection) exception</td></tr>
+<tr><td><strong>Indirect Branch Tracking (IBT)</strong></td><td>Ensures indirect branches (JMP/CALL through registers or memory) land on valid targets</td><td>Indirect branches must land on an <code>ENDBR64</code> instruction. If not &rarr; <code>#CP</code> exception</td></tr>
+</table>
+
+<p>CET is increasingly enabled by default in Windows 11 and recent builds of Windows Server. Any evasion technique that manipulates return addresses or uses ROP-like chains will fail on CET-enabled systems.</p>
+
+<!-- ============================================================ -->
+<h2>2. Why Ekko/Zilean/FOLIAGE Break Under CET</h2>
+
+<p>Traditional sleep obfuscation techniques fundamentally conflict with CET&rsquo;s Shadow Stack:</p>
+
+<div class="card warn">
+<h4>The ROP Problem</h4>
+<p>Ekko, Zilean, and FOLIAGE use callback-based execution chains (timer callbacks, APC queuing, <code>NtContinue</code> context manipulation) that effectively construct <strong>ROP chains</strong> &mdash; sequences of return addresses that redirect execution through system functions. The Shadow Stack detects that these return addresses were never pushed by a legitimate <code>CALL</code> instruction and raises a <code>#CP</code> exception, killing the process.</p>
+</div>
+
+<table>
+<tr><th>Technique</th><th>How It Chains Execution</th><th>CET Compatible?</th></tr>
+<tr><td><strong>Ekko</strong></td><td>Timer callbacks with crafted context records; uses <code>NtContinue</code> to set RSP to a gadget chain</td><td>No &mdash; Shadow Stack mismatch on <code>RET</code> from manipulated stack</td></tr>
+<tr><td><strong>Zilean</strong></td><td>APC queue with context manipulation</td><td>No &mdash; same issue with return address validation</td></tr>
+<tr><td><strong>FOLIAGE</strong></td><td>APC + <code>NtContinue</code> with RSP pivoting</td><td>No &mdash; RSP pivot causes Shadow Stack desync</td></tr>
+<tr><td><strong>FunctionPeekaboo</strong></td><td>Normal <code>CALL</code>/<code>RET</code> flow through prologue/epilogue stubs</td><td><strong>Yes</strong> &mdash; all calls and returns are legitimate</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>3. FunctionPeekaboo&rsquo;s CET Compatibility</h2>
+
+<p>FunctionPeekaboo is fully compatible with CET because it uses <strong>legitimate control flow</strong>:</p>
+
+<div class="card green">
+<h4>Why It Works Under CET</h4>
+<ul>
+<li><strong>Normal CALL/RET</strong>: The prologue stub calls the handler via a <code>CALL</code> instruction, which pushes the return address to both stacks. The handler returns via <code>RET</code>, which validates against the Shadow Stack. Both match.</li>
+<li><strong>No stack pivoting</strong>: FunctionPeekaboo never changes RSP to point to a fabricated stack. The stack grows and shrinks naturally through push/pop and CALL/RET.</li>
+<li><strong>No ROP chains</strong>: There are no gadget chains. The handler is a single contiguous function called normally.</li>
+<li><strong>ENDBR64 at targets</strong>: The LLVM compiler automatically inserts <code>ENDBR64</code> instructions at indirect branch targets when CET-IBT is enabled. FunctionPeekaboo&rsquo;s stubs are direct calls, so IBT is not affected.</li>
+<li><strong>Transparent to the CPU</strong>: From the processor&rsquo;s perspective, the CALL/RET flow is perfectly normal. The fact that the called code (handler) changes memory permissions and XOR&rsquo;s bytes is invisible to CET.</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Nighthawk C2 and &ldquo;Evanesco&rdquo;</h2>
+
+<p>MDSec&rsquo;s <strong>Nighthawk</strong> is a commercial C2 framework designed for red team operations. Version 0.3.3 introduced &ldquo;<strong>Evanesco</strong>&rdquo; &mdash; a production implementation of FunctionPeekaboo&rsquo;s per-function self-masking concept.</p>
+
+<div class="card">
+<h4>Nighthawk Evanesco Features</h4>
+<table>
+<tr><th>Feature</th><th>PoC (FunctionPeekaboo)</th><th>Production (Nighthawk Evanesco)</th></tr>
+<tr><td><strong>Masking scope</strong></td><td>Functions with <code>peekaboo</code> attribute</td><td>All implant functions automatically</td></tr>
+<tr><td><strong>Thread safety</strong></td><td>Basic (single-byte IsEncrypted flag)</td><td>Reference counting, mutex protection for shared functions</td></tr>
+<tr><td><strong>Exception handling</strong></td><td>Not addressed in PoC</td><td>Custom unwind handlers ensure re-encryption on exceptions</td></tr>
+<tr><td><strong>VirtualProtect avoidance</strong></td><td>Uses kernel32 import</td><td>Direct syscalls (<code>NtProtectVirtualMemory</code>) to bypass hooks</td></tr>
+<tr><td><strong>Section names</strong></td><td><code>.funcmeta</code>, <code>.stub</code> (descriptive)</td><td>Randomized or merged into existing sections</td></tr>
+<tr><td><strong>Key strength</strong></td><td>Single-byte XOR</td><td>Potentially stronger masking (multi-byte or rolling XOR)</td></tr>
+<tr><td><strong>Performance</strong></td><td>Proof of concept</td><td>Optimized XOR engine, minimal syscall overhead</td></tr>
+<tr><td><strong>Sleep integration</strong></td><td>Separate (manual combination)</td><td>Integrated with Nighthawk&rsquo;s sleep obfuscation</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h4>The &ldquo;Evanesco&rdquo; Name</h4>
+<p>Named after the vanishing spell in the Harry Potter series, Evanesco makes implant code &ldquo;vanish&rdquo; from memory scanners. Each function only appears when actively called &mdash; the rest of the time, it&rsquo;s XOR&rsquo;d garbage that matches no known signatures.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Detection Strategies for Defenders</h2>
+
+<p>Understanding FunctionPeekaboo from a defensive perspective is essential for blue team operations. Several detection approaches can identify per-function self-masking:</p>
+
+<h3>5.1 VirtualProtect Monitoring</h3>
+
+<div class="card">
+<h4>Behavioral Pattern</h4>
+<p>FunctionPeekaboo generates a characteristic pattern of <code>VirtualProtect</code> calls: rapid RX &rarr; RW &rarr; RX transitions on small memory regions within the <code>.text</code> section. This pattern is unusual for legitimate software &mdash; most programs never change the permissions of their own code sections after loading.</p>
+<pre><span class="lang-tag">Detection Rule (Pseudocode)</span>rule FunctionPeekaboo_VProtect:
+  trigger: NtProtectVirtualMemory
+  conditions:
+    - target address is within a PE .text section
+    - protection changed from PAGE_EXECUTE_READ to PAGE_READWRITE
+    - followed within 1ms by PAGE_READWRITE to PAGE_EXECUTE_READ
+    - same small region (&lt; 0x2000 bytes)
+    - occurs repeatedly during process lifetime
+  action: alert "Potential per-function self-masking detected"</pre>
+</div>
+
+<h3>5.2 Custom PE Section Detection</h3>
+
+<table>
+<tr><th>Indicator</th><th>Detection Method</th></tr>
+<tr><td><code>.funcmeta</code> section name</td><td>PE section name scan (static analysis, YARA)</td></tr>
+<tr><td><code>.stub</code> section name</td><td>PE section name scan</td></tr>
+<tr><td>Entry point not in <code>.text</code></td><td>Validate <code>AddressOfEntryPoint</code> falls within the <code>.text</code> section</td></tr>
+<tr><td>RW data section with structured entries</td><td>Entropy and structure analysis of non-standard sections</td></tr>
+</table>
+
+<h3>5.3 TEB UserReserved Monitoring</h3>
+
+<div class="card">
+<h4>TEB Field Writes</h4>
+<p>Most legitimate applications never write to the TEB UserReserved fields (offsets 0x1478-0x1488). Monitoring writes to these fields can indicate FunctionPeekaboo or similar techniques. This requires kernel-level or hardware-assisted monitoring (e.g., data breakpoints, page guard pages on TEB).</p>
+</div>
+
+<h3>5.4 Timing-Based Detection</h3>
+
+<p>The handler adds ~4-20&mu;s overhead to every function call. While individually undetectable, statistical analysis of function call timing across many calls might reveal the overhead pattern. This is a research-level detection approach, not currently deployed by any known EDR.</p>
+
+<h3>5.5 Memory Scan Timing</h3>
+
+<div class="card green">
+<h4>Aggressive Scanning Strategy</h4>
+<p>The strongest countermeasure is <strong>high-frequency memory scanning</strong> during process activity periods (not just sleep). If the scanner catches the ~2% window when a function is decrypted, it can extract signatures. This requires scanning every few hundred microseconds, which has significant performance cost but is feasible for targeted investigation.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. YARA Rules for Detection</h2>
+
+<pre><span class="lang-tag">YARA</span>rule FunctionPeekaboo_Sections {
+    meta:
+        description = "Detects PE with FunctionPeekaboo custom sections"
+        author = "Blue Team"
+
+    condition:
+        uint16(0) == 0x5A4D and
+        for any i in (0..pe.number_of_sections - 1): (
+            pe.sections[i].name == ".funcmeta" or
+            pe.sections[i].name == ".stub"
+        )
+}
+
+rule FunctionPeekaboo_EP_Anomaly {
+    meta:
+        description = "Entry point outside .text section"
+
+    condition:
+        uint16(0) == 0x5A4D and
+        not for any i in (0..pe.number_of_sections - 1): (
+            pe.sections[i].name == ".text" and
+            pe.entry_point >= pe.sections[i].virtual_address and
+            pe.entry_point < pe.sections[i].virtual_address +
+                pe.sections[i].virtual_size
+        )
+}
+
+rule FunctionPeekaboo_Stub_Pattern {
+    meta:
+        description = "Detects the CALL/POP PIC pattern followed by register saves"
+
+    strings:
+        // CALL +5 (E8 00000000) followed by POP RBX (5B)
+        // then multiple PUSH instructions
+        $pic_trick = { E8 00 00 00 00 5B 50 51 52 41 50 41 51 }
+
+    condition:
+        uint16(0) == 0x5A4D and $pic_trick
+}</pre>
+
+<!-- ============================================================ -->
+<h2>7. Comparison with Other Evasion Techniques</h2>
+
+<table>
+<tr><th>Technique</th><th>Scope</th><th>When Active</th><th>CET Safe</th><th>Implementation</th></tr>
+<tr><td><strong>FunctionPeekaboo</strong></td><td>Per-function</td><td>Always (active + sleep)</td><td>Yes</td><td>Compiler (LLVM)</td></tr>
+<tr><td><strong>Ekko</strong></td><td>Entire image</td><td>Sleep only</td><td>No</td><td>Runtime (code)</td></tr>
+<tr><td><strong>Zilean</strong></td><td>Entire image</td><td>Sleep only</td><td>No</td><td>Runtime (code)</td></tr>
+<tr><td><strong>FOLIAGE</strong></td><td>Entire image</td><td>Sleep only</td><td>No</td><td>Runtime (code)</td></tr>
+<tr><td><strong>Gargoyle</strong></td><td>Entire image</td><td>Sleep only</td><td>No</td><td>Runtime (timer ROP)</td></tr>
+<tr><td><strong>Module Stomping</strong></td><td>Entire DLL</td><td>Persistent</td><td>Yes</td><td>Loader technique</td></tr>
+<tr><td><strong>PE Header Wiping</strong></td><td>Headers only</td><td>Persistent</td><td>Yes</td><td>Post-load cleanup</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>8. Limitations and Future Work</h2>
+
+<div class="card">
+<h4>Current Limitations</h4>
+<table>
+<tr><th>Limitation</th><th>Impact</th><th>Potential Solution</th></tr>
+<tr><td>On-disk cleartext</td><td>Static analysis sees unmasked functions before first run</td><td>Combine with packing or on-disk encryption</td></tr>
+<tr><td>VirtualProtect footprint</td><td>EDR can monitor permission changes</td><td>Direct syscalls, avoiding kernel32 imports</td></tr>
+<tr><td>Thread safety gaps</td><td>Race conditions with same function across threads</td><td>Per-function reference counting</td></tr>
+<tr><td>Exception path leaks</td><td>Exceptions may leave functions decrypted</td><td>Custom SEH/VEH handlers for cleanup</td></tr>
+<tr><td>Custom section names</td><td>Trivially signaturable</td><td>Merge into existing sections or randomize names</td></tr>
+<tr><td>XOR weakness</td><td>Single-byte XOR is easily reversed</td><td>Multi-byte keys, rolling XOR, or lightweight ciphers</td></tr>
+<tr><td>Build complexity</td><td>Requires custom LLVM build</td><td>Distribute pre-built toolchain</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Operational Deployment Considerations</h2>
+
+<div class="card green">
+<h4>Red Team Deployment Checklist</h4>
+<ul>
+<li><strong>Attribute selection</strong>: Mark sensitive functions (C2 comms, credential access, lateral movement, persistence). Leave hot-loop and utility functions unmasked for performance.</li>
+<li><strong>Combine with sleep obfuscation</strong>: Use FOLIAGE or similar during sleep for 100% coverage in the sleep window. Accept ~98% during active execution.</li>
+<li><strong>Test on CET hardware</strong>: Verify compatibility on Intel 12th/13th/14th gen (Alder Lake+) with CET enabled in Windows 11.</li>
+<li><strong>Rename sections</strong>: Change <code>.funcmeta</code> and <code>.stub</code> to innocuous names before deployment.</li>
+<li><strong>Use direct syscalls</strong>: Replace <code>VirtualProtect</code> imports with <code>NtProtectVirtualMemory</code> syscall stubs to avoid user-mode hooks.</li>
+<li><strong>Thread safety</strong>: If the implant is multithreaded, implement reference counting for shared functions.</li>
+<li><strong>Test exception paths</strong>: Ensure SEH handlers are in place for all peekaboo functions that might throw.</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. Course Summary</h2>
+
+<div class="card highlight">
+<h4>What You&rsquo;ve Learned</h4>
+<table>
+<tr><th>Module</th><th>Key Takeaway</th></tr>
+<tr><td>1</td><td>Memory scanners exploit the sleep window; traditional sleep obfuscation protects during sleep but not during active execution</td></tr>
+<tr><td>2</td><td>LLVM&rsquo;s modular backend allows custom passes at the PreEmit stage, after all optimizations</td></tr>
+<tr><td>3</td><td>Custom PE sections (<code>.funcmeta</code>, <code>.stub</code>) store metadata and initialization code</td></tr>
+<tr><td>4</td><td><code>X86RetModPass</code> identifies attributed functions and injects stubs at every entry and exit point</td></tr>
+<tr><td>5</td><td>Prologue (0x46 bytes) decrypts on call; epilogue re-encrypts on return; CALL/POP enables PIC</td></tr>
+<tr><td>6</td><td>The handler (~380 bytes) performs PE parsing, .funcmeta lookup, VirtualProtect transitions, and byte-level XOR</td></tr>
+<tr><td>7</td><td>Initialization encrypts all functions before main(); steady-state maintains ~98% encryption coverage</td></tr>
+<tr><td>8</td><td>CET-compatible (unlike Ekko/Zilean/FOLIAGE); Nighthawk Evanesco is the production implementation</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz">
+<h2>Knowledge Check</h2>
+
+<div class="quiz-q" data-answer="A">
+<p>Q1: Why is FunctionPeekaboo compatible with Intel CET while Ekko is not?</p>
+<div class="quiz-btn" data-choice="A">A) FunctionPeekaboo uses legitimate CALL/RET flow; Ekko uses ROP-like callback chains that desync the Shadow Stack</div>
+<div class="quiz-btn" data-choice="B">B) FunctionPeekaboo runs in kernel mode, bypassing CET</div>
+<div class="quiz-btn" data-choice="C">C) CET only applies to 32-bit code</div>
+<div class="quiz-btn" data-choice="D">D) Ekko was designed before CET existed and can be easily updated</div>
+</div>
+
+<div class="quiz-q" data-answer="D">
+<p>Q2: What is the most effective detection approach for FunctionPeekaboo?</p>
+<div class="quiz-btn" data-choice="A">A) Scanning for the XOR key in memory</div>
+<div class="quiz-btn" data-choice="B">B) Checking for LLVM compiler artifacts</div>
+<div class="quiz-btn" data-choice="C">C) Monitoring CPU instruction counts</div>
+<div class="quiz-btn" data-choice="D">D) Monitoring rapid VirtualProtect RX&rarr;RW&rarr;RX transitions on .text section regions</div>
+</div>
+
+<div class="quiz-q" data-answer="B">
+<p>Q3: What is Nighthawk&rsquo;s &ldquo;Evanesco&rdquo; feature?</p>
+<div class="quiz-btn" data-choice="A">A) A kernel-mode rootkit for hiding processes</div>
+<div class="quiz-btn" data-choice="B">B) A production implementation of per-function self-masking based on FunctionPeekaboo's concepts</div>
+<div class="quiz-btn" data-choice="C">C) An anti-debugging technique using hardware breakpoints</div>
+<div class="quiz-btn" data-choice="D">D) A network protocol obfuscation layer</div>
+</div>
+</div>
+
+<div class="nav-btns">
+<a href="module7.html">&larr; Previous: Init &amp; Runtime Flow</a>
+<a class="primary" href="../FunctionPeekaboo_index.html">Back to Course Home &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

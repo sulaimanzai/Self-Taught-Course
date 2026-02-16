@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 4: Function Registration & X86RetModPass - FunctionPeekaboo Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F441;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f97316;--accent2:#ef4444;--gradient:linear-gradient(135deg,#f97316,#ef4444)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>FunctionPeekaboo</h2>
+<span>LLVM Self-Masking Functions</span>
+</div>
+<a class="home-link" href="../FunctionPeekaboo_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. Memory Scanning &amp; Sleep</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. LLVM Compiler Architecture</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. PE Internals &amp; Sections</span><span class="diff d1">d1</span></a>
+<a class="mod-link active" href="module4.html"><span>4. Registration &amp; X86RetModPass</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Prologue &amp; Epilogue Stubs</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. The Handler &amp; XOR Engine</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Init &amp; Runtime Flow</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Detection, CET &amp; Nighthawk</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge med">Difficulty: Intermediate</span>
+<h1>Module 4: Function Registration &amp; X86RetModPass</h1>
+<p class="subtitle">The LLVM MachineFunctionPass that transforms ordinary functions into self-masking ones.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Understand how the <code>X86RetModPass</code> MachineFunctionPass works: how it identifies functions to instrument, how it generates <code>.funcmeta</code> entries, how it inserts prologue and epilogue stubs, and the key implementation considerations at the machine instruction level.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. Pass Registration in the X86 Backend</h2>
+
+<p>The <code>X86RetModPass</code> is registered as a <strong>PreEmit</strong> pass in the X86 target machine configuration. In LLVM, each target defines its pass pipeline through a <code>TargetPassConfig</code> subclass:</p>
+
+<pre><span class="lang-tag">C++</span>// X86TargetMachine.cpp - Pass pipeline configuration
+void X86PassConfig::addPreEmitPass() {
+  // Standard pre-emit passes run first
+  addPass(new X86IndirectBranchTrackingPass());  // CET IBT support
+
+  // FunctionPeekaboo's pass runs last in PreEmit
+  // This ensures all other transformations are complete
+  addPass(new X86RetModPass());
+}</pre>
+
+<p>Running last in PreEmit is critical: it means all other passes (register allocation, frame layout, branch optimization) have finished. The function&rsquo;s machine code is in its final form, and the pass can calculate exact byte sizes and offsets.</p>
+
+<!-- ============================================================ -->
+<h2>2. Function Identification</h2>
+
+<p>The pass&rsquo;s <code>runOnMachineFunction()</code> method is called for every function in the compilation unit. The first thing it does is check whether this function should be instrumented:</p>
+
+<pre><span class="lang-tag">C++</span>bool X86RetModPass::runOnMachineFunction(MachineFunction &MF) {
+  // Get the underlying LLVM IR function
+  const Function &F = MF.getFunction();
+
+  // Check for the "peekaboo" annotation attribute
+  if (!F.hasFnAttribute("peekaboo"))
+    return false;  // Skip this function - no changes
+
+  // Also skip very small functions (< minimum stub size)
+  // The prologue stub is 0x46 bytes; function must be larger
+  if (estimateFunctionSize(MF) < MIN_FUNCTION_SIZE)
+    return false;
+
+  // This function should be instrumented
+  instrumentFunction(MF);
+  return true;  // We modified the function
+}</pre>
+
+<div class="card">
+<h4>Attribute Detection Mechanism</h4>
+<p>In the source code, the developer marks functions with <code>__attribute__((annotate("peekaboo")))</code>. This annotation survives through the entire LLVM pipeline &mdash; from C source through IR through MIR &mdash; and is accessible via the <code>Function</code> object at the backend level. The pass simply checks for this attribute string.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Function Size Calculation</h2>
+
+<p>Before injecting stubs, the pass needs to know the exact byte size of the function&rsquo;s body. At the PreEmit stage, instructions are <code>MachineInstr</code> objects, not bytes, so the pass estimates the encoded size:</p>
+
+<pre><span class="lang-tag">C++</span>unsigned X86RetModPass::estimateFunctionSize(MachineFunction &MF) {
+  unsigned Size = 0;
+  for (MachineBasicBlock &MBB : MF) {
+    for (MachineInstr &MI : MBB) {
+      // Each instruction has a known encoding size
+      // The MCCodeEmitter can compute exact sizes
+      Size += getInstructionSize(MI);
+    }
+  }
+  return Size;
+}</pre>
+
+<p>The function size is recorded in the <code>.funcmeta</code> entry so the handler knows exactly how many bytes to XOR at runtime. Accuracy is essential &mdash; encrypting too few bytes leaves code exposed, while encrypting too many corrupts adjacent code.</p>
+
+<!-- ============================================================ -->
+<h2>4. The Instrumentation Process</h2>
+
+<p>Once a function is identified for instrumentation, <code>X86RetModPass</code> performs three transformations:</p>
+
+<div class="card green">
+<h4>Three-Step Instrumentation</h4>
+<ol>
+<li><strong>Inject Prologue Stub</strong>: Prepend a code sequence to the function&rsquo;s entry block that calls the handler to decrypt the function body</li>
+<li><strong>Replace All Returns</strong>: Find every <code>RET</code> instruction and replace it with an epilogue stub that calls the handler to re-encrypt before returning</li>
+<li><strong>Emit .funcmeta Entry</strong>: Generate a metadata entry recording the function&rsquo;s RVA, body size, XOR key, and initial encryption state</li>
+</ol>
+</div>
+
+<pre><span class="lang-tag">C++</span>void X86RetModPass::instrumentFunction(MachineFunction &MF) {
+  // Step 1: Generate a random XOR key for this function
+  uint8_t xorKey = generateRandomKey();
+
+  // Step 2: Calculate the function body size (excluding stubs)
+  unsigned bodySize = estimateFunctionSize(MF);
+
+  // Step 3: Inject prologue stub at function entry
+  MachineBasicBlock &EntryBB = MF.front();
+  injectPrologue(EntryBB, xorKey);
+
+  // Step 4: Find and replace all RET instructions
+  for (MachineBasicBlock &MBB : MF) {
+    for (auto MI = MBB.begin(); MI != MBB.end(); ) {
+      if (MI->isReturn()) {
+        MI = replaceReturn(MBB, MI);  // Replace RET with epilogue stub
+      } else {
+        ++MI;
+      }
+    }
+  }
+
+  // Step 5: Emit .funcmeta entry
+  emitFuncMetaEntry(MF, bodySize, xorKey);
+}</pre>
+
+<!-- ============================================================ -->
+<h2>5. Handling Multiple Return Points</h2>
+
+<p>C/C++ functions can have multiple return paths (early returns, conditional returns, switch/case exits). Every single <code>RET</code> instruction in the function must be replaced with an epilogue stub. Missing even one return point means the function could return without re-encrypting itself, leaving it in cleartext.</p>
+
+<pre><span class="lang-tag">C++</span>// Example: function with multiple returns
+int process_command(int cmd) {
+    if (cmd == 0) return -1;      // Early return (RET #1)
+
+    if (cmd == 1) {
+        do_thing_a();
+        return 0;                  // Normal return (RET #2)
+    }
+
+    if (cmd == 2) {
+        do_thing_b();
+        return 1;                  // Another return (RET #3)
+    }
+
+    return -2;                     // Default return (RET #4)
+}
+
+// X86RetModPass replaces ALL FOUR RET instructions with epilogue stubs
+// The compiler guarantees it sees every return point at the MachineInstr level</pre>
+
+<div class="card warn">
+<h4>Compiler-Level Advantage</h4>
+<p>This is a key advantage of compiler-level instrumentation. At the source level, a developer might miss return paths hidden in macros, inlined functions, or complex control flow. At the machine instruction level, every <code>RET</code> opcode is visible and replaceable &mdash; the compiler guarantees completeness.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. .funcmeta Entry Emission</h2>
+
+<p>For each instrumented function, the pass emits a structured entry into the <code>.funcmeta</code> section. This is done through LLVM&rsquo;s MC (Machine Code) layer, which handles section management and object file emission:</p>
+
+<pre><span class="lang-tag">C++</span>void X86RetModPass::emitFuncMetaEntry(
+    MachineFunction &MF, unsigned bodySize, uint8_t xorKey) {
+
+  // Get or create the .funcmeta section
+  MCContext &Ctx = MF.getContext();
+  MCSection *MetaSection = Ctx.getELFSection(
+      ".funcmeta", ELF::SHT_PROGBITS,
+      ELF::SHF_ALLOC | ELF::SHF_WRITE);  // RW, no execute
+
+  // Switch to the .funcmeta section
+  MCStreamer &Streamer = ...;
+  Streamer.switchSection(MetaSection);
+
+  // Emit the entry fields
+  MCSymbol *FuncSym = MF.getJTISymbol(0, Ctx);
+  Streamer.emitSymbolValue(FuncSym, 4);   // Function RVA (4 bytes)
+  Streamer.emitIntValue(bodySize, 4);      // Body size (4 bytes)
+  Streamer.emitIntValue(xorKey, 1);        // XOR key (1 byte)
+  Streamer.emitIntValue(0, 1);             // IsEncrypted = 0 initially
+  Streamer.emitIntValue(0, 2);             // Padding (2 bytes)
+}</pre>
+
+<div class="card">
+<h4>Initial State: Not Encrypted</h4>
+<p>When the binary is first produced by the compiler/linker, functions are <strong>not encrypted</strong> &mdash; the <code>IsEncrypted</code> field is 0. The <code>.stub</code> initialization code encrypts them all on first run. This means the on-disk binary has functions in cleartext, but they are encrypted before any application code executes. This is acceptable because the on-disk binary can be protected by other means (signing, packing, etc.).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. XOR Key Generation</h2>
+
+<p>Each function gets its own unique single-byte XOR key. A single byte (256 possible values, excluding 0) is used because:</p>
+
+<table>
+<tr><th>Consideration</th><th>Single-Byte XOR</th><th>Multi-Byte Key</th></tr>
+<tr><td><strong>Speed</strong></td><td>Fastest possible &mdash; single XOR per byte</td><td>Slightly slower (index tracking, modular arithmetic)</td></tr>
+<tr><td><strong>Code size</strong></td><td>Minimal handler code</td><td>Larger handler with key indexing logic</td></tr>
+<tr><td><strong>Cryptographic strength</strong></td><td>Weak (brute-forceable in 255 attempts)</td><td>Stronger but still not truly secure without proper cipher</td></tr>
+<tr><td><strong>Purpose</strong></td><td>Sufficient to defeat signature scanning</td><td>Overkill &mdash; the goal is masking, not encryption</td></tr>
+</table>
+
+<div class="card">
+<h4>Masking vs Encryption</h4>
+<p>FunctionPeekaboo is a <strong>masking</strong> technique, not a cryptographic one. The XOR key prevents static signature matching (YARA rules, byte-pattern scans) but would not withstand cryptanalysis. A determined analyst with a memory dump could XOR-decrypt any function in seconds. The point is not to make analysis impossible &mdash; it is to make <em>automated scanning</em> fail, which single-byte XOR accomplishes effectively.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Register Preservation</h2>
+
+<p>The injected prologue and epilogue stubs must not corrupt any registers that the original function uses. At the PreEmit stage, register allocation is complete, so the pass knows exactly which registers are live:</p>
+
+<pre><span class="lang-tag">C++</span>void X86RetModPass::injectPrologue(MachineBasicBlock &EntryBB, uint8_t key) {
+  // The prologue stub must:
+  // 1. Save ALL registers it uses (push to stack)
+  // 2. Save flags (pushfq)
+  // 3. Call the handler
+  // 4. Restore flags (popfq)
+  // 5. Restore ALL registers (pop from stack)
+  // 6. Fall through to the (now decrypted) function body
+
+  // The stub uses a CALL/POP trick for PIC (position-independent)
+  // addressing, which means it uses one register for the return
+  // address. All other registers are preserved via push/pop.
+}</pre>
+
+<div class="card green">
+<h4>Why Register Safety Matters</h4>
+<p>If the prologue stub accidentally clobbers RAX and the function body immediately uses RAX as an input parameter (which it can under the Microsoft x64 calling convention &mdash; but typically RCX, RDX, R8, R9 are parameter registers), the program would crash or produce wrong results. The stub saves and restores all volatile registers to guarantee transparent operation.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Interaction with Optimizations</h2>
+
+<p>Because <code>X86RetModPass</code> runs <em>after</em> all optimization passes, it does not interfere with any standard compiler optimizations:</p>
+
+<table>
+<tr><th>Optimization</th><th>Interaction with X86RetModPass</th></tr>
+<tr><td><strong>Inlining</strong></td><td>Already happened at IR level. If a peekaboo function is inlined into a non-peekaboo function, the inlined copy is not instrumented (it&rsquo;s no longer a separate function)</td></tr>
+<tr><td><strong>Tail call optimization</strong></td><td>Tail calls convert a <code>CALL + RET</code> to a <code>JMP</code>. X86RetModPass must also handle <code>JMP</code> instructions that serve as tail returns</td></tr>
+<tr><td><strong>LTO (Link-Time Optimization)</strong></td><td>LTO merges and optimizes across translation units at link time. X86RetModPass runs per-function after LTO, so it sees the final optimized code</td></tr>
+<tr><td><strong>Sibling call optimization</strong></td><td>Similar to tail calls; the pass checks for jump instructions that exit the function scope</td></tr>
+</table>
+
+<div class="card warn">
+<h4>Tail Call Edge Case</h4>
+<p>When the compiler optimizes a function call followed by a return into a single jump (tail call), the <code>RET</code> instruction disappears. The jump target is in another function, so the current function never formally returns. <code>X86RetModPass</code> must detect these tail-call jumps and insert the re-encryption epilogue <em>before</em> the jump, not after a nonexistent return.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. Pass Output Summary</h2>
+
+<p>After <code>X86RetModPass</code> processes a function, the output consists of:</p>
+
+<div class="card">
+<h4>Instrumented Function Layout</h4>
+<pre><span class="lang-tag">Text</span>+----------------------------------+
+| Prologue Stub (0x46 bytes)       |  &larr; Injected: saves regs, calls handler to decrypt
++----------------------------------+
+| Original Function Body           |  &larr; Unchanged machine code (will be XOR'd at runtime)
+|   ... instructions ...           |
+|   ... multiple basic blocks ...  |
++----------------------------------+
+| Epilogue Stub (at each RET)      |  &larr; Injected: calls handler to re-encrypt, then RET
++----------------------------------+
+
+.funcmeta entry:
+  FunctionRVA  = RVA of function body start (after prologue)
+  FunctionSize = byte size of original body (excluding stubs)
+  XorKey       = random byte (1-255)
+  IsEncrypted  = 0 (set to 1 by .stub initialization)</pre>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz">
+<h2>Knowledge Check</h2>
+
+<div class="quiz-q" data-answer="B">
+<p>Q1: Why does X86RetModPass run at the PreEmit stage rather than earlier in the pipeline?</p>
+<div class="quiz-btn" data-choice="A">A) PreEmit is the only stage that supports custom passes</div>
+<div class="quiz-btn" data-choice="B">B) At PreEmit, register allocation is complete and instructions are in final form, allowing exact byte-level stub injection</div>
+<div class="quiz-btn" data-choice="C">C) PreEmit runs before optimization, giving better performance</div>
+<div class="quiz-btn" data-choice="D">D) The pass needs access to source code, which is only available at PreEmit</div>
+</div>
+
+<div class="quiz-q" data-answer="C">
+<p>Q2: What happens if X86RetModPass misses a return instruction in a function?</p>
+<div class="quiz-btn" data-choice="A">A) The program crashes immediately</div>
+<div class="quiz-btn" data-choice="B">B) The function is not encrypted at all</div>
+<div class="quiz-btn" data-choice="C">C) The function can return without re-encrypting, leaving its body in cleartext</div>
+<div class="quiz-btn" data-choice="D">D) The handler automatically detects and fixes the problem</div>
+</div>
+
+<div class="quiz-q" data-answer="A">
+<p>Q3: Why does FunctionPeekaboo use a single-byte XOR key rather than a stronger cipher?</p>
+<div class="quiz-btn" data-choice="A">A) The goal is defeating automated signature scanning, not resisting cryptanalysis; single-byte XOR is fast and sufficient for masking</div>
+<div class="quiz-btn" data-choice="B">B) LLVM does not support multi-byte operations</div>
+<div class="quiz-btn" data-choice="C">C) Stronger ciphers would corrupt the function code</div>
+<div class="quiz-btn" data-choice="D">D) Windows only supports single-byte XOR for memory operations</div>
+</div>
+</div>
+
+<div class="nav-btns">
+<a href="module3.html">&larr; Previous: PE Internals &amp; Sections</a>
+<a class="primary" href="module5.html">Next: Prologue &amp; Epilogue Stubs &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

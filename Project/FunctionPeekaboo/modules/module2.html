@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 2: LLVM Compiler Architecture - FunctionPeekaboo Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F441;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f97316;--accent2:#ef4444;--gradient:linear-gradient(135deg,#f97316,#ef4444)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>FunctionPeekaboo</h2>
+<span>LLVM Self-Masking Functions</span>
+</div>
+<a class="home-link" href="../FunctionPeekaboo_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. Memory Scanning &amp; Sleep</span><span class="diff d1">d1</span></a>
+<a class="mod-link active" href="module2.html"><span>2. LLVM Compiler Architecture</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. PE Internals &amp; Sections</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. Registration &amp; X86RetModPass</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Prologue &amp; Epilogue Stubs</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. The Handler &amp; XOR Engine</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Init &amp; Runtime Flow</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Detection, CET &amp; Nighthawk</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 2: LLVM Compiler Architecture</h1>
+<p class="subtitle">Understanding the compilation pipeline that makes compiler-level function masking possible.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Learn how the LLVM compiler framework is structured, what intermediate representations it uses, how the X86 backend transforms IR into machine code, and specifically where FunctionPeekaboo&rsquo;s <code>X86RetModPass</code> hooks into the pipeline to instrument functions at the <strong>PreEmit</strong> phase.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. What Is LLVM?</h2>
+
+<p>LLVM (originally &ldquo;Low Level Virtual Machine,&rdquo; now just a name) is a modular compiler infrastructure used by Clang (C/C++), Rust, Swift, and many other languages. Its key design principle is a <strong>three-phase architecture</strong>:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">LLVM Three-Phase Architecture</h4>
+<div class="flow">
+<div class="flow box">Frontend<br><small>Clang, rustc, swiftc<br>Parses source &rarr; LLVM IR</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">Middle-End<br><small>Optimizer<br>Transform passes on IR</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">Backend<br><small>Target-specific<br>IR &rarr; machine code</small></div>
+</div>
+</div>
+
+<p>The frontend (e.g., Clang for C/C++) parses source code into <strong>LLVM IR</strong> (Intermediate Representation). The middle-end runs optimization passes on this IR. The backend converts optimized IR into target-specific machine code (x86, ARM, RISC-V, etc.).</p>
+
+<p>FunctionPeekaboo operates in the <strong>backend</strong> &mdash; specifically in the X86 backend. This is critical because by the time the backend runs, all high-level language features have been lowered to concrete machine instructions, and FunctionPeekaboo can inject exact assembly sequences.</p>
+
+<!-- ============================================================ -->
+<h2>2. LLVM Intermediate Representation (IR)</h2>
+
+<p>LLVM IR is a typed, SSA-form (Static Single Assignment) intermediate language. It looks like a cross between assembly and a high-level language:</p>
+
+<pre><span class="lang-tag">LLVM IR</span>; A simple function that adds two integers
+define i32 @add(i32 %a, i32 %b) {
+entry:
+  %result = add i32 %a, %b
+  ret i32 %result
+}
+
+; A function with a conditional branch
+define i32 @max(i32 %a, i32 %b) {
+entry:
+  %cmp = icmp sgt i32 %a, %b
+  br i1 %cmp, label %then, label %else
+
+then:
+  ret i32 %a
+
+else:
+  ret i32 %b
+}</pre>
+
+<p>Key properties of LLVM IR that matter for FunctionPeekaboo:</p>
+<ul>
+<li><strong>SSA Form</strong>: Each variable is assigned exactly once, making data flow analysis straightforward</li>
+<li><strong>Typed</strong>: Every value has a type (<code>i32</code>, <code>i64</code>, <code>ptr</code>, etc.)</li>
+<li><strong>Target-independent</strong>: The same IR can be lowered to x86, ARM, or any other supported backend</li>
+<li><strong>Function-level granularity</strong>: Each function is a self-contained unit, which aligns perfectly with per-function masking</li>
+</ul>
+
+<div class="card">
+<h4>Why Not Modify IR?</h4>
+<p>FunctionPeekaboo could theoretically inject masking logic at the IR level, but this would be problematic. At the IR level, there are no concrete machine instructions yet &mdash; the injected code would need to survive lowering, instruction selection, register allocation, and scheduling. By modifying at the backend level (after these phases), FunctionPeekaboo injects exact x86 machine instructions that go directly into the output binary.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. The X86 Backend Pipeline</h2>
+
+<p>The LLVM X86 backend converts IR into x86 machine code through a series of passes. Each pass transforms the code further toward final machine code:</p>
+
+<div class="card">
+<h4>X86 Backend Pass Pipeline (Simplified)</h4>
+<table>
+<tr><th>Phase</th><th>Pass Category</th><th>What Happens</th></tr>
+<tr><td>1</td><td><strong>Instruction Selection (ISel)</strong></td><td>IR instructions are matched to x86 machine instructions using pattern matching (SelectionDAG or GlobalISel)</td></tr>
+<tr><td>2</td><td><strong>Machine IR (MIR) Optimization</strong></td><td>Machine instructions are optimized: peephole opts, dead code elimination, instruction combining</td></tr>
+<tr><td>3</td><td><strong>Register Allocation</strong></td><td>Virtual registers are mapped to physical x86 registers (RAX, RCX, etc.), with spilling for overflows</td></tr>
+<tr><td>4</td><td><strong>Prologue/Epilogue Insertion</strong></td><td>Stack frame setup/teardown code is added (push rbp, sub rsp, etc.)</td></tr>
+<tr><td>5</td><td><strong>Post-RA Optimization</strong></td><td>Further optimization after register allocation (register copy coalescing, branch folding)</td></tr>
+<tr><td>6</td><td><strong>PreEmit</strong></td><td>Final passes before code emission &mdash; <strong>this is where X86RetModPass runs</strong></td></tr>
+<tr><td>7</td><td><strong>Code Emission</strong></td><td>Machine instructions are serialized to binary (MC layer) and written to the object file</td></tr>
+</table>
+</div>
+
+<p>The <strong>PreEmit</strong> phase is the last opportunity to modify the machine code before it is finalized. By this point, all register allocation is done, all frame setup is in place, and the instructions are in their final form. This makes it the ideal insertion point for FunctionPeekaboo&rsquo;s stubs.</p>
+
+<!-- ============================================================ -->
+<h2>4. MachineFunction and MachineFunctionPass</h2>
+
+<p>In the LLVM backend, each function is represented as a <code>MachineFunction</code> object. A <code>MachineFunctionPass</code> is a pass that operates on one <code>MachineFunction</code> at a time &mdash; it receives each function, can inspect and modify its machine instructions, and returns whether it changed anything.</p>
+
+<pre><span class="lang-tag">C++</span>// Simplified MachineFunctionPass structure
+class X86RetModPass : public MachineFunctionPass {
+public:
+  static char ID;
+  X86RetModPass() : MachineFunctionPass(ID) {}
+
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    // This method is called once per function
+    // MF contains all MachineBasicBlocks
+    // Each MBB contains MachineInstr objects
+
+    // Check if this function should be instrumented
+    if (!shouldInstrument(MF))
+      return false;  // no changes made
+
+    // Instrument the function
+    addPrologueStub(MF);
+    replaceReturns(MF);
+    return true;  // function was modified
+  }
+};</pre>
+
+<p>The <code>MachineFunction</code> contains <code>MachineBasicBlock</code> objects, which in turn contain <code>MachineInstr</code> objects. FunctionPeekaboo&rsquo;s <code>X86RetModPass</code> iterates through these to find all <code>RET</code> instructions and replace them with epilogue stubs, and to prepend prologue stubs to the function entry.</p>
+
+<!-- ============================================================ -->
+<h2>5. Machine Instructions at the PreEmit Stage</h2>
+
+<p>At the PreEmit stage, instructions look like concrete x86 machine instructions, but they are still represented as <code>MachineInstr</code> objects (not yet serialized to bytes). For example:</p>
+
+<pre><span class="lang-tag">MIR (Machine IR)</span>; A simple function at PreEmit stage
+bb.0.entry:
+  liveins: $edi, $esi
+  $eax = LEA32r $edi, 1, $esi, 0, $noreg  ; eax = edi + esi
+  RET 0, $eax                               ; return eax
+
+; After X86RetModPass, the RET is replaced:
+bb.0.entry:
+  liveins: $edi, $esi
+  ; ... prologue stub (inline bytes) ...
+  $eax = LEA32r $edi, 1, $esi, 0, $noreg
+  ; ... epilogue stub replaces the RET ...
+  CALL64pcrel32 @handler       ; call handler to re-encrypt
+  RET 0, $eax                  ; then return</pre>
+
+<div class="card green">
+<h4>Key Advantage of PreEmit</h4>
+<p>At PreEmit, register allocation is complete, so FunctionPeekaboo knows exactly which physical registers are in use. The prologue stub can safely use registers that are known to be free (or save/restore them on the stack). The epilogue stub similarly knows the register state at each return point. This level of precision is only available in the backend.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. How FunctionPeekaboo Integrates</h2>
+
+<p>FunctionPeekaboo adds a new <code>MachineFunctionPass</code> called <code>X86RetModPass</code> to the X86 backend&rsquo;s pass pipeline. The integration requires modifying two key files in the LLVM source:</p>
+
+<div class="card">
+<h4>LLVM Modification Points</h4>
+<table>
+<tr><th>File</th><th>Change</th></tr>
+<tr><td><code>lib/Target/X86/X86TargetMachine.cpp</code></td><td>Register <code>X86RetModPass</code> in the target pass pipeline at the PreEmit stage</td></tr>
+<tr><td><code>lib/Target/X86/X86RetModPass.cpp</code></td><td>The new pass implementation (function detection, stub injection, metadata generation)</td></tr>
+<tr><td><code>lib/Target/X86/CMakeLists.txt</code></td><td>Add the new source file to the build</td></tr>
+</table>
+</div>
+
+<p>The pass registration in <code>X86TargetMachine.cpp</code> places it at the PreEmit position:</p>
+
+<pre><span class="lang-tag">C++</span>// In X86TargetMachine.cpp - addPreEmitPass()
+void X86PassConfig::addPreEmitPass() {
+  // ... existing passes ...
+  addPass(new X86RetModPass());  // FunctionPeekaboo's pass
+}</pre>
+
+<!-- ============================================================ -->
+<h2>7. Function Attributes for Registration</h2>
+
+<p>Not every function should be instrumented &mdash; only functions explicitly marked by the developer. FunctionPeekaboo uses LLVM function attributes to identify which functions to instrument:</p>
+
+<pre><span class="lang-tag">C++</span>// In the implant source code, mark functions for masking:
+__attribute__((annotate("peekaboo")))
+void beacon_checkin() {
+    // This function will be self-masking
+    // The attribute tells X86RetModPass to instrument it
+}
+
+// Unmarked functions are left alone:
+void helper_function() {
+    // This function will NOT be instrumented
+    // It stays as normal code
+}</pre>
+
+<p>The <code>X86RetModPass</code> checks each function for this attribute. If present, the function is registered for instrumentation: its address and size are recorded in the <code>.funcmeta</code> section, and prologue/epilogue stubs are injected.</p>
+
+<div class="card warn">
+<h4>Registration Granularity</h4>
+<p>The developer has full control over which functions are masked. Functions that are called extremely frequently (hot loops) might be left unmasked for performance. Functions containing sensitive logic (C2 communication, credential handling, lateral movement) should be masked. The attribute-based approach lets the developer make this trade-off per function.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Building LLVM with FunctionPeekaboo</h2>
+
+<p>To use FunctionPeekaboo, you must build a custom LLVM/Clang toolchain with the patch applied. The typical workflow is:</p>
+
+<pre><span class="lang-tag">Bash</span># 1. Clone the LLVM project
+git clone https://github.com/llvm/llvm-project.git
+cd llvm-project
+
+# 2. Apply FunctionPeekaboo patches
+#    (copies X86RetModPass.cpp, modifies X86TargetMachine.cpp, etc.)
+git apply functionpeekaboo.patch
+
+# 3. Build LLVM + Clang with X86 backend
+cmake -S llvm -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_ENABLE_PROJECTS="clang" \
+  -DLLVM_TARGETS_TO_BUILD="X86"
+
+ninja -C build
+
+# 4. The resulting clang binary supports FunctionPeekaboo
+# Use it to compile your implant:
+build/bin/clang -target x86_64-pc-windows-msvc \
+  -O2 implant.c -o implant.exe
+
+# 5. Post-process the PE to set the entry point
+python3 modifyEP.py implant.exe</pre>
+
+<div class="card">
+<h4>Build Time Consideration</h4>
+<p>Building LLVM from source with Clang typically takes 30&ndash;60 minutes on modern hardware with sufficient RAM (16 GB+ recommended). This is a one-time cost &mdash; once the toolchain is built, recompiling the implant is fast. The custom Clang binary is the only tool needed; no runtime dependencies are added.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. The Compilation Flow with FunctionPeekaboo</h2>
+
+<p>Here is the complete compilation flow from source code to a self-masking binary:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Full Compilation Pipeline</h4>
+<div class="flow">
+<div class="flow box">Source (.c)<br><small>Functions with<br>peekaboo attribute</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">Clang Frontend<br><small>Parse &rarr; LLVM IR</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">Optimizer<br><small>Standard passes</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">X86 Backend<br><small>ISel &rarr; RegAlloc<br>&rarr; X86RetModPass</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">modifyEP.py<br><small>Adjust PE entry<br>to .stub section</small></div>
+</div>
+</div>
+
+<p>The key addition is <code>X86RetModPass</code> in the backend and <code>modifyEP.py</code> as a post-build step. The optimizer runs unchanged, meaning all standard optimizations (<code>-O2</code>, <code>-O3</code>, LTO) work normally. FunctionPeekaboo does not interfere with optimization because it runs after all optimization is complete.</p>
+
+<!-- ============================================================ -->
+<div class="quiz">
+<h2>Knowledge Check</h2>
+
+<div class="quiz-q" data-answer="C">
+<p>Q1: At which stage of the LLVM X86 backend does X86RetModPass run?</p>
+<div class="quiz-btn" data-choice="A">A) Instruction Selection (ISel)</div>
+<div class="quiz-btn" data-choice="B">B) Register Allocation</div>
+<div class="quiz-btn" data-choice="C">C) PreEmit (just before code emission)</div>
+<div class="quiz-btn" data-choice="D">D) During the optimization middle-end</div>
+</div>
+
+<div class="quiz-q" data-answer="B">
+<p>Q2: Why does FunctionPeekaboo modify the LLVM backend rather than the IR?</p>
+<div class="quiz-btn" data-choice="A">A) IR does not support function attributes</div>
+<div class="quiz-btn" data-choice="B">B) At the backend level, concrete machine instructions are available, allowing exact x86 stub injection</div>
+<div class="quiz-btn" data-choice="C">C) IR modifications would be too fast to execute</div>
+<div class="quiz-btn" data-choice="D">D) The backend is simpler to modify</div>
+</div>
+
+<div class="quiz-q" data-answer="D">
+<p>Q3: What mechanism does FunctionPeekaboo use to determine which functions to instrument?</p>
+<div class="quiz-btn" data-choice="A">A) It instruments every function automatically</div>
+<div class="quiz-btn" data-choice="B">B) It only instruments functions over 100 bytes</div>
+<div class="quiz-btn" data-choice="C">C) It uses a configuration file listing function names</div>
+<div class="quiz-btn" data-choice="D">D) Function attributes (annotations) mark functions for masking</div>
+</div>
+</div>
+
+<div class="nav-btns">
+<a href="module1.html">&larr; Previous: Memory Scanning &amp; Sleep</a>
+<a class="primary" href="module3.html">Next: PE Internals &amp; Sections &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

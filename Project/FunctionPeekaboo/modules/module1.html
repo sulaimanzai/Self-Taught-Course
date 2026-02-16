@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 1: Memory Scanning & Sleep Obfuscation - FunctionPeekaboo Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F441;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f97316;--accent2:#ef4444;--gradient:linear-gradient(135deg,#f97316,#ef4444)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>FunctionPeekaboo</h2>
+<span>LLVM Self-Masking Functions</span>
+</div>
+<a class="home-link" href="../FunctionPeekaboo_index.html">&larr; Course Home</a>
+<a class="mod-link active" href="module1.html"><span>1. Memory Scanning &amp; Sleep</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. LLVM Compiler Architecture</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. PE Internals &amp; Sections</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. Registration &amp; X86RetModPass</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. Prologue &amp; Epilogue Stubs</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. The Handler &amp; XOR Engine</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Init &amp; Runtime Flow</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Detection, CET &amp; Nighthawk</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 1: Memory Scanning &amp; Sleep Obfuscation</h1>
+<p class="subtitle">The cat-and-mouse game between memory scanners and implant developers &mdash; and why sleep obfuscation alone isn&rsquo;t enough.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Understand how EDR memory scanners detect implants, how traditional sleep obfuscation techniques (Ekko, Zilean, FOLIAGE) attempt to evade them, their fundamental limitations, and why MDSec&rsquo;s FunctionPeekaboo introduces a paradigm shift from &ldquo;encrypt everything during sleep&rdquo; to &ldquo;encrypt each function individually at rest.&rdquo;</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. How Memory Scanners Find Implants</h2>
+
+<p>Once shellcode or an implant is loaded into memory, Endpoint Detection and Response (EDR) products periodically scan process memory looking for indicators of compromise. These scans target several categories of evidence:</p>
+
+<table>
+<tr><th>Detection Vector</th><th>What the Scanner Looks For</th><th>Why It Works</th></tr>
+<tr><td><strong>Signature Matching</strong></td><td>Known byte sequences from public implants (Cobalt Strike, Meterpreter, Sliver)</td><td>Public tools have documented signatures; YARA rules catch them reliably</td></tr>
+<tr><td><strong>Unbacked Executable Memory</strong></td><td>Private memory regions with <code>PAGE_EXECUTE_*</code> that don&rsquo;t map to any file on disk</td><td>Legitimate code comes from DLLs with backing files; implants exist only in memory</td></tr>
+<tr><td><strong>RWX Pages</strong></td><td>Memory with simultaneous read, write, and execute permissions</td><td>Normal code sections are <code>RX</code>; <code>RWX</code> strongly suggests self-modifying or injected code</td></tr>
+<tr><td><strong>Behavioral Heuristics</strong></td><td>Patterns like alloc &rarr; write &rarr; protect &rarr; execute sequences, abnormal thread start addresses</td><td>The mechanics of injection follow predictable patterns</td></tr>
+<tr><td><strong>PE Header Artifacts</strong></td><td>MZ/PE headers in non-file-backed memory, reflectively loaded DLLs</td><td>PE headers in private memory indicate manual loading outside the normal loader</td></tr>
+</table>
+
+<p>The critical insight is that <strong>scanners look at memory content at a point in time</strong>. If the implant&rsquo;s code is in cleartext in executable memory when the scan happens, it gets caught. This observation drives all sleep obfuscation techniques.</p>
+
+<!-- ============================================================ -->
+<h2>2. The Sleep Window Problem</h2>
+
+<p>Command-and-control implants spend the vast majority of their runtime <strong>sleeping</strong> &mdash; waiting between check-ins to the C2 server. A typical beacon might check in every 60 seconds, meaning ~59.9 seconds of each cycle is idle sleep time. During this sleep window, the implant&rsquo;s code sits in memory doing nothing, but it&rsquo;s still fully readable by any scanner that comes along.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Implant Lifecycle Timeline</h4>
+<div class="flow">
+<div class="flow box">Check-In<br><small>~100ms active</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">SLEEP<br><small>~59.9s idle</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">Check-In<br><small>~100ms active</small></div>
+<div class="flow arrow">&rarr;</div>
+<div class="flow box">SLEEP<br><small>~59.9s idle</small></div>
+</div>
+</div>
+
+<p>During those ~100ms of activity, the scanner is unlikely to catch the implant because the window is so brief. But during the ~59.9 seconds of sleep, the code is a sitting duck. This asymmetry &mdash; code is vulnerable during 99.8% of its runtime &mdash; is the fundamental problem that sleep obfuscation addresses.</p>
+
+<!-- ============================================================ -->
+<h2>3. Traditional Sleep Obfuscation Techniques</h2>
+
+<p>Several techniques have been developed to encrypt the implant&rsquo;s memory during the sleep window. The core idea is the same in all of them: before sleeping, encrypt all implant code and data in memory; after waking, decrypt it and resume execution.</p>
+
+<h3>3.1 Ekko (by C5pider)</h3>
+
+<p>Ekko uses <strong>timer callbacks</strong> (via <code>CreateTimerQueueTimer</code>) to schedule the encryption and decryption operations. The flow is:</p>
+
+<div class="card">
+<h4>Ekko Execution Flow</h4>
+<ol>
+<li>Create a timer queue with <code>CreateTimerQueueTimer</code></li>
+<li>Queue callback 1: <code>VirtualProtect</code> &rarr; change implant memory to <code>RW</code> (remove execute)</li>
+<li>Queue callback 2: <code>SystemFunction032</code> (RC4) &rarr; encrypt the implant&rsquo;s memory in-place</li>
+<li>Queue callback 3: <code>WaitForSingleObject</code> &rarr; sleep for the beacon interval</li>
+<li>Queue callback 4: <code>SystemFunction032</code> &rarr; decrypt the implant&rsquo;s memory</li>
+<li>Queue callback 5: <code>VirtualProtect</code> &rarr; restore <code>RX</code> permissions</li>
+</ol>
+<p>Because the callbacks execute in a legitimate Windows thread pool thread, the call stack during sleep looks clean &mdash; it traces back to <code>ntdll!TppWorkerThread</code> rather than to the implant.</p>
+</div>
+
+<h3>3.2 Zilean</h3>
+
+<p>Zilean extends the Ekko concept by using <strong>APC (Asynchronous Procedure Call) queuing</strong> instead of timer callbacks. The advantage is that APCs can be queued to the implant&rsquo;s own thread in an alertable wait state, giving tighter control over execution ordering.</p>
+
+<h3>3.3 FOLIAGE (by Austin Hudson)</h3>
+
+<p>FOLIAGE combines APC queuing with <code>NtContinue</code> context manipulation for cleaner execution flow. It also handles the call stack more carefully, making the sleep state look even more like a legitimate suspended thread.</p>
+
+<div class="card green">
+<h4>What They All Share</h4>
+<p>All three techniques follow the same fundamental pattern: (1) change memory permissions to writable, (2) encrypt everything, (3) sleep, (4) decrypt everything, (5) restore execute permissions. The differences are in the <em>mechanism</em> used to schedule these steps (timers vs APCs vs context manipulation), not in the <em>strategy</em> itself.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Limitations of Whole-Image Encryption</h2>
+
+<p>While sleep obfuscation dramatically improves stealth during the sleep window, it has several fundamental weaknesses:</p>
+
+<div class="card warn">
+<h4>Critical Limitation: The Active Window</h4>
+<p>During the brief period when the implant is <strong>awake and executing</strong> (processing commands, exfiltrating data, communicating with C2), the entire codebase is decrypted and sitting in executable memory. A well-timed scan during this window catches everything. The attacker has no control over when EDR scans occur.</p>
+</div>
+
+<table>
+<tr><th>Limitation</th><th>Impact</th></tr>
+<tr><td><strong>All-or-nothing decryption</strong></td><td>When the implant wakes up, 100% of its code is decrypted, even if only a tiny fraction is needed for the current task</td></tr>
+<tr><td><strong>Predictable memory permission changes</strong></td><td>Flipping an entire image between RW and RX is itself a detectable pattern; ETW and minifilter callbacks can observe <code>VirtualProtect</code> calls</td></tr>
+<tr><td><strong>No protection at sleep 0</strong></td><td>If the beacon interval is set to 0 (continuous check-in), the code is never encrypted because there is no sleep window. Some operational scenarios require sleep 0</td></tr>
+<tr><td><strong>Thread state anomalies</strong></td><td>Even with clean call stacks, the sudden appearance and disappearance of large encrypted memory regions can be correlated with thread state changes</td></tr>
+<tr><td><strong>Timing correlation</strong></td><td>EDR can correlate periodic permission changes with C2 beaconing intervals, revealing the implant even without reading its content</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>5. The FunctionPeekaboo Paradigm Shift</h2>
+
+<p>FunctionPeekaboo by MDSec (<code>@saab_sec</code>) fundamentally rethinks the problem. Instead of encrypting the entire implant image during sleep, it operates at the <strong>individual function level</strong>:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Traditional vs FunctionPeekaboo</h4>
+<div class="flow">
+<div class="flow box">Traditional<br><small>Encrypt ALL during sleep<br>Decrypt ALL on wake</small></div>
+<div class="flow arrow">vs</div>
+<div class="flow box">FunctionPeekaboo<br><small>Each function encrypted at rest<br>Decrypt ONE on call, re-encrypt on return</small></div>
+</div>
+</div>
+
+<p>The key principles are:</p>
+
+<div class="card green">
+<h4>Per-Function Self-Masking</h4>
+<ul>
+<li><strong>Functions are encrypted by default</strong> &mdash; every registered function&rsquo;s body is XOR-encrypted at rest</li>
+<li><strong>Decrypt on call</strong> &mdash; when a function is called, only that specific function is decrypted</li>
+<li><strong>Re-encrypt on return</strong> &mdash; when the function returns, it is immediately re-encrypted</li>
+<li><strong>At most one function in cleartext</strong> &mdash; at any point, only the currently executing function is decrypted; all others remain masked</li>
+<li><strong>~98% coverage</strong> &mdash; even with sleep set to 0 (no sleep at all), approximately 98% of the implant&rsquo;s code remains encrypted at any given moment</li>
+</ul>
+</div>
+
+<p>This is implemented at the <strong>compiler level</strong> &mdash; specifically as a modification to the LLVM X86 backend. The compiler automatically injects encryption/decryption stubs into every registered function, meaning the source code of the implant does not need to be modified at all.</p>
+
+<!-- ============================================================ -->
+<h2>6. Why Compiler-Level Instrumentation?</h2>
+
+<p>FunctionPeekaboo modifies the LLVM compiler rather than the implant&rsquo;s source code. This approach has several advantages:</p>
+
+<table>
+<tr><th>Approach</th><th>Compiler-Level (FunctionPeekaboo)</th><th>Source-Level (Manual)</th></tr>
+<tr><td><strong>Code modification</strong></td><td>None &mdash; original source unchanged</td><td>Every function must be manually wrapped</td></tr>
+<tr><td><strong>Coverage</strong></td><td>Automatic for all attributed functions</td><td>Easy to miss functions; error-prone</td></tr>
+<tr><td><strong>Maintenance</strong></td><td>Zero per-function overhead; add attribute and recompile</td><td>Must maintain wrapper code alongside business logic</td></tr>
+<tr><td><strong>Correctness</strong></td><td>Compiler guarantees all code paths are instrumented</td><td>Edge cases (early returns, exceptions) can skip re-encryption</td></tr>
+<tr><td><strong>Performance</strong></td><td>Stubs are minimal machine code, no abstraction overhead</td><td>Wrapper functions add call overhead and may prevent inlining</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>7. High-Level Architecture</h2>
+
+<p>Before diving into the implementation details (covered in later modules), here is the high-level architecture of FunctionPeekaboo:</p>
+
+<div class="card">
+<h4>Component Overview</h4>
+<table>
+<tr><th>Component</th><th>Purpose</th><th>Location</th></tr>
+<tr><td><strong>X86RetModPass</strong></td><td>LLVM MachineFunctionPass that injects prologue/epilogue stubs into registered functions</td><td>LLVM X86 backend (PreEmit phase)</td></tr>
+<tr><td><strong>Prologue Stub</strong></td><td>0x46-byte code block at function entry that calls the handler to decrypt the function body</td><td>Prepended to each function</td></tr>
+<tr><td><strong>Epilogue Stub</strong></td><td>Code block at every return point that calls the handler to re-encrypt the function body</td><td>Replaces each <code>RET</code> instruction</td></tr>
+<tr><td><strong>Handler</strong></td><td>~380-byte routine that performs the actual XOR encryption/decryption and memory permission changes</td><td>Shared across all functions</td></tr>
+<tr><td><strong>.funcmeta Section</strong></td><td>Custom PE section containing metadata about each registered function (address, size, key)</td><td>PE file custom section</td></tr>
+<tr><td><strong>.stub Section</strong></td><td>Custom PE section containing the initialization entry point</td><td>PE file custom section</td></tr>
+<tr><td><strong>modifyEP.py</strong></td><td>Post-processing script that adjusts the PE entry point to the .stub section</td><td>Build pipeline</td></tr>
+<tr><td><strong>TEB UserReserved</strong></td><td>Thread Environment Block fields used to store per-thread state (current function pointer, flags)</td><td>Runtime, via GS segment</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Comparison with Sleep Obfuscation</h2>
+
+<table>
+<tr><th>Property</th><th>Sleep Obfuscation (Ekko/Zilean/FOLIAGE)</th><th>FunctionPeekaboo</th></tr>
+<tr><td><strong>Granularity</strong></td><td>Entire image</td><td>Per-function</td></tr>
+<tr><td><strong>When encrypted</strong></td><td>Only during sleep</td><td>Always (except currently executing function)</td></tr>
+<tr><td><strong>Coverage during activity</strong></td><td>0% (all decrypted while awake)</td><td>~98% (only active function decrypted)</td></tr>
+<tr><td><strong>Sleep 0 protection</strong></td><td>None</td><td>Full protection</td></tr>
+<tr><td><strong>Implementation level</strong></td><td>Runtime (source code or library)</td><td>Compiler (LLVM backend)</td></tr>
+<tr><td><strong>Source code changes</strong></td><td>Required (integrate sleep mask)</td><td>Add attribute only</td></tr>
+<tr><td><strong>CET compatible</strong></td><td>No (Ekko/Zilean use ROP-like chains)</td><td>Yes (legitimate call/ret flow)</td></tr>
+<tr><td><strong>Can be combined</strong></td><td>Yes &mdash; use both together</td><td>Yes &mdash; use both together</td></tr>
+</table>
+
+<div class="card highlight">
+<h4>Complementary, Not Competing</h4>
+<p>FunctionPeekaboo and sleep obfuscation are <strong>complementary techniques</strong>. You can use sleep obfuscation to encrypt the entire image during sleep (catching the ~2% that FunctionPeekaboo leaves decrypted), and FunctionPeekaboo to maintain ~98% encryption during active execution. Together, they provide near-complete memory protection across the entire implant lifecycle.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Course Roadmap</h2>
+
+<div class="card">
+<h4>What Comes Next</h4>
+<table>
+<tr><th>Module</th><th>Topic</th><th>Builds On</th></tr>
+<tr><td>1 (this)</td><td>Memory Scanning &amp; Sleep Obfuscation</td><td>&mdash;</td></tr>
+<tr><td>2</td><td>LLVM Compiler Architecture</td><td>Understanding the compilation pipeline</td></tr>
+<tr><td>3</td><td>PE Internals &amp; Custom Sections</td><td>Where metadata and stubs live in the binary</td></tr>
+<tr><td>4</td><td>Function Registration &amp; X86RetModPass</td><td>How functions are marked and instrumented</td></tr>
+<tr><td>5</td><td>Prologue &amp; Epilogue Stubs</td><td>The injected code at function boundaries</td></tr>
+<tr><td>6</td><td>The Handler &amp; XOR Engine</td><td>The core encryption/decryption logic</td></tr>
+<tr><td>7</td><td>Initialization &amp; Runtime Flow</td><td>How the system bootstraps and runs</td></tr>
+<tr><td>8</td><td>Detection, CET &amp; Nighthawk</td><td>Real-world deployment, defenses, and production use</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz">
+<h2>Knowledge Check</h2>
+
+<div class="quiz-q" data-answer="C">
+<p>Q1: What is the fundamental limitation of traditional sleep obfuscation?</p>
+<div class="quiz-btn" data-choice="A">A) It cannot encrypt memory at all</div>
+<div class="quiz-btn" data-choice="B">B) It only works on 32-bit systems</div>
+<div class="quiz-btn" data-choice="C">C) During active execution, 100% of code is decrypted and scannable</div>
+<div class="quiz-btn" data-choice="D">D) It requires kernel-mode drivers</div>
+</div>
+
+<div class="quiz-q" data-answer="B">
+<p>Q2: Approximately what percentage of code remains encrypted with FunctionPeekaboo during active execution?</p>
+<div class="quiz-btn" data-choice="A">A) ~50%</div>
+<div class="quiz-btn" data-choice="B">B) ~98%</div>
+<div class="quiz-btn" data-choice="C">C) ~75%</div>
+<div class="quiz-btn" data-choice="D">D) 100%</div>
+</div>
+
+<div class="quiz-q" data-answer="A">
+<p>Q3: At what level is FunctionPeekaboo implemented?</p>
+<div class="quiz-btn" data-choice="A">A) LLVM compiler backend modification</div>
+<div class="quiz-btn" data-choice="B">B) Windows kernel driver</div>
+<div class="quiz-btn" data-choice="C">C) Source-level wrapper functions</div>
+<div class="quiz-btn" data-choice="D">D) Hypervisor-based interception</div>
+</div>
+</div>
+
+<div class="nav-btns">
+<span></span>
+<a class="primary" href="module2.html">Next: LLVM Compiler Architecture &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

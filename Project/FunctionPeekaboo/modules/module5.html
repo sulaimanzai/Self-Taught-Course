@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 5: Prologue & Epilogue Stubs - FunctionPeekaboo Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F441;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f97316;--accent2:#ef4444;--gradient:linear-gradient(135deg,#f97316,#ef4444)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>FunctionPeekaboo</h2>
+<span>LLVM Self-Masking Functions</span>
+</div>
+<a class="home-link" href="../FunctionPeekaboo_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. Memory Scanning &amp; Sleep</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. LLVM Compiler Architecture</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. PE Internals &amp; Sections</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module4.html"><span>4. Registration &amp; X86RetModPass</span><span class="diff d2">d2</span></a>
+<a class="mod-link active" href="module5.html"><span>5. Prologue &amp; Epilogue Stubs</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. The Handler &amp; XOR Engine</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Init &amp; Runtime Flow</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Detection, CET &amp; Nighthawk</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge med">Difficulty: Intermediate</span>
+<h1>Module 5: Prologue &amp; Epilogue Stubs</h1>
+<p class="subtitle">The injected code at function boundaries that enables transparent decrypt-on-call and re-encrypt-on-return.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Understand the exact structure of the prologue and epilogue stubs injected by <code>X86RetModPass</code>: the 0x46-byte prologue with its <code>CALL/POP</code> PIC trick, register preservation, handler invocation, and the epilogue stub that replaces each <code>RET</code> instruction. Learn how these stubs achieve position independence and transparent operation.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. Prologue Stub Overview</h2>
+
+<p>The prologue stub is a 0x46-byte (70-byte) sequence prepended to every registered function. It runs before the function&rsquo;s original code and performs one critical task: <strong>call the handler to decrypt the function body</strong>.</p>
+
+<div class="card">
+<h4>Prologue Stub Layout</h4>
+<pre><span class="lang-tag">Text</span>Function Start (as seen by callers)
++-----------------------------------------------+
+| Bytes 0x00-0x05: CALL/POP PIC trick            |  &larr; Get current RIP
+| Bytes 0x06-0x20: Save registers (push)         |  &larr; Preserve all volatile regs
+| Bytes 0x21-0x30: Save flags (pushfq)           |
+| Bytes 0x31-0x3A: Set up handler args           |  &larr; Pass "decrypt" flag + function ptr
+| Bytes 0x3B-0x3F: CALL handler                  |  &larr; Invoke the shared handler
+| Bytes 0x40-0x44: Restore flags + registers     |  &larr; Restore original state
+| Byte  0x45:      Fall through                  |  &larr; Continue to decrypted function body
++-----------------------------------------------+
+| Original Function Body (now decrypted)         |
++-----------------------------------------------+</pre>
+</div>
+
+<p>The key challenge is that the stub must work regardless of where the function is loaded in memory (ASLR). This is solved with the <strong>CALL/POP trick</strong> for position-independent code (PIC).</p>
+
+<!-- ============================================================ -->
+<h2>2. The CALL/POP PIC Trick</h2>
+
+<p>Position-independent code needs to know its own address at runtime. In x86-64, the standard trick is:</p>
+
+<pre><span class="lang-tag">x86-64 Assembly</span>; CALL/POP trick for position-independent addressing
+prologue_start:
+    call    next_instruction    ; CALL pushes return address (RIP+5) onto stack
+next_instruction:
+    pop     rbx                 ; POP retrieves the address of 'next_instruction'
+    ; Now RBX = address of 'next_instruction' at runtime
+    ; We can calculate any relative offset from here</pre>
+
+<p>The <code>CALL</code> instruction pushes the address of the next instruction onto the stack. The immediately following <code>POP</code> retrieves it into a register. Now the stub knows its own address and can calculate relative offsets to:</p>
+
+<ul>
+<li>The function body start (prologue start + 0x46)</li>
+<li>The handler function (known offset from the stub)</li>
+<li>The <code>.funcmeta</code> section (via PE header walking)</li>
+</ul>
+
+<div class="card green">
+<h4>Why Not LEA with RIP-Relative?</h4>
+<p>x86-64 supports <code>LEA RAX, [RIP + offset]</code> which is also position-independent. However, at the time the stub is emitted (PreEmit phase), the exact distance to the handler may not be finalized (the linker hasn&rsquo;t placed sections yet). The CALL/POP trick works without knowing the absolute distance at compile time &mdash; the handler address can be resolved through PE header traversal at runtime.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Register Preservation in the Prologue</h2>
+
+<p>The prologue must save and restore ALL registers it touches. Under the Microsoft x64 ABI, the function&rsquo;s callers may have placed arguments in RCX, RDX, R8, R9, and on the stack. The prologue must not disturb any of these:</p>
+
+<pre><span class="lang-tag">x86-64 Assembly</span>; Complete prologue stub (simplified)
+prologue:
+    ; === PIC: Get our own address ===
+    call    .Lnext
+.Lnext:
+    pop     rbx                 ; RBX = runtime address of .Lnext
+
+    ; === Save ALL volatile registers ===
+    push    rax
+    push    rcx                 ; Arg 1 (MS x64 ABI)
+    push    rdx                 ; Arg 2
+    push    r8                  ; Arg 3
+    push    r9                  ; Arg 4
+    push    r10
+    push    r11
+    pushfq                      ; Save CPU flags (CF, ZF, SF, OF, etc.)
+
+    ; === Set up handler arguments ===
+    ; RCX = pointer to this function's body (RBX + offset_to_body)
+    lea     rcx, [rbx + BODY_OFFSET]
+    ; RDX = operation flag: 0 = decrypt, 1 = encrypt
+    xor     rdx, rdx            ; 0 = decrypt
+
+    ; === Call the handler ===
+    ; Handler address is resolved via TEB or embedded offset
+    call    handler_address
+
+    ; === Restore ALL registers ===
+    popfq
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rdx
+    pop     rcx
+    pop     rax
+    pop     rbx                 ; Restore RBX used by CALL/POP
+
+    ; === Fall through to function body (now decrypted) ===
+function_body_start:
+    ; Original function instructions begin here</pre>
+
+<div class="card warn">
+<h4>RBX Is Non-Volatile</h4>
+<p>Under the Microsoft x64 calling convention, RBX is a <strong>non-volatile</strong> (callee-saved) register. The prologue saves and restores it explicitly because the CALL/POP trick uses it. The function body (generated by the compiler) also saves/restores RBX if it uses it, so there&rsquo;s no conflict &mdash; the prologue&rsquo;s push/pop of RBX happens before the compiler&rsquo;s own frame setup.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Epilogue Stub Overview</h2>
+
+<p>Every <code>RET</code> instruction in the function is replaced with an epilogue stub. The epilogue performs the inverse of the prologue: it calls the handler to <strong>re-encrypt</strong> the function body, then executes the original return.</p>
+
+<pre><span class="lang-tag">x86-64 Assembly</span>; Epilogue stub (replaces each RET instruction)
+epilogue:
+    ; === Save registers (same set as prologue) ===
+    push    rbx
+    push    rax
+    push    rcx
+    push    rdx
+    push    r8
+    push    r9
+    push    r10
+    push    r11
+    pushfq
+
+    ; === PIC: Get our address ===
+    call    .Lepinext
+.Lepinext:
+    pop     rbx
+
+    ; === Set up handler arguments ===
+    lea     rcx, [rbx - EPILOGUE_TO_BODY_OFFSET]  ; Pointer to function body
+    mov     rdx, 1              ; 1 = encrypt (re-mask)
+
+    ; === Call handler ===
+    call    handler_address
+
+    ; === Restore registers ===
+    popfq
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rdx
+    pop     rcx
+    pop     rax
+    pop     rbx
+
+    ; === Execute the original return ===
+    ret</pre>
+
+<p>The critical difference from the prologue is the operation flag: <code>RDX = 1</code> tells the handler to <strong>encrypt</strong> rather than decrypt.</p>
+
+<!-- ============================================================ -->
+<h2>5. Return Value Preservation</h2>
+
+<p>When a function returns a value, it is placed in <code>RAX</code> (integers/pointers) or <code>XMM0</code> (floating point) per the Microsoft x64 ABI. The epilogue stub must preserve this return value:</p>
+
+<div class="card">
+<h4>RAX Preservation</h4>
+<p>Notice in the epilogue that <code>RAX</code> is pushed before the handler call and popped after. This ensures the return value survives the re-encryption process. The handler itself does not return a meaningful value in RAX (or if it does, it&rsquo;s overwritten by the pop), so the function&rsquo;s return value is correctly passed to the caller.</p>
+</div>
+
+<pre><span class="lang-tag">C++</span>// Example: function returns an int
+__attribute__((annotate("peekaboo")))
+int compute_hash(const char* data) {
+    int hash = 0;
+    // ... compute hash ...
+    return hash;  // hash is in RAX when RET executes
+}
+
+// After instrumentation:
+// 1. Prologue decrypts function body
+// 2. compute_hash runs, puts result in RAX
+// 3. Before RET: epilogue saves RAX, re-encrypts body, restores RAX
+// 4. RET: caller receives correct hash value in RAX</pre>
+
+<!-- ============================================================ -->
+<h2>6. Stack Frame Interaction</h2>
+
+<p>The prologue stub runs <em>before</em> the compiler-generated stack frame setup (the standard <code>push rbp; mov rbp, rsp; sub rsp, N</code> sequence). The epilogue stub runs <em>after</em> the compiler-generated frame teardown but <em>before</em> the actual <code>RET</code>:</p>
+
+<pre><span class="lang-tag">Text</span>Execution order:
+
+CALL from caller
+  |
+  v
+[Prologue Stub]          &larr; Decrypt function
+  |
+  v
+[Compiler Frame Setup]   &larr; push rbp; mov rbp, rsp; sub rsp, ...
+  |
+  v
+[Function Body]          &larr; Original code
+  |
+  v
+[Compiler Frame Teardown] &larr; add rsp; pop rbp
+  |
+  v
+[Epilogue Stub]          &larr; Re-encrypt function
+  |
+  v
+[RET]                    &larr; Return to caller</pre>
+
+<p>This ordering is important because the prologue stub&rsquo;s register pushes are balanced by its own pops before the compiler&rsquo;s frame setup. The stack is in the exact state the compiler expects when the frame setup code runs.</p>
+
+<!-- ============================================================ -->
+<h2>7. Recursive and Reentrant Calls</h2>
+
+<p>What happens if a peekaboo function calls another peekaboo function? Or calls itself recursively? The handler must handle these cases correctly:</p>
+
+<div class="card">
+<h4>Reentrancy Scenario</h4>
+<pre><span class="lang-tag">Text</span>func_A (peekaboo) calls func_B (peekaboo):
+
+1. func_A prologue: decrypt func_A body
+2. func_A executes, calls func_B
+3. func_B prologue: decrypt func_B body
+   (func_A is still decrypted - it's on the call stack)
+4. func_B executes
+5. func_B epilogue: re-encrypt func_B body
+6. Return to func_A (still decrypted, continues executing)
+7. func_A epilogue: re-encrypt func_A body</pre>
+</div>
+
+<p>The handler uses the <strong>TEB UserReserved fields</strong> (discussed in Module 6) to track the currently active function. When func_B&rsquo;s prologue runs, it sees that func_A is already decrypted and handles the nesting correctly by maintaining a reference counter or stack of active functions.</p>
+
+<div class="card warn">
+<h4>The Two-Decrypted Problem</h4>
+<p>In the scenario above, between steps 3 and 5, <em>both</em> func_A and func_B are decrypted simultaneously. This is unavoidable &mdash; func_A&rsquo;s code is on the call stack and will be needed when func_B returns. This means the &ldquo;at most one function decrypted&rdquo; guarantee is actually &ldquo;at most one function decrypted <em>per call chain depth</em>.&rdquo; In practice, the call depth is small relative to the total number of registered functions, so ~98% coverage still holds.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Stub Size and Performance Impact</h2>
+
+<table>
+<tr><th>Component</th><th>Size</th><th>Performance Impact</th></tr>
+<tr><td><strong>Prologue stub</strong></td><td>~0x46 bytes (70 bytes)</td><td>~50-100ns per function call (register saves + handler call)</td></tr>
+<tr><td><strong>Epilogue stub</strong></td><td>~0x40 bytes (64 bytes) per return point</td><td>~50-100ns per function return</td></tr>
+<tr><td><strong>Handler execution</strong></td><td>N/A (shared code)</td><td>~1-10&mu;s per invocation (XOR loop + VirtualProtect calls)</td></tr>
+<tr><td><strong>Total per call</strong></td><td>&mdash;</td><td>~2-20&mu;s (prologue + epilogue + two handler calls)</td></tr>
+</table>
+
+<p>The overhead is dominated by the <code>VirtualProtect</code> system calls within the handler (Module 6). The XOR operation itself is extremely fast. For functions called infrequently (C2 check-in, command dispatch, credential handling), this overhead is negligible. For hot-loop functions called millions of times, it would be significant &mdash; which is why the attribute-based opt-in approach lets developers exclude performance-critical functions.</p>
+
+<!-- ============================================================ -->
+<h2>9. Position Independence Verification</h2>
+
+<p>The stubs must work correctly regardless of ASLR (Address Space Layout Randomization). To verify position independence, examine every memory reference in the stubs:</p>
+
+<div class="card green">
+<h4>PIC Checklist</h4>
+<ul>
+<li><strong>No absolute addresses</strong> &mdash; all addresses derived from CALL/POP at runtime</li>
+<li><strong>No relocations needed</strong> &mdash; the stub bytes are the same regardless of load address</li>
+<li><strong>Handler address</strong> &mdash; resolved via PE header traversal or TEB field, not hard-coded</li>
+<li><strong>Function body offset</strong> &mdash; known at compile time as a relative offset from the stub (constant 0x46)</li>
+<li><strong>Stack references</strong> &mdash; all via RSP-relative addressing (inherently position-independent)</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz">
+<h2>Knowledge Check</h2>
+
+<div class="quiz-q" data-answer="B">
+<p>Q1: What is the purpose of the CALL/POP trick in the prologue stub?</p>
+<div class="quiz-btn" data-choice="A">A) To call the handler function directly</div>
+<div class="quiz-btn" data-choice="B">B) To obtain the stub's own runtime address for position-independent addressing</div>
+<div class="quiz-btn" data-choice="C">C) To pop the return address and prevent stack traces</div>
+<div class="quiz-btn" data-choice="D">D) To encrypt the function body inline</div>
+</div>
+
+<div class="quiz-q" data-answer="D">
+<p>Q2: What is the key difference between the prologue and epilogue handler calls?</p>
+<div class="quiz-btn" data-choice="A">A) The epilogue uses a different handler function</div>
+<div class="quiz-btn" data-choice="B">B) The prologue saves more registers than the epilogue</div>
+<div class="quiz-btn" data-choice="C">C) The epilogue does not need PIC addressing</div>
+<div class="quiz-btn" data-choice="D">D) The prologue passes flag 0 (decrypt), the epilogue passes flag 1 (encrypt)</div>
+</div>
+
+<div class="quiz-q" data-answer="C">
+<p>Q3: In a call chain where peekaboo func_A calls peekaboo func_B, how many functions are decrypted simultaneously?</p>
+<div class="quiz-btn" data-choice="A">A) Zero &mdash; the handler prevents this</div>
+<div class="quiz-btn" data-choice="B">B) One &mdash; func_A is re-encrypted when func_B starts</div>
+<div class="quiz-btn" data-choice="C">C) Two &mdash; both must be decrypted because func_A is still on the call stack</div>
+<div class="quiz-btn" data-choice="D">D) All registered functions are decrypted when any function runs</div>
+</div>
+</div>
+
+<div class="nav-btns">
+<a href="module4.html">&larr; Previous: Registration &amp; X86RetModPass</a>
+<a class="primary" href="module6.html">Next: The Handler &amp; XOR Engine &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>
