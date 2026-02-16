@@ -98,7 +98,7 @@
 
 <h3>3.2 Zilean</h3>
 
-<p>Zilean extends the Ekko concept by using <strong>APC (Asynchronous Procedure Call) queuing</strong> instead of timer callbacks. The advantage is that APCs can be queued to the implant&rsquo;s own thread in an alertable wait state, giving tighter control over execution ordering.</p>
+<p>Zilean extends the Ekko concept by using <strong><code>RtlRegisterWait</code></strong> instead of timer callbacks. This API registers a callback to execute when a specified wait handle is signaled or a timeout occurs, providing another mechanism to schedule the encrypt-sleep-decrypt chain without using the timer queue.</p>
 
 <h3>3.3 FOLIAGE (by Austin Hudson)</h3>
 
@@ -106,7 +106,7 @@
 
 <div class="card green">
 <h4>What They All Share</h4>
-<p>All three techniques follow the same fundamental pattern: (1) change memory permissions to writable, (2) encrypt everything, (3) sleep, (4) decrypt everything, (5) restore execute permissions. The differences are in the <em>mechanism</em> used to schedule these steps (timers vs APCs vs context manipulation), not in the <em>strategy</em> itself.</p>
+<p>All three techniques follow the same fundamental pattern: (1) change memory permissions to writable, (2) encrypt everything, (3) sleep, (4) decrypt everything, (5) restore execute permissions. The differences are in the <em>mechanism</em> used to schedule these steps (timer callbacks vs wait registration vs APC queuing with context manipulation), not in the <em>strategy</em> itself.</p>
 </div>
 
 <!-- ============================================================ -->
