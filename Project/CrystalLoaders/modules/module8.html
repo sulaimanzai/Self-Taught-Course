@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 8: Extending Crystal-Loaders - Crystal-Loaders Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F48E;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f43f5e;--accent2:#fb923c;--gradient:linear-gradient(135deg,#f43f5e,#fb923c)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Crystal-Loaders</h2>
+<span>PIC Reflective Loaders</span>
+</div>
+<a class="home-link" href="../CrystalLoaders_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. The Reflective Loader Problem</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. Crystal Palace &mdash; The PIC Linker</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. LibTCG &mdash; The Tradecraft Garden</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module4.html"><span>4. LibGate &mdash; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. The UDRL Loader Walkthrough</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. Beacon User Data (BUD)</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Post-Ex UDRL &amp; Aggressor</span><span class="diff d3">d3</span></a>
+<a class="mod-link active" href="module8.html"><span>8. Extending Crystal-Loaders</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 8: Extending Crystal-Loaders</h1>
+<p class="subtitle">The adaptation guide &mdash; module stomping, sleep mask integration, call stack spoofing, IAT hooking PICOs, guardrailed loaders, custom DFR resolvers, and porting the architecture beyond Cobalt Strike.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Crystal-Loaders is a <strong>proof of concept</strong>. As rasta-mouse stated, it demonstrates the BUD contract and Crystal Palace integration &mdash; not a production-ready implant. This module maps the extension points that Crystal-Loaders deliberately leaves open. By the end, you will understand seven concrete extension paths, the data structures each one touches, and the detection trade-offs each extension addresses.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. What Crystal-Loaders Leaves on the Table</h2>
+
+<p>Crystal-Loaders is deliberately minimal. It proves the spec-driven PIC architecture works, but it ships without several capabilities that a production-grade loader would need. Each omission is an extension opportunity:</p>
+
+<table>
+<thead>
+<tr><th>Capability</th><th>Current Status</th><th>Extension Opportunity</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Module stomping / overloading</strong></td><td>Uses <code>VirtualAlloc</code> &rarr; private commit</td><td>File-backed MEM_IMAGE memory</td></tr>
+<tr><td><strong>Sleep mask</strong></td><td>BUD tracking is set up but no sleep mask PIC is included</td><td>BUD-aware encrypt/decrypt cycle</td></tr>
+<tr><td><strong>Call stack spoofing</strong></td><td>Not implemented</td><td>Draugr / ThreadStackSpoofer integration</td></tr>
+<tr><td><strong>IAT hooking PICO</strong></td><td>No post-exploitation API interception</td><td>Hook loaded DLL IATs via Crystal Palace PICO</td></tr>
+<tr><td><strong>Guardrailing</strong></td><td>Environment-locked decryption not included</td><td>Payload only decrypts on the correct target</td></tr>
+<tr><td><strong>Custom DFR resolvers</strong></td><td>Default ROR13 + string resolution</td><td>Alternative hash algorithms, LdrLoadDll fallback</td></tr>
+<tr><td><strong>ETW / AMSI bypass</strong></td><td>Not addressed</td><td>Patch or unhook telemetry providers</td></tr>
+<tr><td><strong>PE header cleanup</strong></td><td>Beacon PE headers persist after load</td><td>Zero headers post-load to evade memory scanners</td></tr>
+</tbody>
+</table>
+
+<p>The rest of this module walks through seven of these extensions in detail, showing what structures to modify, what code to change, and what detection vectors each extension addresses.</p>
+
+<!-- ============================================================ -->
+<h2>2. Extension 1 &mdash; Module Stomping</h2>
+
+<p>The single biggest detection surface in Crystal-Loaders today is that Beacon lives in <strong>private-commit executable memory</strong> allocated via <code>VirtualAlloc</code>. Tools like Moneta and pe-sieve specifically scan for <code>MEM_PRIVATE + PAGE_EXECUTE*</code> regions. Module stomping (also called module overloading) eliminates this by placing Beacon in <strong>file-backed MEM_IMAGE memory</strong>.</p>
+
+<h3>The Concept</h3>
+
+<div class="diagram">
+<h4>Module Stomping Flow</h4>
+<div class="flow">
+<div class="box">Find sacrificial<br>DLL on disk</div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">NtCreateSection<br><small>SEC_IMAGE flag</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">NtMapViewOfSection<br><small>&rarr; MEM_IMAGE</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box y">Overwrite sections<br><small>with Beacon</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Beacon in<br>file-backed memory</div>
+</div>
+</div>
+
+<ol>
+<li>Instead of <code>VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE)</code>, load a legitimate but unused DLL from disk.</li>
+<li>Use <code>NtCreateSection</code> with the <code>SEC_IMAGE</code> flag to create a file-backed section object.</li>
+<li>Map it into the process with <code>NtMapViewOfSection</code>.</li>
+<li>Overwrite the legitimate DLL's sections with Beacon's sections.</li>
+<li>The result: Beacon lives in <strong>MEM_IMAGE</strong> (file-backed) memory, defeating Moneta and pe-sieve's private-commit detection.</li>
+</ol>
+
+<h3>Code Changes to go()</h3>
+
+<pre><code><span class="lang-tag">C (Conceptual Diff)</span>// Before (current Crystal-Loaders)
+PBYTE dst = KERNEL32$VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+// After (module stomping)
+// 1. Find a suitable sacrificial DLL (not loaded, large enough)
+// 2. NtCreateSection with SEC_IMAGE
+// 3. NtMapViewOfSection
+// 4. Copy sections over the mapped DLL</code></pre>
+
+<h3>Updating ALLOCATED_MEMORY</h3>
+
+<p>The BUD <code>ALLOCATED_MEMORY</code> structure tracks how each region was allocated. When switching to module stomping, you must update the allocation method so the sleep mask and other BUD consumers know they are dealing with file-backed memory:</p>
+
+<pre><code><span class="lang-tag">C</span>// Use METHOD_MODULESTOMP instead of METHOD_VIRTUALALLOC
+region->Method = METHOD_MODULESTOMP;
+// or METHOD_NTMAPVIEW if using NtMapViewOfSection directly</code></pre>
+
+<h3>The MODULESTOMP_INFO Structure</h3>
+
+<p>Beacon's <code>beacon.h</code> defines a structure for tracking module-stomped allocations:</p>
+
+<pre><code><span class="lang-tag">C (beacon.h)</span>typedef struct {
+    DWORD              Unknown;
+    DWORD              SizeOfHeaders;
+    PIMAGE_DOS_HEADER  DosHeader;
+} MODULESTOMP_INFO;</code></pre>
+
+<p>This structure lets BUD consumers (especially the sleep mask) know that the region is file-backed and provides the original DOS header pointer for cleanup or restoration. The <code>SizeOfHeaders</code> field tells the sleep mask how much of the initial region is header data versus payload sections.</p>
+
+<div class="card warn">
+<h4>Sacrificial DLL Selection</h4>
+<p>The sacrificial DLL must meet two criteria: it must <strong>not already be loaded</strong> in the process (to avoid conflicts), and it must be <strong>large enough</strong> to contain the Beacon payload. Common choices include DLLs in <code>C:\Windows\System32</code> that are large but rarely loaded, such as <code>xpsservices.dll</code> or <code>dbghelp.dll</code>. Choosing a DLL whose <code>SizeOfImage</code> closely matches Beacon's size reduces the amount of unused mapped memory, which itself can be a detection heuristic.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Extension 2 &mdash; Sleep Mask Integration</h2>
+
+<p>Crystal-Loaders populates the <code>ALLOCATED_MEMORY</code> structure with section-level tracking, but it does not include a sleep mask. A sleep mask PIC would use this BUD data to encrypt Beacon's memory sections during sleep and decrypt them before the next check-in.</p>
+
+<h3>The Sleep Mask Cycle</h3>
+
+<div class="diagram">
+<h4>BUD-Aware Sleep Mask Flow</h4>
+<div class="flow" style="flex-direction:column;gap:4px;align-items:stretch;max-width:680px;margin:0 auto">
+<div class="box" style="width:100%"><strong>1.</strong> Read <code>ALLOCATED_MEMORY</code> from BUD &mdash; enumerate all tracked regions and sections</div>
+<div class="box hl" style="width:100%"><strong>2.</strong> For each section where <code>MaskSection == TRUE</code>: change permissions to RW via <code>NtProtectVirtualMemory</code></div>
+<div class="box y" style="width:100%"><strong>3.</strong> Encrypt section contents (XOR, RC4, or <code>SystemFunction032</code>)</div>
+<div class="box" style="width:100%"><strong>4.</strong> Set up a sleep timer (<code>CreateTimerQueueTimer</code> or waitable timer)</div>
+<div class="box y" style="width:100%"><strong>5.</strong> After sleep: decrypt section contents</div>
+<div class="box g" style="width:100%"><strong>6.</strong> Restore original permissions (RX for code, R for read-only data)</div>
+</div>
+</div>
+
+<h3>Conceptual Implementation Using BUD</h3>
+
+<pre><code><span class="lang-tag">C (Sleep Mask - BUD Integration)</span>// Conceptual sleep mask flow using BUD's ALLOCATED_MEMORY
+for (int r = 0; r < 6; r++) {
+    ALLOCATED_MEMORY_REGION * region = &bud->allocatedMemory->AllocatedMemoryRegions[r];
+    if (region->Purpose == PURPOSE_EMPTY) continue;
+
+    for (int s = 0; s < 8; s++) {
+        ALLOCATED_MEMORY_SECTION * sec = &region->Sections[s];
+        if (!sec->MaskSection || sec->VirtualSize == 0) continue;
+
+        // Change to RW so we can encrypt in place
+        DWORD oldProtect;
+        NtProtectVirtualMemory(
+            NtCurrentProcess(),
+            &sec->BaseAddress,
+            &sec->VirtualSize,
+            PAGE_READWRITE,
+            &oldProtect
+        );
+
+        // Encrypt the section contents
+        xor_encrypt(sec->BaseAddress, sec->VirtualSize, key);
+    }
+}</code></pre>
+
+<h3>The Ekko-Style Timer Queue Pattern</h3>
+
+<p>The Ekko sleep obfuscation technique uses <code>CreateTimerQueueTimer</code> to queue ROP-style callbacks that change memory permissions, encrypt, sleep, decrypt, and restore &mdash; all without the Beacon thread being active during the sleep window. Adapting Ekko for BUD means replacing Ekko's hardcoded memory ranges with the <code>ALLOCATED_MEMORY</code> regions tracked by BUD.</p>
+
+<div class="card green">
+<h4>Why BUD Makes This Easier</h4>
+<p>Without BUD, a sleep mask must discover Beacon's memory layout at runtime &mdash; scanning the VAD, searching for PE headers, or using hardcoded offsets. BUD provides the <strong>exact base address, size, and permissions of every section</strong> in a structured array. The sleep mask just iterates the array. This is the design intent behind <code>ALLOCATED_MEMORY</code> &mdash; it is the contract between the loader and the sleep mask.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Extension 3 &mdash; Call Stack Spoofing</h2>
+
+<p>Even with LibGate's indirect syscalls routing execution through ntdll, the return stack still reveals that the <strong>calling code</strong> lives in private memory. A full call stack walk shows:</p>
+
+<pre><code><span class="lang-tag">Call Stack (Anomalous)</span>ntdll!NtAllocateVirtualMemory       (syscall;ret gadget)
+  &rarr; returns to 0x00007FF6`1A3C0842   &larr; loader PIC blob (PRIVATE memory!)
+  &rarr; returns to 0x00007FF6`1A3C0210   &larr; still in PIC blob
+  &rarr; ...</code></pre>
+
+<p>The return addresses in private memory are the anomaly. EDR stack walkers flag any frame that falls outside a file-backed module.</p>
+
+<h3>The Draugr Approach</h3>
+
+<p>The Draugr technique (covered in a separate course) creates <strong>synthetic stack frames</strong> that make the call stack look like it originates from legitimate system code. It uses <code>JMP [RBX]</code> gadget chaining with fake <code>RUNTIME_FUNCTION</code> and <code>UNWIND_INFO</code> structures so that the Windows unwinder produces a clean, believable stack trace.</p>
+
+<h3>The ThreadStackSpoofer Approach</h3>
+
+<p>A simpler alternative: before entering sleep, <strong>overwrite the return addresses</strong> on the current thread's stack with pointers into legitimate modules. On wake, restore the real return addresses. This defeats point-in-time stack scans during the sleep window.</p>
+
+<h3>Integration via Crystal Palace PICO</h3>
+
+<p>Crystal Kit demonstrated call stack spoofing as a <strong>PICO merged via Crystal Palace</strong>. The integration approach:</p>
+
+<div class="diagram">
+<h4>Call Stack Spoofing PICO Integration</h4>
+<div class="flow" style="flex-direction:column;gap:4px;align-items:stretch;max-width:680px;margin:0 auto">
+<div class="box" style="width:100%"><strong>1.</strong> Build the call stack spoofing logic as a standalone PIC object (PICO)</div>
+<div class="box hl" style="width:100%"><strong>2.</strong> Add it to the Crystal Palace spec via the <code>mergelib</code> directive</div>
+<div class="box" style="width:100%"><strong>3.</strong> The PICO intercepts API calls and wraps them with synthetic stack frames</div>
+<div class="box g" style="width:100%"><strong>4.</strong> All outbound syscalls now show a legitimate call stack</div>
+</div>
+</div>
+
+<div class="card">
+<h4>Why This Is a PICO and Not Part of the Loader</h4>
+<p>Call stack spoofing is orthogonal to the loading process. It applies to <strong>every API call Beacon makes after loading</strong>, not just the loading phase. By packaging it as a PICO merged via <code>mergelib</code>, the spoofing logic is composable &mdash; you can include it or omit it per-spec without modifying the loader code itself.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Extension 4 &mdash; IAT Hooking PICO</h2>
+
+<p>Crystal Kit's most sophisticated extension was an IAT hooking PICO that intercepts specific API calls made by Beacon's loaded dependencies. This operates during and after the <code>ProcessImports</code> phase of LibTCG.</p>
+
+<h3>How It Works</h3>
+
+<ol>
+<li>During <code>LoadDLL</code> / <code>ProcessImports</code>, the PICO hooks the loaded DLL's IAT entries by replacing function pointers with addresses inside the PIC blob.</li>
+<li>The PIC blob intercepts the call, adds evasion (call stack spoofing, argument sanitization), and then forwards to the real API.</li>
+<li>The hooking is invisible to Beacon &mdash; it calls APIs normally through its IAT, unaware that they are being intercepted.</li>
+</ol>
+
+<h3>Key Hook Targets</h3>
+
+<table>
+<thead>
+<tr><th>Target API</th><th>Beacon Commands Affected</th><th>Evasion Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>CreateProcessA/W</code></td><td><code>shell</code>, <code>run</code>, <code>powerpick</code></td><td>Wrap with call stack spoofing for child process creation</td></tr>
+<tr><td><code>LoadLibraryA/W</code></td><td>CLR/PowerShell commands</td><td>Intercept loads of <code>clr.dll</code>, <code>System.Management.Automation.dll</code></td></tr>
+</tbody>
+</table>
+
+<p>The <code>LoadLibraryA/W</code> hook is particularly important. When Beacon executes <code>powerpick</code> or <code>execute-assembly</code>, Windows loads the CLR and PowerShell automation DLLs. EDR products monitor for these loads (via <code>PsSetLoadImageNotifyRoutine</code>) as they strongly indicate offensive tooling. An IAT hook can intercept these loads and apply additional obfuscation or timing manipulation.</p>
+
+<div class="card warn">
+<h4>Complexity Warning</h4>
+<p>IAT hooking PICOs are the most complex extension on this list. The PIC blob must maintain its own trampolines for every hooked function, handle calling convention preservation, and ensure thread safety. Incorrect hooking can crash the Beacon process or produce unpredictable behavior. This is an advanced technique that requires deep understanding of x64 calling conventions and IAT structure.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Extension 5 &mdash; Guardrailed Loaders</h2>
+
+<p>Guardrailing ensures that a captured payload is useless outside the target environment. Crystal-Loaders includes a reference to this concept via its <code>simple_rdll_guardrail</code> example, but does not implement it in the main loader. The full guardrail pattern works as follows:</p>
+
+<h3>The Guardrail Flow</h3>
+
+<div class="diagram">
+<h4>Environment-Locked Payload Decryption</h4>
+<div class="flow" style="flex-direction:column;gap:4px;align-items:stretch;max-width:680px;margin:0 auto">
+<div class="box hl" style="width:100%"><strong>Link Time:</strong> Derive a key from target environment properties (hostname, domain, username hash)</div>
+<div class="box hl" style="width:100%"><strong>Link Time:</strong> Encrypt the Beacon DLL with this derived key</div>
+<div class="box y" style="width:100%"><strong>Runtime:</strong> Re-derive the key from the current environment</div>
+<div class="box g" style="width:100%"><strong>Match:</strong> Key matches &rarr; Beacon decrypts correctly and runs</div>
+<div class="box r" style="width:100%"><strong>Mismatch:</strong> Wrong environment &rarr; garbage output, no valid PE, no IOCs</div>
+</div>
+</div>
+
+<h3>Conceptual Implementation</h3>
+
+<pre><code><span class="lang-tag">C (Link Time - Operator Workstation)</span>// Generate environment-derived encryption key
+BYTE envKey[16];
+DeriveKey(targetHostname, targetDomain, envKey);
+EncryptBeacon(beacon, envKey);</code></pre>
+
+<pre><code><span class="lang-tag">C (Runtime - Target Host)</span>// Re-derive the key from the current environment
+BYTE runtimeKey[16];
+DeriveKey(GetComputerName(), GetDomainName(), runtimeKey);
+
+// Attempt decryption
+DecryptBeacon(encrypted, runtimeKey);
+
+// If wrong environment: DecryptBeacon produces garbage
+// No valid PE signature &rarr; ParseDLL fails &rarr; loader exits cleanly
+// No crash, no IOCs, no Beacon artifacts for blue team to analyze</code></pre>
+
+<div class="card green">
+<h4>Blue Team Impact</h4>
+<p>The critical benefit of guardrailing is not that it prevents execution &mdash; it prevents <strong>analysis</strong>. When a blue team captures a guardrailed payload and attempts to detonate it in a sandbox or reverse-engineer it on an analyst workstation, they get garbage. The Beacon DLL never materializes. There are no strings to extract, no configuration to decode, no C2 addresses to block. The payload is forensically inert outside the target environment.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Extension 6 &mdash; Custom DFR Resolvers</h2>
+
+<p>Crystal Palace's Dynamic Function Resolution system supports multiple resolver strategies. The spec file controls which strategy applies to which modules. The default Crystal-Loaders configuration uses ROR13 hashing, but the DFR system is designed to be customizable.</p>
+
+<h3>The Dual-Resolver Pattern</h3>
+
+<p>From rasta-mouse's "Arranging the PIC Parterre" blog post, the recommended pattern uses two resolvers:</p>
+
+<pre><code><span class="lang-tag">Crystal Palace Spec</span>dfr "resolve_explicit" "ror13" "KERNEL32, NTDLL"
+dfr "resolve_default" "strings"</code></pre>
+
+<table>
+<thead>
+<tr><th>Resolver</th><th>Behavior</th><th>Use Case</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>resolve_explicit</strong></td><td>Only walks already-loaded modules (EAT parsing). Never calls <code>LoadLibrary</code>.</td><td>KERNEL32 and NTDLL &mdash; guaranteed to be loaded in every process</td></tr>
+<tr><td><strong>resolve_default</strong></td><td>Falls back to <code>LoadLibraryA</code> for modules not yet loaded.</td><td>All other DLLs that Beacon might need at runtime</td></tr>
+</tbody>
+</table>
+
+<h3>Advanced Resolver Modifications</h3>
+
+<ul>
+<li><strong>Substitute LdrLoadDll for LoadLibraryA:</strong> <code>LoadLibraryA</code> (kernel32) is commonly hooked by EDRs. Calling <code>LdrLoadDll</code> (ntdll) directly bypasses kernel32 hooks while achieving the same result.</li>
+<li><strong>Custom hash algorithms:</strong> Replace ROR13 with CRC32, djb2, or a unique hash to avoid YARA rules that signature the ROR13 constant (<code>0x3CFA685D</code> for <code>NTDLL_HASH</code>).</li>
+<li><strong>Proxy through threadpool:</strong> Route API calls through <code>TpAllocWork</code> / <code>TpPostWork</code> / <code>TpReleaseWork</code> threadpool work items. The call stack then shows the Windows threadpool infrastructure rather than direct calls from the PIC blob.</li>
+</ul>
+
+<div class="card">
+<h4>Resolver Security Trade-Off</h4>
+<p>The <strong>explicit</strong> resolver is stealthier because it never triggers a <code>PsSetLoadImageNotifyRoutine</code> callback &mdash; it only reads modules already in the PEB. The <strong>default</strong> (LoadLibrary-based) resolver is more flexible but generates image load events that EDRs monitor. A well-designed loader uses explicit resolution for everything it can and only falls back to default for genuinely unloaded dependencies.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Extension 7 &mdash; Porting Beyond Cobalt Strike</h2>
+
+<p>Crystal Palace and the PIC architecture are <strong>not Cobalt Strike-specific</strong>. The core value &mdash; spec-driven PIC generation, LibTCG PE loading, LibGate indirect syscalls, DFR &mdash; is C2-framework agnostic. The Cobalt Strike coupling comes from only a few interfaces.</p>
+
+<h3>What You Would Need to Change</h3>
+
+<table>
+<thead>
+<tr><th>CS-Specific Component</th><th>What to Remove / Replace</th></tr>
+</thead>
+<tbody>
+<tr><td><code>beacon.h</code> BUD structures</td><td>Create equivalent data-passing structures for your C2, or remove BUD entirely if not needed</td></tr>
+<tr><td>Three <code>DllMain</code> call protocol</td><td>Remove the <code>DLL_BEACON_USER_DATA</code>, <code>DLL_PROCESS_ATTACH</code>, <code>DLL_BEACON_START</code> sequence</td></tr>
+<tr><td>Aggressor <code>.cna</code> hooks</td><td>Replace with your C2's operator scripting interface (if any)</td></tr>
+<tr><td>Post-Ex UDRL references</td><td>Adapt or remove post-exploitation loader if your C2 does not use child payload loading</td></tr>
+</tbody>
+</table>
+
+<h3>Potential Targets</h3>
+
+<ul>
+<li><strong>Mythic agents</strong> &mdash; Mythic's payload generation is already modular; Crystal Palace PIC output can be wrapped in a Mythic payload type</li>
+<li><strong>Sliver implants</strong> &mdash; Sliver uses shellcode stagers; the PIC blob can serve as the shellcode payload</li>
+<li><strong>Havoc agents</strong> &mdash; Havoc's Demon agent uses UDRL-style loading that maps directly to Crystal Palace concepts</li>
+<li><strong>Custom C2 frameworks</strong> &mdash; Any framework that accepts shellcode or reflective DLL input</li>
+<li><strong>Standalone shellcode runners</strong> &mdash; Use the PIC blob as a generic payload without any C2 framework</li>
+</ul>
+
+<h3>A Minimal Generic Loader</h3>
+
+<p>Stripped of all Cobalt Strike specifics, a Crystal Palace loader reduces to this core:</p>
+
+<pre><code><span class="lang-tag">C (Generic Loader)</span>void go(void)
+{
+    // Get the embedded DLL and XOR key from the PIC's resource section
+    PRESOURCE dll = GETRESOURCE(_DLL_);
+    PRESOURCE key = GETRESOURCE(_KEY_);
+
+    // XOR unmask the embedded payload
+    PBYTE buf = VirtualAlloc(NULL, dll->length, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    for (DWORD i = 0; i < dll->length; i++)
+        buf[i] = dll->data[i] ^ key->data[i % key->length];
+
+    // Parse and load the DLL using LibTCG
+    DLLDATA dlldata;
+    ParseDLL(buf, &dlldata);
+    PBYTE dst = VirtualAlloc(NULL, SizeOfDLL(&dlldata), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    LoadDLL(&dlldata, dst);
+    ProcessImports(&dlldata, dst);
+    FixSectionPermissions(&dlldata, dst);
+
+    // Simple: just call DllMain directly
+    DLLMAIN_FUNC entry = (DLLMAIN_FUNC)EntryPoint(&dlldata, dst);
+    VirtualFree(buf, 0, MEM_RELEASE);
+    entry(dst, DLL_PROCESS_ATTACH, NULL);
+}</code></pre>
+
+<p>This is the entire loading pipeline without BUD, without the three-call protocol, and without Aggressor integration. LibTCG, LibGate, and DFR all still function &mdash; only the Cobalt Strike handshake is removed. You can then add back whatever data-passing contract your C2 agent expects.</p>
+
+<div class="card highlight">
+<h4>The Core Portable Components</h4>
+<table>
+<tr><th>Component</th><th>Function</th><th>CS Dependency</th></tr>
+<tr><td><strong>Crystal Palace linker</strong></td><td>Compiles COFF &rarr; PIC shellcode</td><td style="color:var(--green)">None</td></tr>
+<tr><td><strong>LibTCG</strong></td><td>PE parsing, loading, imports, relocations</td><td style="color:var(--green)">None</td></tr>
+<tr><td><strong>LibGate</strong></td><td>Indirect syscall execution</td><td style="color:var(--green)">None</td></tr>
+<tr><td><strong>DFR</strong></td><td>Dynamic function resolution at link time</td><td style="color:var(--green)">None</td></tr>
+<tr><td><strong>mergelib / PICOs</strong></td><td>Composable PIC module merging</td><td style="color:var(--green)">None</td></tr>
+<tr><td><strong>BUD</strong></td><td>Loader &rarr; agent data contract</td><td style="color:var(--red)">CS-specific structures</td></tr>
+<tr><td><strong>Three-call DllMain</strong></td><td>Agent initialization protocol</td><td style="color:var(--red)">CS-specific protocol</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Detection &amp; OPSEC Considerations</h2>
+
+<p>This table summarizes the detection posture of Crystal-Loaders in its current PoC state versus what becomes possible with the extensions described in this module:</p>
+
+<table>
+<thead>
+<tr><th>Detection Vector</th><th>Current Crystal-Loaders</th><th>With Extensions</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Private-commit executable memory</strong></td><td style="color:var(--red)">Vulnerable &mdash; uses VirtualAlloc</td><td style="color:var(--green)">Module stomping &rarr; file-backed MEM_IMAGE</td></tr>
+<tr><td><strong>PE headers in memory</strong></td><td>Minimal &mdash; PIC blob has no PE headers, but loaded Beacon does</td><td style="color:var(--green)">Header erasure post-load</td></tr>
+<tr><td><strong>RWX memory</strong></td><td style="color:var(--green)">Avoids &mdash; uses RW then RX per section</td><td style="color:var(--green)">Same</td></tr>
+<tr><td><strong>Return address in private memory</strong></td><td style="color:#fb923c">LibGate indirect syscalls help (ntdll frame present)</td><td style="color:var(--green)">Call stack spoofing eliminates anomalous frames</td></tr>
+<tr><td><strong>YARA on ROR13 constants</strong></td><td style="color:var(--red)">NTDLL_HASH (0x3CFA685D) visible in PIC</td><td style="color:var(--green)">Custom hash algorithm obfuscates constants</td></tr>
+<tr><td><strong>ETW syscall telemetry</strong></td><td>Kernel-level &mdash; cannot bypass from userland</td><td>N/A &mdash; kernel telemetry remains</td></tr>
+<tr><td><strong>Behavioral analysis</strong></td><td style="color:var(--red)">VirtualAlloc + VirtualProtect patterns</td><td style="color:var(--green)">Module stomping changes the pattern entirely</td></tr>
+<tr><td><strong>Sleep mask detection</strong></td><td style="color:var(--red)">No sleep mask included</td><td style="color:var(--green)">BUD-aware sleep mask encrypts during sleep</td></tr>
+<tr><td><strong>CLR / PowerShell image loads</strong></td><td style="color:var(--red)">Not addressed</td><td style="color:#fb923c">IAT hooking PICO can intercept and obfuscate</td></tr>
+</tbody>
+</table>
+
+<div class="card warn">
+<h4>No Silver Bullet</h4>
+<p>Even with every extension implemented, certain detection vectors remain. Kernel-level ETW telemetry sees every syscall regardless of how it is invoked. Behavioral analysis can correlate process creation patterns, network traffic, and named pipe usage. Memory scanners are evolving to detect module stomping by comparing mapped sections against the on-disk DLL. The goal of these extensions is not to achieve permanent invisibility &mdash; it is to raise the cost of detection high enough that automated tools miss the implant, forcing defenders into expensive manual analysis.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. Module Summary</h2>
+
+<div class="card highlight">
+<h4>Key Takeaways</h4>
+<ul>
+<li><strong>Crystal-Loaders is a PoC</strong>, not a production loader. Its value is demonstrating the architecture, not shipping a finished product.</li>
+<li><strong>Module stomping</strong> replaces VirtualAlloc with file-backed MEM_IMAGE memory, eliminating the single biggest detection surface.</li>
+<li><strong>Sleep mask integration</strong> leverages BUD's <code>ALLOCATED_MEMORY</code> to encrypt Beacon sections during sleep without runtime memory discovery.</li>
+<li><strong>Call stack spoofing</strong> (Draugr/ThreadStackSpoofer) eliminates anomalous return addresses in private memory, packaged as a composable PICO.</li>
+<li><strong>IAT hooking PICOs</strong> intercept Beacon API calls to add per-call evasion (stack spoofing, CLR load interception).</li>
+<li><strong>Guardrailing</strong> ensures captured payloads are forensically inert outside the target environment.</li>
+<li><strong>Custom DFR resolvers</strong> let you swap hash algorithms, avoid LoadLibrary hooks, and proxy through threadpool infrastructure.</li>
+<li><strong>Porting beyond Cobalt Strike</strong> requires removing only BUD and the three-call DllMain protocol. The core PIC architecture (Crystal Palace, LibTCG, LibGate, DFR) is C2-agnostic.</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz" id="quiz1">
+<h4>Module 8 Quiz: Extending Crystal-Loaders</h4>
+
+<div class="quiz-q" data-correct="2">
+<p>Q1: What allocation method should you use in ALLOCATED_MEMORY when implementing module stomping?</p>
+<label data-opt="0"><input type="radio" name="q1_0"> METHOD_VIRTUALALLOC</label>
+<label data-opt="1"><input type="radio" name="q1_0"> METHOD_HEAPALLOC</label>
+<label data-opt="2"><input type="radio" name="q1_0"> METHOD_MODULESTOMP</label>
+<label data-opt="3"><input type="radio" name="q1_0"> METHOD_NTMAPVIEW</label>
+<div class="explain">METHOD_MODULESTOMP is the correct allocation method to record in ALLOCATED_MEMORY when the loader uses module stomping. This tells BUD consumers (especially the sleep mask) that the memory region is file-backed via a stomped DLL rather than a private VirtualAlloc allocation. METHOD_NTMAPVIEW is also related but less precise &mdash; it indicates a generic NtMapViewOfSection mapping, whereas METHOD_MODULESTOMP specifically signals that a legitimate DLL's sections have been overwritten with payload data.</div>
+</div>
+
+<div class="quiz-q" data-correct="1">
+<p>Q2: What is the primary benefit of guardrailed loaders?</p>
+<label data-opt="0"><input type="radio" name="q2_0"> They run faster on the target</label>
+<label data-opt="1"><input type="radio" name="q2_0"> Captured payloads cannot be analyzed outside the target environment</label>
+<label data-opt="2"><input type="radio" name="q2_0"> They bypass all EDR detections</label>
+<label data-opt="3"><input type="radio" name="q2_0"> They support 32-bit systems</label>
+<div class="explain">Guardrailed loaders derive an encryption key from the target environment's properties (hostname, domain, username). If the payload is captured and detonated in a sandbox or analyst workstation, the derived key will not match, and decryption produces garbage. The Beacon DLL never materializes, leaving no strings, configuration, or C2 addresses for blue team analysis. The payload is forensically inert outside the intended target.</div>
+</div>
+
+<div class="quiz-q" data-correct="0">
+<p>Q3: What Crystal Palace feature makes the PIC architecture portable beyond Cobalt Strike?</p>
+<label data-opt="0"><input type="radio" name="q3_0"> The core PIC generation, DFR, and library merging are C2-framework agnostic</label>
+<label data-opt="1"><input type="radio" name="q3_0"> Crystal Palace has built-in Mythic support</label>
+<label data-opt="2"><input type="radio" name="q3_0"> The spec language includes C2-specific directives</label>
+<label data-opt="3"><input type="radio" name="q3_0"> LibGate only works with Cobalt Strike</label>
+<div class="explain">The core components of Crystal Palace &mdash; the PIC linker, Dynamic Function Resolution (DFR), LibTCG PE loading, LibGate indirect syscalls, and the mergelib/PICO system &mdash; have zero dependencies on Cobalt Strike. The only CS-specific pieces are the BUD data structures (beacon.h) and the three-call DllMain initialization protocol. Removing those interfaces lets you use the entire PIC architecture with any C2 framework or standalone shellcode runner.</div>
+</div>
+
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module7.html">&larr; Prev: Post-Ex UDRL &amp; Aggressor</a>
+<span></span>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

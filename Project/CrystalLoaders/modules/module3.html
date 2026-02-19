@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 3: LibTCG — The Tradecraft Garden - Crystal-Loaders Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F48E;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f43f5e;--accent2:#fb923c;--gradient:linear-gradient(135deg,#f43f5e,#fb923c)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Crystal-Loaders</h2>
+<span>PIC Reflective Loaders</span>
+</div>
+<a class="home-link" href="../CrystalLoaders_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. The Reflective Loader Problem</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. Crystal Palace &mdash; The PIC Linker</span><span class="diff d1">d1</span></a>
+<a class="mod-link active" href="module3.html"><span>3. LibTCG &mdash; The Tradecraft Garden</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module4.html"><span>4. LibGate &mdash; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. The UDRL Loader Walkthrough</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. Beacon User Data (BUD)</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Post-Ex UDRL &amp; Aggressor</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Extending Crystal-Loaders</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge medium">Difficulty: Intermediate</span>
+<h1>Module 3: LibTCG &mdash; The Tradecraft Garden</h1>
+<p class="subtitle">The shared PE loading library that gives every Crystal Palace loader its foundation &mdash; PE parsing, section loading, import resolution, relocations, and PEB-based hash resolution.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>LibTCG (Library for the Tradecraft Garden) is the beating heart of the Crystal-Loaders ecosystem. It is a pre-compiled relocatable object file that Crystal Palace merges into your loader via <code>mergelib</code>. Every primitive a reflective loader needs &mdash; parsing PE headers, mapping sections, processing relocations, resolving imports, and walking the PEB for hash-based API resolution &mdash; lives here. By the end of this module, you will understand every function in LibTCG and how they compose into a complete PE loading pipeline.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. What Is LibTCG?</h2>
+
+<p>LibTCG stands for <strong>Library for the Tradecraft Garden</strong>. It is a shared C library that provides the common PE loading and API resolution primitives needed by any Crystal Palace-based loader. Rather than writing manual mapping code from scratch each time, LibTCG encapsulates the entire process in a clean, reusable interface.</p>
+
+<div class="card">
+<h4>Key Characteristics</h4>
+<ul style="padding-left:20px;line-height:2;">
+<li>Pre-compiled into a <strong>relocatable COFF object file</strong> and distributed as <code>libtcg.x64.zip</code></li>
+<li>Merged into your loader at link time via the Crystal Palace directive: <code>mergelib "../libtcg.x64.zip"</code></li>
+<li>Header file <code>tcg.h</code> defines all types, macros, and function prototypes</li>
+<li>Provides building blocks: <strong>PE parsing</strong>, <strong>section loading</strong>, <strong>import resolution</strong>, <strong>relocation processing</strong>, and <strong>PEB-based hash resolution</strong></li>
+<li>Designed for position-independent code &mdash; no absolute addresses, no CRT dependencies</li>
+</ul>
+</div>
+
+<p>When Crystal Palace processes a <code>mergelib</code> directive, it extracts the COFF objects from the zip archive and links them directly into your PIC output. The functions become available as if they were defined in your own source files. This modular approach means you can write a loader that is only a few dozen lines of C, delegating all the heavy lifting to LibTCG.</p>
+
+<!-- ============================================================ -->
+<h2>2. Key Types and Macros</h2>
+
+<p>The <code>tcg.h</code> header defines several structures, typedefs, and macros that the entire LibTCG API depends on. Understanding these is essential before looking at any function implementation.</p>
+
+<h3>IMPORTFUNCS</h3>
+
+<p>This structure holds the two Win32 API function pointers that LibTCG needs for import resolution. These are resolved by the loader before calling any LibTCG PE loading functions:</p>
+
+<pre><code><span class="lang-tag">C — tcg.h</span>typedef struct {
+    PVOID LoadLibraryA;     // Pointer to kernel32!LoadLibraryA
+    PVOID GetProcAddress;   // Pointer to kernel32!GetProcAddress
+} IMPORTFUNCS;</code></pre>
+
+<div class="card">
+<h4>Why Only Two Functions?</h4>
+<p>With <code>LoadLibraryA</code> and <code>GetProcAddress</code>, you can resolve any other Win32 API. <code>LoadLibraryA</code> loads a DLL by name and returns its base address. <code>GetProcAddress</code> takes a module handle and function name and returns the function pointer. Together, they bootstrap the entire IAT. The loader resolves these two from the PEB using <code>findModuleByHash()</code> and <code>findFunctionByHash()</code> before calling any LibTCG import processing.</p>
+</div>
+
+<h3>DLLDATA</h3>
+
+<p>This structure is populated by <code>ParseDLL()</code> and carries parsed PE header pointers through the entire loading pipeline:</p>
+
+<pre><code><span class="lang-tag">C — tcg.h</span>typedef struct {
+    PIMAGE_DOS_HEADER      DosHeader;       // Pointer to the MZ header
+    PIMAGE_NT_HEADERS      NtHeaders;       // Pointer to PE\0\0 + COFF + Optional
+    PIMAGE_OPTIONAL_HEADER OptionalHeader;  // Pointer to the Optional Header
+} DLLDATA;</code></pre>
+
+<p>Every subsequent LibTCG function takes a pointer to a <code>DLLDATA</code> struct. It acts as a parsed view into the raw PE bytes, avoiding redundant re-parsing at each stage.</p>
+
+<h3>Function Pointer Typedefs</h3>
+
+<pre><code><span class="lang-tag">C — tcg.h</span>// Standard DllMain signature for reflective DLL loading
+typedef BOOL (WINAPI * DLLMAIN_FUNC)(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved);
+
+// Entry point for PIC Object (PICO) payloads
+typedef void (* PICOMAIN_FUNC)(char * arg);</code></pre>
+
+<div class="card">
+<h4>Two Entry Point Models</h4>
+<p><code>DLLMAIN_FUNC</code> is the classic DLL entry point called with <code>DLL_PROCESS_ATTACH</code> after a reflective load completes. <code>PICOMAIN_FUNC</code> is the simpler entry point used by PICO (Position Independent Code Object) payloads, which receive a single string argument. The loader decides which to call based on the payload type.</p>
+</div>
+
+<h3>Utility Macros</h3>
+
+<pre><code><span class="lang-tag">C — tcg.h</span>// Pointer arithmetic: advance pointer x by y bytes
+#define PTR_OFFSET(x, y)  ((PBYTE)(x) + (y))
+
+// Dereference a pointer-sized value at the given address
+#define DEREF(name)        *(UINT_PTR *)(name)
+
+// Get the caller's return address (MinGW built-in)
+#define WIN_GET_CALLER()   __builtin_return_address(0)</code></pre>
+
+<div class="card">
+<h4>Macro Breakdown</h4>
+<table>
+<tr><th>Macro</th><th>Purpose</th><th>Usage</th></tr>
+<tr><td><code>PTR_OFFSET(x, y)</code></td><td>Byte-level pointer arithmetic</td><td>Navigate from a base address to an RVA: <code>PTR_OFFSET(moduleBase, rva)</code></td></tr>
+<tr><td><code>DEREF(name)</code></td><td>Read a pointer-sized value from memory</td><td>Read IAT entries, function pointers from tables</td></tr>
+<tr><td><code>WIN_GET_CALLER()</code></td><td>Retrieve the return address of the current function</td><td>Used for call stack introspection and validation</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. PE Loading Pipeline</h2>
+
+<p>LibTCG implements the full manual mapping pipeline as a series of composable functions. Each function handles one stage of the PE loading process. The loader calls them in sequence to transform raw PE bytes into an executable image in memory.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">LibTCG PE Loading Pipeline</h4>
+<div class="flow">
+<div class="box hl">ParseDLL()<br><small>Validate &amp; parse headers</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">SizeOfDLL()<br><small>Get virtual image size</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">LoadDLL()<br><small>Map headers + sections</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box y">ProcessRelocations()<br><small>Fix base delta</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box y">ProcessImports()<br><small>Resolve IAT</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">EntryPoint()<br><small>Calculate DllMain addr</small></div>
+</div>
+</div>
+
+<h3>ParseDLL(payload, &amp;dlldata)</h3>
+
+<p>The first step in the pipeline. <code>ParseDLL</code> takes a pointer to the raw PE bytes and populates the <code>DLLDATA</code> struct with pointers into the PE structure:</p>
+
+<pre><code><span class="lang-tag">C</span>// ParseDLL validates the DOS header and locates the NT headers
+void ParseDLL(PBYTE payload, PDLLDATA dlldata)
+{
+    // 1. Cast the start of the buffer to a DOS header
+    dlldata->DosHeader = (PIMAGE_DOS_HEADER)payload;
+
+    // 2. Validate the MZ magic number (0x5A4D)
+    //    If this check fails, the payload is not a valid PE
+
+    // 3. Use e_lfanew to locate the NT headers
+    //    e_lfanew is a LONG at offset 0x3C in the DOS header
+    //    It contains the file offset to the PE signature
+    dlldata->NtHeaders = (PIMAGE_NT_HEADERS)PTR_OFFSET(payload,
+                          dlldata->DosHeader->e_lfanew);
+
+    // 4. Extract the Optional Header pointer
+    //    The Optional Header immediately follows the COFF File Header
+    dlldata->OptionalHeader = &dlldata->NtHeaders->OptionalHeader;
+}</code></pre>
+
+<div class="card">
+<h4>DOS Header Validation</h4>
+<p>The <code>0x4D5A</code> magic ("MZ") at the very start of the file identifies it as a DOS executable. The <code>e_lfanew</code> field at offset 0x3C is a 4-byte offset pointing to the PE signature (<code>0x00004550</code> = "PE\0\0"). Every PE file, whether a DLL or EXE, begins with this same DOS header structure. If <code>e_lfanew</code> points outside the buffer or the PE signature doesn't match, the file is corrupt or not a PE.</p>
+</div>
+
+<h3>SizeOfDLL(&amp;dlldata)</h3>
+
+<p>Returns the total virtual size needed for the fully loaded image:</p>
+
+<pre><code><span class="lang-tag">C</span>// SizeOfDLL returns the total memory required for the mapped image
+DWORD SizeOfDLL(PDLLDATA dlldata)
+{
+    // SizeOfImage from the Optional Header tells us the total virtual
+    // size of the PE when loaded into memory, including all sections
+    // aligned to SectionAlignment boundaries
+    return dlldata->OptionalHeader->SizeOfImage;
+}</code></pre>
+
+<p>The caller uses this value to allocate a contiguous memory region (via <code>VirtualAlloc</code> or <code>NtAllocateVirtualMemory</code>) before calling <code>LoadDLL</code>. The <code>SizeOfImage</code> field accounts for section alignment padding, so it is always larger than the raw file size.</p>
+
+<h3>LoadDLL(&amp;dlldata, destination)</h3>
+
+<p>Copies the PE headers and all sections to the destination buffer at their correct virtual offsets:</p>
+
+<pre><code><span class="lang-tag">C</span>// LoadDLL maps the PE into the destination buffer
+void LoadDLL(PDLLDATA dlldata, PVOID destination)
+{
+    // 1. Copy the PE headers (DOS + NT + Section Table)
+    //    Size = OptionalHeader->SizeOfHeaders
+    memcpy(destination, dlldata->DosHeader,
+           dlldata->OptionalHeader->SizeOfHeaders);
+
+    // 2. Get the first section header
+    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(dlldata->NtHeaders);
+    WORD numSections = dlldata->NtHeaders->FileHeader.NumberOfSections;
+
+    // 3. Iterate each section and copy raw data to virtual address
+    for (WORD i = 0; i < numSections; i++) {
+        if (section[i].SizeOfRawData > 0) {
+            PBYTE src  = (PBYTE)dlldata->DosHeader + section[i].PointerToRawData;
+            PBYTE dest = (PBYTE)destination         + section[i].VirtualAddress;
+            memcpy(dest, src, section[i].SizeOfRawData);
+        }
+    }
+}</code></pre>
+
+<div class="card warn">
+<h4>Virtual Address vs Raw Data</h4>
+<p>On disk, section data is packed at <code>PointerToRawData</code> offsets aligned to <code>FileAlignment</code> (typically 0x200). In memory, sections sit at <code>VirtualAddress</code> offsets aligned to <code>SectionAlignment</code> (typically 0x1000). The gap between the raw and virtual layouts means sections may have zero-filled padding between them once mapped. This is why <code>SizeOfImage</code> is larger than the file size.</p>
+</div>
+
+<h3>ProcessRelocations(&amp;dlldata, destination)</h3>
+
+<p>When a DLL is loaded at a base address different from its preferred <code>ImageBase</code>, all absolute addresses embedded in the code must be patched. This is what the <code>.reloc</code> section is for:</p>
+
+<pre><code><span class="lang-tag">C</span>// ProcessRelocations patches absolute addresses for the new base
+void ProcessRelocations(PDLLDATA dlldata, PVOID destination)
+{
+    // 1. Calculate the delta between actual and preferred base
+    UINT_PTR delta = (UINT_PTR)destination -
+                     dlldata->OptionalHeader->ImageBase;
+
+    if (delta == 0) return;  // Loaded at preferred base, no fixups needed
+
+    // 2. Locate the Base Relocation Directory
+    PIMAGE_DATA_DIRECTORY relocDir = &dlldata->OptionalHeader->
+        DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+
+    PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)
+        PTR_OFFSET(destination, relocDir->VirtualAddress);
+
+    // 3. Walk each relocation block
+    while (reloc->VirtualAddress != 0) {
+        DWORD numEntries = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION))
+                           / sizeof(WORD);
+        PWORD entries = (PWORD)(reloc + 1);
+
+        for (DWORD i = 0; i < numEntries; i++) {
+            WORD type   = entries[i] >> 12;        // Top 4 bits = type
+            WORD offset = entries[i] & 0x0FFF;     // Bottom 12 bits = offset
+
+            if (type == IMAGE_REL_BASED_DIR64) {   // Type 10: 64-bit fixup
+                PUINT_PTR patchAddr = (PUINT_PTR)PTR_OFFSET(
+                    destination, reloc->VirtualAddress + offset);
+                *patchAddr += delta;               // Apply the delta
+            }
+        }
+        // Advance to next relocation block
+        reloc = (PIMAGE_BASE_RELOCATION)PTR_OFFSET(reloc, reloc->SizeOfBlock);
+    }
+}</code></pre>
+
+<div class="card">
+<h4>Relocation Block Structure</h4>
+<table>
+<tr><th>Field</th><th>Description</th></tr>
+<tr><td><code>VirtualAddress</code></td><td>Base RVA for this block of relocations (page-aligned)</td></tr>
+<tr><td><code>SizeOfBlock</code></td><td>Total size of this block including the header and all entries</td></tr>
+<tr><td>Entries (WORD[])</td><td>Each WORD: top 4 bits = relocation type, bottom 12 bits = offset within the page</td></tr>
+</table>
+<p style="margin-top:10px;color:var(--dim);font-size:.85rem;">On x64, the only relocation type you typically encounter is <code>IMAGE_REL_BASED_DIR64</code> (type 10), which patches a 64-bit absolute address by adding the base delta.</p>
+</div>
+
+<h3>ProcessImports(&amp;dlldata, destination)</h3>
+
+<p>Walks the Import Directory Table and resolves every imported function into the IAT:</p>
+
+<pre><code><span class="lang-tag">C</span>// ProcessImports resolves all imported DLLs and functions
+void ProcessImports(PDLLDATA dlldata, PVOID destination, IMPORTFUNCS * funcs)
+{
+    // 1. Locate the Import Directory
+    PIMAGE_DATA_DIRECTORY importDir = &dlldata->OptionalHeader->
+        DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+    PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)
+        PTR_OFFSET(destination, importDir->VirtualAddress);
+
+    // Cast the function pointers from IMPORTFUNCS
+    typedef HMODULE (WINAPI * fnLoadLibraryA)(LPCSTR);
+    typedef FARPROC (WINAPI * fnGetProcAddress)(HMODULE, LPCSTR);
+    fnLoadLibraryA  pLoadLibraryA  = (fnLoadLibraryA)funcs->LoadLibraryA;
+    fnGetProcAddress pGetProcAddress = (fnGetProcAddress)funcs->GetProcAddress;
+
+    // 2. Walk each import descriptor (one per imported DLL)
+    while (importDesc->Name != 0) {
+        // Resolve the imported DLL by name
+        char * dllName = (char *)PTR_OFFSET(destination, importDesc->Name);
+        HMODULE hModule = pLoadLibraryA(dllName);
+
+        // 3. Walk the ILT (Import Lookup Table) and IAT simultaneously
+        PUINT_PTR thunk    = (PUINT_PTR)PTR_OFFSET(destination,
+                              importDesc->OriginalFirstThunk);
+        PUINT_PTR iatEntry = (PUINT_PTR)PTR_OFFSET(destination,
+                              importDesc->FirstThunk);
+
+        while (*thunk != 0) {
+            if (IMAGE_SNAP_BY_ORDINAL(*thunk)) {
+                // Import by ordinal
+                *iatEntry = (UINT_PTR)pGetProcAddress(hModule,
+                             (LPCSTR)IMAGE_ORDINAL(*thunk));
+            } else {
+                // Import by name
+                PIMAGE_IMPORT_BY_NAME nameEntry = (PIMAGE_IMPORT_BY_NAME)
+                    PTR_OFFSET(destination, *thunk);
+                *iatEntry = (UINT_PTR)pGetProcAddress(hModule, nameEntry->Name);
+            }
+            thunk++;
+            iatEntry++;
+        }
+        importDesc++;
+    }
+}</code></pre>
+
+<div class="card green">
+<h4>The IAT After Resolution</h4>
+<p>After <code>ProcessImports</code> completes, every slot in the Import Address Table contains a live function pointer. When the loaded DLL's code calls an imported function like <code>VirtualProtect</code>, it reads the pointer from the IAT and jumps to it. This is identical to how the Windows loader resolves imports &mdash; the key difference is that LibTCG does it entirely in usermode without any loader lock or LDR notification.</p>
+</div>
+
+<h3>EntryPoint(&amp;dlldata, destination)</h3>
+
+<p>Computes the address of the DLL's entry point in the mapped image:</p>
+
+<pre><code><span class="lang-tag">C</span>// EntryPoint calculates the entry point address
+PVOID EntryPoint(PDLLDATA dlldata, PVOID destination)
+{
+    // AddressOfEntryPoint is an RVA in the Optional Header
+    // Add it to the destination base to get the absolute address
+    return PTR_OFFSET(destination,
+                      dlldata->OptionalHeader->AddressOfEntryPoint);
+}</code></pre>
+
+<p>The returned address is cast to <code>DLLMAIN_FUNC</code> and called with <code>DLL_PROCESS_ATTACH</code>. For a Cobalt Strike Beacon DLL, this is where execution begins after the reflective load completes.</p>
+
+<!-- ============================================================ -->
+<h2>4. PEB Walking &mdash; findModuleByHash()</h2>
+
+<p>Before the PE loading pipeline can run, the loader needs <code>LoadLibraryA</code> and <code>GetProcAddress</code>. But you cannot call <code>GetProcAddress</code> to find <code>GetProcAddress</code> &mdash; that is circular. The solution is to walk the <strong>Process Environment Block (PEB)</strong> to find loaded modules by hash, then walk their Export Address Table to find functions by hash.</p>
+
+<pre><code><span class="lang-tag">C</span>PVOID findModuleByHash(DWORD hash)
+{
+    // 1. Read the PEB from the GS segment register (x64)
+    //    On x64, gs:[0x60] points to the PEB
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+
+    // 2. Access the Ldr (PEB_LDR_DATA) which tracks all loaded modules
+    //    InMemoryOrderModuleList is a doubly-linked list of
+    //    LDR_DATA_TABLE_ENTRY structures
+    PLIST_ENTRY head  = &pPeb->Ldr->InMemoryOrderModuleList;
+    PLIST_ENTRY entry = head->Flink;
+
+    // 3. Walk the linked list
+    while (entry != head) {
+        // CONTAINING_RECORD macro: given a list entry pointer,
+        // recover the enclosing LDR_DATA_TABLE_ENTRY
+        PLDR_DATA_TABLE_ENTRY mod = CONTAINING_RECORD(
+            entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+
+        // 4. Hash the module's BaseDllName (Unicode, case-insensitive)
+        //    using the ROR13 algorithm
+        DWORD nameHash = ror13_unicode(mod->BaseDllName.Buffer,
+                                       mod->BaseDllName.Length);
+
+        // 5. Compare against the target hash
+        if (nameHash == hash)
+            return mod->DllBase;  // Return the module's base address
+
+        entry = entry->Flink;    // Advance to next module
+    }
+    return NULL;  // Module not found
+}</code></pre>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">PEB Structure Chain (x64)</h4>
+<div class="flow">
+<div class="box hl">TEB<br><small>gs:[0x60]</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">PEB<br><small>ProcessEnvironmentBlock</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">PEB_LDR_DATA<br><small>Ldr</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box y">InMemoryOrder<br>ModuleList<br><small>LIST_ENTRY head</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">LDR_DATA_TABLE_ENTRY<br><small>DllBase + BaseDllName</small></div>
+</div>
+</div>
+
+<div class="card">
+<h4>The Module List Walk</h4>
+<table>
+<tr><th>Step</th><th>Structure</th><th>Access</th></tr>
+<tr><td>1</td><td>Thread Environment Block (TEB)</td><td><code>__readgsqword(0x60)</code> on x64 &mdash; GS segment register points to the TEB, offset 0x60 holds the PEB pointer</td></tr>
+<tr><td>2</td><td>Process Environment Block (PEB)</td><td><code>pPeb->Ldr</code> &mdash; pointer to PEB_LDR_DATA, the loader data structure</td></tr>
+<tr><td>3</td><td>PEB_LDR_DATA</td><td><code>Ldr->InMemoryOrderModuleList</code> &mdash; head of the doubly-linked list of loaded modules</td></tr>
+<tr><td>4</td><td>LDR_DATA_TABLE_ENTRY</td><td>Each entry has <code>DllBase</code> (base address), <code>BaseDllName</code> (Unicode name), <code>FullDllName</code>, and other metadata</td></tr>
+</table>
+</div>
+
+<div class="card warn">
+<h4>Why InMemoryOrderModuleList?</h4>
+<p>The PEB_LDR_DATA has three module lists: <code>InLoadOrderModuleList</code>, <code>InMemoryOrderModuleList</code>, and <code>InInitializationOrderModuleList</code>. LibTCG uses <code>InMemoryOrderModuleList</code> because it is the most commonly used in shellcode and is well-documented. The order typically starts with the executable itself, then <code>ntdll.dll</code>, then <code>kernel32.dll</code>. This predictable order means the loader will find kernel32 within the first few iterations.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. EAT Walking &mdash; findFunctionByHash()</h2>
+
+<p>Once <code>findModuleByHash()</code> returns a module's base address, <code>findFunctionByHash()</code> searches that module's Export Address Table (EAT) for a function matching a given ROR13 hash:</p>
+
+<pre><code><span class="lang-tag">C</span>PVOID findFunctionByHash(PVOID moduleBase, DWORD functionHash)
+{
+    // 1. Parse PE headers to find the Export Directory
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)moduleBase;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)
+        PTR_OFFSET(moduleBase, dos->e_lfanew);
+
+    PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)
+        PTR_OFFSET(moduleBase,
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
+            .VirtualAddress);
+
+    // 2. Retrieve the three parallel arrays
+    PDWORD names     = (PDWORD)PTR_OFFSET(moduleBase, exports->AddressOfNames);
+    PDWORD functions = (PDWORD)PTR_OFFSET(moduleBase, exports->AddressOfFunctions);
+    PWORD  ordinals  = (PWORD) PTR_OFFSET(moduleBase, exports->AddressOfNameOrdinals);
+
+    // 3. Iterate through all named exports
+    for (DWORD i = 0; i < exports->NumberOfNames; i++) {
+        // Resolve the function name string
+        char * name = (char *)PTR_OFFSET(moduleBase, names[i]);
+
+        // Hash the name and compare
+        if (ror13_ascii(name) == functionHash)
+            return PTR_OFFSET(moduleBase, functions[ordinals[i]]);
+    }
+    return NULL;  // Function not found
+}</code></pre>
+
+<h3>The Three Parallel Arrays</h3>
+
+<p>The Export Directory uses three arrays that work together to map function names to their code addresses. Understanding how they link together is critical:</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">Export Address Table &mdash; Three Parallel Arrays</h4>
+<div style="display:flex;gap:20px;justify-content:center;flex-wrap:wrap;">
+<div style="flex:1;min-width:180px;">
+<p style="text-align:center;color:var(--accent);font-weight:700;margin-bottom:8px;font-size:.85rem;">AddressOfNames</p>
+<div class="flow" style="flex-direction:column;gap:4px;">
+<div class="box" style="width:100%;font-size:.75rem;">[0] RVA &rarr; "CreateFileW"</div>
+<div class="box hl" style="width:100%;font-size:.75rem;">[1] RVA &rarr; "GetProcAddress"</div>
+<div class="box" style="width:100%;font-size:.75rem;">[2] RVA &rarr; "LoadLibraryA"</div>
+</div>
+</div>
+<div style="flex:0;display:flex;align-items:center;color:var(--dim);font-size:1.2rem;padding:0 4px;">
+&rarr;
+</div>
+<div style="flex:1;min-width:140px;">
+<p style="text-align:center;color:var(--yellow);font-weight:700;margin-bottom:8px;font-size:.85rem;">AddressOfNameOrdinals</p>
+<div class="flow" style="flex-direction:column;gap:4px;">
+<div class="box" style="width:100%;font-size:.75rem;">[0] ordinal: 42</div>
+<div class="box y" style="width:100%;font-size:.75rem;">[1] ordinal: 187</div>
+<div class="box" style="width:100%;font-size:.75rem;">[2] ordinal: 215</div>
+</div>
+</div>
+<div style="flex:0;display:flex;align-items:center;color:var(--dim);font-size:1.2rem;padding:0 4px;">
+&rarr;
+</div>
+<div style="flex:1;min-width:180px;">
+<p style="text-align:center;color:var(--green);font-weight:700;margin-bottom:8px;font-size:.85rem;">AddressOfFunctions</p>
+<div class="flow" style="flex-direction:column;gap:4px;">
+<div class="box" style="width:100%;font-size:.75rem;">[42] RVA &rarr; code</div>
+<div class="box g" style="width:100%;font-size:.75rem;">[187] RVA &rarr; code</div>
+<div class="box" style="width:100%;font-size:.75rem;">[215] RVA &rarr; code</div>
+</div>
+</div>
+</div>
+</div>
+
+<div class="card">
+<h4>How the Lookup Works</h4>
+<ol style="padding-left:20px;line-height:2.2;">
+<li><strong>AddressOfNames[i]</strong> is an RVA pointing to a null-terminated ASCII string &mdash; the function's export name</li>
+<li><strong>AddressOfNameOrdinals[i]</strong> is a WORD index that maps the name at position <code>i</code> to an entry in the functions array</li>
+<li><strong>AddressOfFunctions[ordinals[i]]</strong> is an RVA pointing to the actual function code</li>
+</ol>
+<p style="margin-top:10px;color:var(--dim);font-size:.85rem;">The names array is sorted alphabetically (enabling binary search by the Windows loader), but the functions array is indexed by ordinal, not alphabetically. The ordinals array bridges the two. When LibTCG finds a matching hash at index <code>i</code>, it reads <code>ordinals[i]</code> and uses that as the index into the functions array.</p>
+</div>
+
+<div class="card warn">
+<h4>Forwarded Exports</h4>
+<p>If an <code>AddressOfFunctions</code> entry points within the export directory's own memory range (between the directory's VirtualAddress and VirtualAddress + Size), it is a <strong>forwarded export</strong> &mdash; a string like <code>"NTDLL.RtlAllocateHeap"</code> instead of a code address. LibTCG's basic implementation does not handle forwarded exports. For Crystal-Loaders this is acceptable because the functions it resolves (<code>LoadLibraryA</code>, <code>GetProcAddress</code>) are not forwarded in kernel32.dll.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. The ROR13 Hash Algorithm</h2>
+
+<p>LibTCG uses the <strong>ROR13</strong> (Rotate Right by 13) hash algorithm to identify modules and functions without embedding their plaintext names in the shellcode. This is the same algorithm used in Metasploit's block_api stager and has been a shellcode convention for over a decade.</p>
+
+<pre><code><span class="lang-tag">C</span>// ROR13 hash for ASCII strings (function names)
+DWORD ror13_ascii(const char * str)
+{
+    DWORD hash = 0;
+    while (*str) {
+        hash = (hash >> 13) | (hash << 19);  // Rotate right 13 bits
+        hash += (DWORD)*str++;                // Add current character
+    }
+    return hash;
+}
+
+// ROR13 hash for Unicode strings (module names, case-insensitive)
+DWORD ror13_unicode(const WCHAR * str, DWORD len)
+{
+    DWORD hash = 0;
+    DWORD chars = len / sizeof(WCHAR);
+    while (chars--) {
+        WCHAR c = *str++;
+        if (c >= L'A' && c <= L'Z')
+            c += 0x20;  // Convert to lowercase for case-insensitive matching
+        hash = (hash >> 13) | (hash << 19);
+        hash += (DWORD)c;
+    }
+    return hash;
+}</code></pre>
+
+<div class="card">
+<h4>Why ROR13?</h4>
+<ul style="padding-left:20px;line-height:2;">
+<li><strong>Minimal code size</strong> &mdash; a single rotate and add per character, compiles to just a few instructions</li>
+<li><strong>Good distribution</strong> &mdash; the 13-bit rotation spreads character influence across all 32 bits, minimizing collisions for typical API names</li>
+<li><strong>No string storage</strong> &mdash; hashes are embedded as 4-byte DWORD immediates, eliminating suspicious plaintext strings</li>
+<li><strong>Industry standard</strong> &mdash; used since the early Metasploit days, well-understood by red and blue teams alike</li>
+</ul>
+</div>
+
+<h3>Pre-Computed Hashes in Crystal-Loaders</h3>
+
+<p>Crystal Palace's <code>dfr</code> (define function reference) directive computes ROR13 hashes at build time and embeds them as DWORD immediates in the PIC output. For example, in <code>loader.c</code>:</p>
+
+<pre><code><span class="lang-tag">C — loader.c</span>// The NTDLL hash used in Crystal-Loaders
+#define NTDLL_HASH      0x3CFA685D
+
+// At runtime, the loader calls:
+PVOID ntdll = findModuleByHash(NTDLL_HASH);
+
+// The dfr directive in the .spec file tells Crystal Palace
+// to resolve function references the same way:
+//   dfr kernel32.dll, LoadLibraryA
+//   dfr kernel32.dll, GetProcAddress
+// Crystal Palace pre-computes the hashes and generates
+// the findModuleByHash + findFunctionByHash calls automatically</code></pre>
+
+<div class="card green">
+<h4>Hash Computation at Build Time vs Runtime</h4>
+<p>When you use <code>dfr</code> in a Crystal Palace spec file, the linker computes the ROR13 hash of both the module name and function name at compile time. These hashes are baked into the shellcode as DWORD constants. At runtime, the PIC walks the PEB and EAT, computing hashes of live module/function names and comparing them to the embedded constants. This eliminates any plaintext API strings from the final shellcode &mdash; only 4-byte hash values remain.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. PICO Functions</h2>
+
+<p>Beyond traditional PE/DLL loading, LibTCG also supports <strong>PICOs</strong> (Position Independent Code Objects). PICOs are a Crystal Kit concept for modular evasion components that differ from standard PIC in one critical way: they keep <strong>code and data in separate allocations</strong>.</p>
+
+<div class="card">
+<h4>PICO API Overview</h4>
+<table>
+<tr><th>Function</th><th>Purpose</th></tr>
+<tr><td><code>PicoEntryPoint()</code></td><td>Returns the address of the PICO's entry function &mdash; the <code>PICOMAIN_FUNC</code> that receives a single <code>char *</code> argument</td></tr>
+<tr><td><code>PicoCodeSize()</code></td><td>Returns the size of the PICO's code section (executable, read-only at rest)</td></tr>
+<tr><td><code>PicoDataSize()</code></td><td>Returns the size of the PICO's data section (read-write, non-executable)</td></tr>
+<tr><td><code>PicoLoad()</code></td><td>Loads a PICO into two separate memory regions: one for code, one for data</td></tr>
+</table>
+</div>
+
+<div class="card warn">
+<h4>PICO vs PIC: The Split-Memory Model</h4>
+<p>Standard position-independent code (PIC) places code and data in a single contiguous allocation. This is simple but creates a security problem: the allocation must be both writable (for data) and executable (for code), resulting in RWX memory &mdash; a strong detection signal.</p>
+<p style="margin-top:10px;">PICOs solve this by splitting into two allocations:</p>
+<ul style="padding-left:20px;line-height:2;">
+<li><strong>Code region</strong> &mdash; marked <code>RX</code> (read-execute), never writable at rest</li>
+<li><strong>Data region</strong> &mdash; marked <code>RW</code> (read-write), never executable</li>
+</ul>
+<p style="margin-top:10px;">This split avoids RWX and looks far more legitimate to EDR memory scanners. The PICO's code references data via relative offsets that <code>PicoLoad()</code> patches at load time, similar to how relocations work for DLLs.</p>
+</div>
+
+<p>Crystal Kit uses PICOs for modular evasion primitives &mdash; sleep masks, call stack spoofers, and other components that can be composed and swapped independently. LibTCG provides the loading machinery; the PICO format and its tooling come from the broader Crystal Kit ecosystem.</p>
+
+<!-- ============================================================ -->
+<div class="quiz" id="quiz1">
+<h4>Module 3 Quiz: LibTCG</h4>
+
+<div class="quiz-q" data-correct="1">
+<p>Q1: What structure does ParseDLL populate with parsed PE header information?</p>
+<label data-opt="0"><input type="radio" name="q1_0"> IMPORTFUNCS</label>
+<label data-opt="1"><input type="radio" name="q1_0"> DLLDATA</label>
+<label data-opt="2"><input type="radio" name="q1_0"> PE_MANUAL_MAP</label>
+<label data-opt="3"><input type="radio" name="q1_0"> IMAGE_NT_HEADERS</label>
+<div class="explain">ParseDLL takes a pointer to raw PE bytes and populates a DLLDATA structure containing pointers to the DOS header, NT headers, and Optional Header. This struct is then passed to every subsequent function in the LibTCG pipeline (SizeOfDLL, LoadDLL, ProcessRelocations, ProcessImports, EntryPoint).</div>
+</div>
+
+<div class="quiz-q" data-correct="0">
+<p>Q2: How does findModuleByHash() locate ntdll.dll in a running process?</p>
+<label data-opt="0"><input type="radio" name="q2_0"> Walks the PEB's InMemoryOrderModuleList and compares ROR13 hashes</label>
+<label data-opt="1"><input type="radio" name="q2_0"> Calls GetModuleHandleA with a hash</label>
+<label data-opt="2"><input type="radio" name="q2_0"> Reads the module list from the SSDT</label>
+<label data-opt="3"><input type="radio" name="q2_0"> Scans process memory for MZ headers</label>
+<div class="explain">findModuleByHash() reads the PEB via the GS segment register (gs:[0x60] on x64), then walks the PEB_LDR_DATA's InMemoryOrderModuleList. For each loaded module, it computes the ROR13 hash of the BaseDllName (Unicode, case-insensitive) and compares it against the target hash. When a match is found, it returns the module's DllBase address.</div>
+</div>
+
+<div class="quiz-q" data-correct="2">
+<p>Q3: What are the three parallel arrays in the Export Address Table?</p>
+<label data-opt="0"><input type="radio" name="q3_0"> ImageBase, EntryPoint, SizeOfImage</label>
+<label data-opt="1"><input type="radio" name="q3_0"> DosHeader, NtHeaders, OptionalHeader</label>
+<label data-opt="2"><input type="radio" name="q3_0"> AddressOfNames, AddressOfFunctions, AddressOfNameOrdinals</label>
+<label data-opt="3"><input type="radio" name="q3_0"> ImportDirectory, BoundImport, DelayImport</label>
+<div class="explain">The Export Directory uses three parallel arrays: AddressOfNames (RVAs to null-terminated function name strings), AddressOfFunctions (RVAs to the actual function code), and AddressOfNameOrdinals (WORD indices that map each name to its corresponding entry in the functions array). To look up a function by name, you find the matching name in AddressOfNames at index i, read the ordinal from AddressOfNameOrdinals[i], and use that ordinal as the index into AddressOfFunctions.</div>
+</div>
+
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module2.html">&larr; Prev: Crystal Palace &mdash; The PIC Linker</a>
+<a class="primary" href="module4.html">Next: LibGate &mdash; Indirect Syscalls &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

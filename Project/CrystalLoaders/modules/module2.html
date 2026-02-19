@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 2: Crystal Palace - The PIC Linker - Crystal-Loaders Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F48E;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f43f5e;--accent2:#fb923c;--gradient:linear-gradient(135deg,#f43f5e,#fb923c)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Crystal-Loaders</h2>
+<span>PIC Reflective Loaders</span>
+</div>
+<a class="home-link" href="../CrystalLoaders_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">1</span> The Loader Problem</a>
+<a class="mod-link active" href="module2.html"><span class="diff d1">2</span> Crystal Palace</a>
+<a class="mod-link" href="module3.html"><span class="diff d2">3</span> LibTCG</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">4</span> LibGate Syscalls</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">5</span> UDRL Walkthrough</a>
+<a class="mod-link" href="module6.html"><span class="diff d3">6</span> Beacon User Data</a>
+<a class="mod-link" href="module7.html"><span class="diff d3">7</span> Post-Ex &amp; Aggressor</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">8</span> Extending Loaders</a>
+</nav>
+
+<main>
+<span class="diff-badge easy">Difficulty: Beginner</span>
+<h1>Module 2: Crystal Palace &mdash; The PIC Linker</h1>
+<p class="subtitle">The spec-driven linker that transforms compiled COFF objects into flat position-independent shellcode &mdash; no PE headers, no import tables, just executable machine code.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Understand what Crystal Palace is, how the <code>.spec</code> linker-script language works, and how every directive in the Crystal-Loaders <code>loader.spec</code> contributes to the final PIC shellcode blob. By the end of this module you will be able to read any Crystal Palace spec file and explain exactly what it does at each step.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. What Is Crystal Palace?</h2>
+
+<p><strong>Crystal Palace</strong> is a Java-based linker and linker-script language designed by <strong>Raphael Mudge</strong> specifically for building PIC (position-independent code) DLL loaders. It was introduced alongside <strong>Cobalt Strike 4.10/4.11</strong> as the official mechanism for creating User-Defined Reflective Loaders (UDRLs).</p>
+
+<p>Crystal Palace takes compiled <strong>COFF object files</strong> (<code>.o</code>) produced by MinGW and transforms them into flat PIC shellcode with embedded resources. The transformation is driven by <code>.spec</code> files &mdash; declarative specifications that describe how to assemble, transform, and link the final payload.</p>
+
+<div class="card warn">
+<h4>Crystal Palace Is NOT a Compiler</h4>
+<p>This is a common misunderstanding. Crystal Palace does not compile C code. It processes <strong>already-compiled</strong> COFF object files. The C compiler (MinGW GCC) runs first, producing <code>.o</code> files. Crystal Palace then takes those object files and performs the linking, relocation resolution, and PIC transformation that would normally be handled by a traditional linker like <code>ld</code> &mdash; but instead of producing a PE executable, it produces raw position-independent shellcode.</p>
+</div>
+
+<p>The key insight is that Crystal Palace replaces the traditional Windows linker entirely. Instead of producing a PE with headers, section tables, and import directories, it produces a single contiguous block of executable bytes that can run from any memory address.</p>
+
+<!-- ============================================================ -->
+<h2>2. The Build Pipeline</h2>
+
+<p>The Crystal-Loaders build process follows a two-stage pipeline. First the C compiler produces COFF objects, then Crystal Palace links them into PIC shellcode:</p>
+
+<div class="diagram">
+<h4>Crystal-Loaders Build Pipeline</h4>
+<div class="flow">
+<div class="box">C Source<br><small>loader.c</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">MinGW GCC<br><small>x86_64-w64-mingw32-gcc</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">COFF Object<br><small>loader.x64.o</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">Crystal Palace<br><small>loader.spec</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">PIC Shellcode<br><small>flat binary blob</small></div>
+</div>
+</div>
+
+<p>The Makefile uses MinGW to cross-compile the C source into a COFF object file:</p>
+
+<pre><code><span class="lang-tag">Makefile</span>CC_64 = x86_64-w64-mingw32-gcc
+$(CC_64) -DWIN_X64 -shared -masm=intel -Wall -Wno-pointer-arith -c src/loader.c -o bin/loader.x64.o</code></pre>
+
+<h3>Compiler Flags Explained</h3>
+
+<table>
+<thead>
+<tr><th>Flag</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-DWIN_X64</code></td><td>Defines the <code>WIN_X64</code> preprocessor macro, enabling x64-specific code paths in the source</td></tr>
+<tr><td><code>-shared</code></td><td>Uses DLL calling conventions &mdash; important because the loader will eventually load a DLL (Beacon)</td></tr>
+<tr><td><code>-masm=intel</code></td><td>Uses Intel assembly syntax for any inline ASM blocks (instead of AT&amp;T syntax)</td></tr>
+<tr><td><code>-Wall</code></td><td>Enables all standard compiler warnings</td></tr>
+<tr><td><code>-Wno-pointer-arith</code></td><td>Suppresses pointer arithmetic warnings (needed for the raw memory manipulation in PIC code)</td></tr>
+<tr><td><code>-c</code></td><td>Compile only, do not link &mdash; Crystal Palace does the linking</td></tr>
+</tbody>
+</table>
+
+<p>The <code>-c</code> flag is the critical one. It tells GCC to stop after compilation and produce a <code>.o</code> object file instead of calling the linker. Crystal Palace handles everything from that point forward.</p>
+
+<!-- ============================================================ -->
+<h2>3. The Spec Language</h2>
+
+<p>Crystal Palace specs are declarative scripts that describe the complete linking and transformation process. Here is the actual <code>loader.spec</code> from Crystal-Loaders, annotated line by line:</p>
+
+<pre><code><span class="lang-tag">loader.spec</span>name     "Beacon BUD Loader"
+describe "PIC loader to pass memory allocation information via Beacon User Data"
+author   "Daniel Duggan (@_RastaMouse)"
+
+x64:
+    load "bin/loader.x64.o"
+        make pic +gofirst +optimize +disco
+        dfr "resolve" "ror13"
+        mergelib "../libgate.x64.zip"
+        mergelib "../libtcg.x64.zip"
+
+    generate $KEY 128
+
+    push $DLL
+        xor $KEY
+        preplen
+        link "dll"
+
+    push $KEY
+        preplen
+        link "key"
+
+    export</code></pre>
+
+<p>The spec reads top-down like a recipe. First it loads and transforms the compiled code, then it generates a random XOR key, encrypts the DLL payload, and links everything together into the final output. Let's break down each block:</p>
+
+<div class="card">
+<h4>Block 1: Metadata</h4>
+<p>The first three lines are purely informational &mdash; they name the spec, describe what it does, and credit the author. Crystal Palace uses these for identification and logging.</p>
+</div>
+
+<div class="card">
+<h4>Block 2: Code Transformation (x64:)</h4>
+<p>The <code>x64:</code> block targets 64-bit architecture. Inside it, <code>load</code> brings in the compiled COFF object, <code>make pic</code> transforms it into position-independent code, <code>dfr</code> rewrites all API import references for runtime resolution, and <code>mergelib</code> pulls in LibGate and LibTCG library code.</p>
+</div>
+
+<div class="card">
+<h4>Block 3: Data Preparation</h4>
+<p><code>generate $KEY 128</code> creates 128 bytes of cryptographically random data. The <code>push $DLL</code> block pushes the Beacon DLL onto the data stack, XORs it with the key, prepends a 4-byte length header, and links it into a section named <code>"dll"</code>. The key itself gets the same length-prefix treatment and is linked into a section named <code>"key"</code>.</p>
+</div>
+
+<div class="card">
+<h4>Block 4: Export</h4>
+<p><code>export</code> emits the final PIC shellcode &mdash; the code blob with all linked data sections appended.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Directive Reference</h2>
+
+<p>Every Crystal Palace directive available in the spec language, with its purpose and usage:</p>
+
+<table>
+<thead>
+<tr><th>Directive</th><th>Purpose</th><th>Example</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>Names the spec for identification</td><td><code>name "Beacon BUD Loader"</code></td></tr>
+<tr><td><code>describe</code></td><td>Human-readable description</td><td><code>describe "PIC loader..."</code></td></tr>
+<tr><td><code>author</code></td><td>Author attribution</td><td><code>author "Daniel Duggan"</code></td></tr>
+<tr><td><code>x64:</code></td><td>Architecture block (x64-only in Crystal-Loaders)</td><td><code>x64:</code></td></tr>
+<tr><td><code>load</code></td><td>Load a compiled COFF object file into the linker</td><td><code>load "bin/loader.x64.o"</code></td></tr>
+<tr><td><code>make pic</code></td><td>Transform the loaded COFF into position-independent code</td><td><code>make pic +gofirst +optimize +disco</code></td></tr>
+<tr><td><code>+gofirst</code></td><td>Place the <code>go()</code> function at byte offset 0 of the PIC blob</td><td>Flag on <code>make pic</code></td></tr>
+<tr><td><code>+optimize</code></td><td>Enable code size optimization passes</td><td>Flag on <code>make pic</code></td></tr>
+<tr><td><code>+disco</code></td><td>Enable function discovery (allow Crystal Palace to find all functions in the object)</td><td>Flag on <code>make pic</code></td></tr>
+<tr><td><code>dfr</code></td><td>Dynamic Function Resolution &mdash; rewrite all <code>__imp_MODULE$Function</code> references to call a resolver</td><td><code>dfr "resolve" "ror13"</code></td></tr>
+<tr><td><code>mergelib</code></td><td>Merge an external library's object files into the current build</td><td><code>mergelib "../libgate.x64.zip"</code></td></tr>
+<tr><td><code>generate</code></td><td>Generate random data (e.g., an XOR key) and store in a variable</td><td><code>generate $KEY 128</code></td></tr>
+<tr><td><code>push</code></td><td>Push data onto the linker's data stack for processing</td><td><code>push $DLL</code></td></tr>
+<tr><td><code>xor</code></td><td>XOR the top-of-stack data with a named key</td><td><code>xor $KEY</code></td></tr>
+<tr><td><code>preplen</code></td><td>Prepend a 4-byte little-endian length prefix to the top-of-stack data</td><td><code>preplen</code></td></tr>
+<tr><td><code>link</code></td><td>Link data into a named section of the PIC blob</td><td><code>link "dll"</code></td></tr>
+<tr><td><code>export</code></td><td>Emit the final PIC shellcode as the build output</td><td><code>export</code></td></tr>
+<tr><td><code>patch</code></td><td>Write a value into a named symbol location (used in postex loader)</td><td><code>patch "pGetModuleHandle" $GMH</code></td></tr>
+</tbody>
+</table>
+
+<div class="card highlight">
+<h4>The Data Stack Model</h4>
+<p>Crystal Palace uses a <strong>stack-based data model</strong> similar to Forth or PostScript. The <code>push</code> directive places data on top of the stack. Subsequent operations like <code>xor</code> and <code>preplen</code> modify the top-of-stack in place. Finally, <code>link</code> pops the data off and attaches it to the PIC blob as a named section. This stack model allows arbitrary data transformations to be chained declaratively.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Dynamic Function Resolution (DFR)</h2>
+
+<p>DFR is the mechanism that makes PIC code possible. In normal PE executables, the loader resolves API imports at load time using the Import Address Table. PIC shellcode has no IAT, so API addresses must be resolved at runtime by the shellcode itself.</p>
+
+<h3>The Problem</h3>
+
+<p>In the C source, Windows API functions are declared as DLL imports using the <code>MODULE$Function</code> naming convention:</p>
+
+<pre><code><span class="lang-tag">C</span>// These declarations tell the compiler: "this function comes from an external DLL"
+// The '$' separator tells Crystal Palace: module = KERNEL32, function = VirtualAlloc
+DECLSPEC_IMPORT PVOID WINAPI KERNEL32$VirtualAlloc(PVOID, SIZE_T, DWORD, DWORD);
+DECLSPEC_IMPORT BOOL  WINAPI KERNEL32$VirtualProtect(PVOID, SIZE_T, DWORD, PDWORD);
+DECLSPEC_IMPORT PVOID WINAPI MSVCRT$memcpy(PVOID, PVOID, SIZE_T);</code></pre>
+
+<p>After compilation, these become <code>__imp_KERNEL32$VirtualAlloc</code> symbols in the COFF object's symbol table. In a normal linking process, these would be resolved against import libraries (<code>.lib</code> files). Crystal Palace does something fundamentally different.</p>
+
+<h3>The Solution: DFR Rewriting</h3>
+
+<p>The <code>dfr "resolve" "ror13"</code> directive tells Crystal Palace to:</p>
+
+<ol>
+<li>Find every instruction in the code that references an <code>__imp_MODULE$Function</code> symbol</li>
+<li>Extract the module name and function name from the symbol</li>
+<li>Compute the <strong>ROR13 hash</strong> of both the module name and function name</li>
+<li>Rewrite each reference to instead call the user-supplied <code>resolve()</code> function, passing the two hash values as DWORD arguments</li>
+</ol>
+
+<div class="diagram">
+<h4>DFR Rewriting Process</h4>
+<div class="flow">
+<div class="box">COFF symbol<br><small>__imp_KERNEL32$VirtualAlloc</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">Crystal Palace<br><small>dfr "resolve" "ror13"</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">call resolve(<br><small>0x6A4ABC5B, 0xE553A458</small>)</div>
+</div>
+</div>
+
+<p>The <code>resolve()</code> function that Crystal Palace calls into is defined in <code>loader.c</code>:</p>
+
+<pre><code><span class="lang-tag">C (loader.c)</span>PVOID resolve(DWORD moduleHash, DWORD functionHash)
+{
+    PVOID mod = findModuleByHash(moduleHash);
+    return findFunctionByHash(mod, functionHash);
+}</code></pre>
+
+<p><code>findModuleByHash</code> walks the <strong>PEB InMemoryOrderModuleList</strong> (the linked list of loaded DLLs maintained by the Windows loader), hashes each module name using the ROR13 algorithm, and compares against <code>moduleHash</code>. <code>findFunctionByHash</code> then walks the found module's <strong>Export Address Table</strong>, hashes each exported function name, and returns the matching function pointer.</p>
+
+<h3>Two Resolution Methods</h3>
+
+<div class="versus">
+<div>
+<h5 style="color:var(--accent)">ror13 Mode</h5>
+<ul>
+<li>Replaces module + function names with 4-byte ROR13 hashes</li>
+<li>Two DWORD arguments passed to <code>resolve()</code></li>
+<li>Strings never appear in the final shellcode</li>
+<li>Slightly harder to reverse-engineer</li>
+<li>Used by the main UDRL loader</li>
+</ul>
+</div>
+<div>
+<h5 style="color:var(--accent2)">strings Mode</h5>
+<ul>
+<li>Embeds actual ASCII module and function name strings</li>
+<li>Two char* pointers passed to <code>resolve()</code></li>
+<li>Plain-text strings visible in the shellcode</li>
+<li>Easier to debug and develop with</li>
+<li>Used by the postex loader (<code>dfr "resolve" "strings"</code>)</li>
+</ul>
+</div>
+</div>
+
+<div class="card warn">
+<h4>Why Not Always Use ror13?</h4>
+<p>The postex loader uses <code>"strings"</code> mode because it needs to resolve <code>GetModuleHandle</code> and <code>GetProcAddress</code> &mdash; two functions whose addresses are <strong>patched in</strong> via the <code>patch</code> directive from an Aggressor script that already has access to the running Beacon. In this context, the resolver function expects string pointers, not hashes, because it delegates to the real <code>GetProcAddress</code> rather than walking export tables manually.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. The PIC Transformation</h2>
+
+<p>The <code>make pic</code> directive is where the real magic happens. It converts a standard COFF object file &mdash; which assumes fixed memory addresses &mdash; into a position-independent blob that can execute from any address.</p>
+
+<h3>What <code>make pic</code> Actually Does</h3>
+
+<ol>
+<li><strong>Resolve all internal relocations</strong> &mdash; Function calls between different <code>.text</code> sections within the same object are patched to use relative offsets</li>
+<li><strong>Flatten all sections</strong> &mdash; The separate <code>.text</code>, <code>.data</code>, and <code>.rdata</code> sections are merged into a single contiguous byte stream</li>
+<li><strong>Convert absolute addresses to RIP-relative</strong> &mdash; Any remaining absolute address references are rewritten to use x64 RIP-relative addressing so the code works regardless of where it is loaded</li>
+<li><strong>Place <code>go()</code> at offset 0</strong> &mdash; With the <code>+gofirst</code> flag, the entry point function is positioned at the very start of the blob so the caller can simply jump to byte 0</li>
+<li><strong>Optimize</strong> &mdash; With <code>+optimize</code>, Crystal Palace removes dead code and minimizes the output size</li>
+<li><strong>Discover functions</strong> &mdash; With <code>+disco</code>, Crystal Palace identifies all function boundaries, which is necessary for relocation and optimization</li>
+</ol>
+
+<div class="diagram">
+<h4>COFF to PIC Transformation</h4>
+<div class="flow">
+<div class="box">COFF Object<br><small>.text + .data + .rdata<br>+ relocations + symbols</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">make pic<br><small>resolve, flatten,<br>RIP-relativize</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Flat PIC Blob<br><small>No PE headers<br>No section table<br>No import directory</small></div>
+</div>
+</div>
+
+<div class="card green">
+<h4>What the Final Output Looks Like</h4>
+<p>The result of the entire spec pipeline is a raw byte stream with this layout:</p>
+<ul>
+<li><strong>Offset 0</strong> &mdash; <code>go()</code> entry point (executable code begins immediately)</li>
+<li><strong>Code body</strong> &mdash; All functions from loader.c, LibTCG, and LibGate, flattened and relocated</li>
+<li><strong>"dll" section</strong> &mdash; XOR-encrypted Beacon DLL, prefixed with a 4-byte length</li>
+<li><strong>"key" section</strong> &mdash; The 128-byte XOR key, prefixed with a 4-byte length</li>
+</ul>
+<p>There are <strong>no PE headers</strong>, <strong>no section tables</strong>, <strong>no import directories</strong>, and <strong>no relocations</strong> left to process. The shellcode finds its own data sections at runtime by using RIP-relative addressing to locate the linked sections after the code body.</p>
+</div>
+
+<p>This is why Crystal Palace-based loaders evade static analysis tools that look for PE artifacts. The payload is not a PE file at any point during execution &mdash; it is raw machine code with embedded encrypted data.</p>
+
+<!-- ============================================================ -->
+<div class="quiz" id="quiz2">
+<h4>Module 2 Knowledge Check</h4>
+
+<div class="quiz-q" data-correct="2">
+<p>Q1: What does the <code>dfr</code> directive do in a Crystal Palace spec?</p>
+<label data-opt="0"><input type="radio" name="q1"> Compiles C code to assembly</label>
+<label data-opt="1"><input type="radio" name="q1"> Encrypts the payload data</label>
+<label data-opt="2"><input type="radio" name="q1"> Rewrites API import references to call a resolver function at runtime</label>
+<label data-opt="3"><input type="radio" name="q1"> Generates random XOR keys</label>
+<div class="explain">The <code>dfr</code> (Dynamic Function Resolution) directive scans the COFF object for all <code>__imp_MODULE$Function</code> symbols and rewrites each reference to call the user-supplied resolver function instead. In <code>"ror13"</code> mode, the module and function names are replaced with their ROR13 hashes. This eliminates all static import references from the PIC shellcode.</div>
+</div>
+
+<div class="quiz-q" data-correct="0">
+<p>Q2: What does the <code>+gofirst</code> flag ensure?</p>
+<label data-opt="0"><input type="radio" name="q2"> The go() function is placed at offset 0 of the PIC blob</label>
+<label data-opt="1"><input type="radio" name="q2"> The output is optimized for size</label>
+<label data-opt="2"><input type="radio" name="q2"> All functions are discovered by the linker</label>
+<label data-opt="3"><input type="radio" name="q2"> The output targets x64 architecture</label>
+<div class="explain">The <code>+gofirst</code> flag tells Crystal Palace to place the <code>go()</code> entry-point function at byte offset 0 of the final PIC blob. This means the caller can execute the shellcode by simply jumping to the start of the buffer &mdash; no need to parse headers or look up an entry point. The other flags (<code>+optimize</code> and <code>+disco</code>) handle size optimization and function discovery respectively.</div>
+</div>
+
+<div class="quiz-q" data-correct="1">
+<p>Q3: What is the difference between <code>"ror13"</code> and <code>"strings"</code> DFR methods?</p>
+<label data-opt="0"><input type="radio" name="q3"> ror13 is faster at runtime</label>
+<label data-opt="1"><input type="radio" name="q3"> ror13 passes hash values, strings passes ASCII name pointers</label>
+<label data-opt="2"><input type="radio" name="q3"> strings is more secure against analysis</label>
+<label data-opt="3"><input type="radio" name="q3"> There is no functional difference</label>
+<div class="explain">In <code>"ror13"</code> mode, Crystal Palace computes the ROR13 hash of the module name and function name, then passes those two DWORD hash values to the resolver function. In <code>"strings"</code> mode, Crystal Palace embeds the actual ASCII strings in the shellcode and passes pointers to them instead. The ror13 method avoids having readable API names in the shellcode, while the strings method is used when the resolver delegates to <code>GetProcAddress</code> directly (as in the postex loader).</div>
+</div>
+
+<button class="quiz-btn" onclick="gradeQuiz('quiz2')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module1.html">&larr; Prev: The Loader Problem</a>
+<a class="primary" href="module3.html">Next: LibTCG &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

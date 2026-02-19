@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Module 6: Beacon User Data (BUD) - Crystal-Loaders Course</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F48E;</text></svg>">
+<link rel="stylesheet" href="../../../assets/course.css">
+<style>:root{--accent:#f43f5e;--accent2:#fb923c;--gradient:linear-gradient(135deg,#f43f5e,#fb923c)}</style>
+</head>
+<body>
+
+<button class="hamburger" aria-label="Toggle navigation">&#9776;</button>
+
+<nav>
+<div class="logo">
+<h2>Crystal-Loaders</h2>
+<span>PIC Reflective Loaders</span>
+</div>
+<a class="home-link" href="../CrystalLoaders_index.html">&larr; Course Home</a>
+<a class="mod-link" href="module1.html"><span class="diff d1">1</span> The Loader Problem</a>
+<a class="mod-link" href="module2.html"><span class="diff d1">2</span> Crystal Palace</a>
+<a class="mod-link" href="module3.html"><span class="diff d2">3</span> LibTCG</a>
+<a class="mod-link" href="module4.html"><span class="diff d2">4</span> LibGate Syscalls</a>
+<a class="mod-link" href="module5.html"><span class="diff d2">5</span> UDRL Walkthrough</a>
+<a class="mod-link active" href="module6.html"><span class="diff d3">6</span> Beacon User Data</a>
+<a class="mod-link" href="module7.html"><span class="diff d3">7</span> Post-Ex &amp; Aggressor</a>
+<a class="mod-link" href="module8.html"><span class="diff d3">8</span> Extending Loaders</a>
+</nav>
+
+<main>
+<span class="diff-badge hard">Difficulty: Advanced</span>
+<h1>Module 6: Beacon User Data (BUD)</h1>
+<p class="subtitle">The contract between loader and Beacon &mdash; pre-resolved syscalls, RTL functions, and full memory layout awareness delivered through a single structured data block.</p>
+
+<div class="card highlight">
+<h4>Module Objective</h4>
+<p>Understand the <strong>USER_DATA</strong> structure and every sub-structure it contains. By the end of this module you will know how Crystal-Loaders populates BUD, what data Beacon expects to receive, and why this mechanism is critical for sleep masking, indirect syscalls, and clean memory cleanup. This is what makes Crystal-Loaders more than just a loader: it provides Beacon with a complete runtime environment.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. What Is BUD?</h2>
+
+<p><strong>BUD (Beacon User Data)</strong> is the mechanism by which a UDRL (User-Defined Reflective Loader) communicates loader-resolved data to the Beacon payload after loading it into memory. It is not a Cobalt Strike "feature" in the UI sense &mdash; it is a structured binary contract between the loader and Beacon's internal runtime.</p>
+
+<p>The concept was introduced with the original UDRL feature in Cobalt Strike 4.4, but it was significantly expanded in <strong>CS 4.11</strong> to support a much richer set of pre-resolved data. Crystal-Loaders targets the 4.11 BUD specification.</p>
+
+<div class="card">
+<h4>How BUD Is Delivered</h4>
+<p>The loader populates a <code>USER_DATA</code> structure in memory and then passes a pointer to it via a special <code>DllMain</code> call. Cobalt Strike defines a custom <code>fdwReason</code> value:</p>
+<pre><code><span class="lang-tag">C</span>#define DLL_BEACON_USER_DATA  0x0d   // fdwReason = 13
+
+// The loader calls Beacon's DllMain with:
+DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
+<p>Beacon's <code>DllMain</code> checks for this reason code and, when it receives it, copies the pointer and stores the USER_DATA internally. This call happens <strong>after</strong> the standard <code>DLL_PROCESS_ATTACH</code> call but <strong>before</strong> Beacon enters its main command loop.</p>
+</div>
+
+<p>Once Beacon has the USER_DATA pointer, it uses the pre-resolved data for four critical capabilities:</p>
+
+<table>
+<tr><th>Capability</th><th>BUD Field Used</th><th>Why It Matters</th></tr>
+<tr><td>Indirect syscall execution</td><td><code>syscalls</code> (SYSCALL_API)</td><td>Beacon can call Nt* functions through pre-resolved <code>syscall;ret</code> gadgets without resolving them itself</td></tr>
+<tr><td>Sleep mask memory tracking</td><td><code>allocatedMemory</code></td><td>The sleep mask knows exactly which memory regions to encrypt/decrypt and what permissions to restore</td></tr>
+<tr><td>Memory cleanup on exit</td><td><code>allocatedMemory</code></td><td>Beacon can cleanly free all loader-allocated memory using the correct deallocation API for each region</td></tr>
+<tr><td>RTL function calls</td><td><code>rtls</code> (RTL_API)</td><td>Beacon can convert DOS paths to NT paths and manage heap memory without resolving these functions itself</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>2. The USER_DATA Structure</h2>
+
+<p>The top-level structure that ties everything together. Every field is a pointer to a sub-structure (or a fixed-size buffer), and Beacon validates the <code>version</code> field before touching anything else.</p>
+
+<pre><code><span class="lang-tag">C</span>typedef struct {
+    DWORD               version;          // CS version: 0x041100 = 4.11
+    PSYSCALL_API        syscalls;         // Pre-resolved syscall entries (35 Nt*)
+    BYTE                custom[32];       // 32-byte user-defined field
+    PRTL_API            rtls;             // Pre-resolved RTL functions
+    PALLOCATED_MEMORY   allocatedMemory;  // Memory region tracking
+} USER_DATA;</code></pre>
+
+<div class="card">
+<h4>Field-by-Field Breakdown</h4>
+<table>
+<tr><th>Field</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>version</code></td><td><code>DWORD</code></td><td>Must match the Cobalt Strike version that built the payload. For CS 4.11 this is <code>0x041100</code>. Beacon validates this value immediately &mdash; if it does not match, Beacon ignores the entire USER_DATA structure. This prevents version-mismatched loaders from corrupting Beacon's state.</td></tr>
+<tr><td><code>syscalls</code></td><td><code>PSYSCALL_API</code></td><td>Pointer to the SYSCALL_API structure containing all 35 Nt* function entries. Each entry holds the function address, a <code>syscall;ret</code> gadget address, and the System Service Number. Beacon uses these for all native API calls, routing them through indirect syscalls.</td></tr>
+<tr><td><code>custom[32]</code></td><td><code>BYTE[32]</code></td><td>A 32-byte user-defined buffer that the loader can use to pass arbitrary data to Beacon. This could be encryption keys, configuration flags, a nonce, or any other operator-defined data. Beacon does not interpret these bytes &mdash; they are available to post-exploitation scripts and BOFs via the Beacon User Data API.</td></tr>
+<tr><td><code>rtls</code></td><td><code>PRTL_API</code></td><td>Pointer to the RTL_API structure with 3 resolved RTL (Runtime Library) function addresses from ntdll and the PEB. These are functions Beacon needs internally but that are not part of the syscall table.</td></tr>
+<tr><td><code>allocatedMemory</code></td><td><code>PALLOCATED_MEMORY</code></td><td>Pointer to the ALLOCATED_MEMORY structure that tracks up to 6 memory regions with up to 8 sections each. This gives Beacon (and its sleep mask) a complete map of every memory region the loader allocated, including section-level metadata for encryption and permission management.</td></tr>
+</table>
+</div>
+
+<div class="card warn">
+<h4>Version Validation Is Strict</h4>
+<p>If you build a loader targeting CS 4.11 but try to use it with a CS 4.9 Beacon DLL, the version check will fail and Beacon will proceed <strong>without</strong> any BUD data. This means no indirect syscalls, no sleep mask memory tracking, and no RTL functions. The loader will appear to work (Beacon runs), but all advanced evasion features that depend on BUD will be silently disabled.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. SYSCALL_API &mdash; The Syscall Table</h2>
+
+<p>The <code>SYSCALL_API</code> structure is the largest component of BUD. It contains 35 entries, one for each Nt* function that Beacon may need to call during its lifecycle. Each entry is a <code>SYSCALL_API_ENTRY</code> with three fields:</p>
+
+<pre><code><span class="lang-tag">C</span>typedef struct {
+    PVOID fnAddr;     // Address of the Nt* function in ntdll.dll
+    PVOID jmpAddr;    // Address of a syscall;ret gadget in ntdll for indirect execution
+    DWORD sysnum;     // The System Service Number (SSN) for this syscall
+} SYSCALL_API_ENTRY;</code></pre>
+
+<div class="card">
+<h4>Understanding the Three Fields</h4>
+<table>
+<tr><th>Field</th><th>Purpose</th><th>Used By</th></tr>
+<tr><td><code>fnAddr</code></td><td>The actual address of the Nt* stub in ntdll.dll. This is where the function's code begins (the <code>mov r10, rcx</code> / <code>mov eax, SSN</code> prologue). Used for direct calls when indirect syscalls are not needed or as a fallback.</td><td>Beacon (direct calls)</td></tr>
+<tr><td><code>jmpAddr</code></td><td>The address of a <code>syscall; ret</code> instruction pair found within a <strong>different</strong> Nt* function in ntdll. By jumping to this gadget instead of executing <code>syscall</code> inline, the return address on the stack points into ntdll &mdash; not into Beacon's private memory. This is the core of indirect syscall execution.</td><td>LibGate trampoline</td></tr>
+<tr><td><code>sysnum</code></td><td>The System Service Number extracted by LibGate's Hell's Gate / Halo's Gate algorithm. This number is loaded into <code>EAX</code> before the <code>syscall</code> instruction to specify which kernel service to invoke.</td><td>LibGate SSN setup</td></tr>
+</table>
+</div>
+
+<p>The full SYSCALL_API structure contains 35 named entries. Crystal-Loaders resolves all of them during the loading process using LibGate:</p>
+
+<pre><code><span class="lang-tag">C</span>typedef struct {
+    SYSCALL_API_ENTRY NtAllocateVirtualMemory;
+    SYSCALL_API_ENTRY NtClose;
+    SYSCALL_API_ENTRY NtContinue;
+    SYSCALL_API_ENTRY NtCreateEvent;
+    SYSCALL_API_ENTRY NtCreateFile;
+    SYSCALL_API_ENTRY NtCreateMutant;
+    SYSCALL_API_ENTRY NtCreateNamedPipeFile;
+    SYSCALL_API_ENTRY NtCreateSection;
+    SYSCALL_API_ENTRY NtCreateThread;
+    SYSCALL_API_ENTRY NtCreateThreadEx;
+    SYSCALL_API_ENTRY NtDuplicateObject;
+    SYSCALL_API_ENTRY NtFreeVirtualMemory;
+    SYSCALL_API_ENTRY NtGetContextThread;
+    SYSCALL_API_ENTRY NtMapViewOfSection;
+    SYSCALL_API_ENTRY NtOpenEvent;
+    SYSCALL_API_ENTRY NtOpenFile;
+    SYSCALL_API_ENTRY NtOpenMutant;
+    SYSCALL_API_ENTRY NtOpenProcess;
+    SYSCALL_API_ENTRY NtOpenThread;
+    SYSCALL_API_ENTRY NtProtectVirtualMemory;
+    SYSCALL_API_ENTRY NtQueryInformationProcess;
+    SYSCALL_API_ENTRY NtQueryInformationThread;
+    SYSCALL_API_ENTRY NtQuerySystemInformation;
+    SYSCALL_API_ENTRY NtQueryVirtualMemory;
+    SYSCALL_API_ENTRY NtQueueApcThread;
+    SYSCALL_API_ENTRY NtReadFile;
+    SYSCALL_API_ENTRY NtReadVirtualMemory;
+    SYSCALL_API_ENTRY NtResumeThread;
+    SYSCALL_API_ENTRY NtSetContextThread;
+    SYSCALL_API_ENTRY NtSetInformationThread;
+    SYSCALL_API_ENTRY NtTerminateProcess;
+    SYSCALL_API_ENTRY NtTerminateThread;
+    SYSCALL_API_ENTRY NtUnmapViewOfSection;
+    SYSCALL_API_ENTRY NtWaitForSingleObject;
+    SYSCALL_API_ENTRY NtWaitForMultipleObjects;
+    SYSCALL_API_ENTRY NtWriteVirtualMemory;
+} SYSCALL_API;</code></pre>
+
+<h3>Complete Syscall Reference Table</h3>
+
+<p>All 35 Nt* functions in the SYSCALL_API, organized by functional category:</p>
+
+<table>
+<tr><th>#</th><th>Function</th><th>Purpose</th><th>Category</th></tr>
+<tr><td>1</td><td><code>NtAllocateVirtualMemory</code></td><td>Allocate memory regions in a process address space</td><td>Memory</td></tr>
+<tr><td>2</td><td><code>NtFreeVirtualMemory</code></td><td>Free previously allocated memory regions</td><td>Memory</td></tr>
+<tr><td>3</td><td><code>NtProtectVirtualMemory</code></td><td>Change memory page permissions (RW, RX, etc.)</td><td>Memory</td></tr>
+<tr><td>4</td><td><code>NtQueryVirtualMemory</code></td><td>Query information about a memory region (type, protection, size)</td><td>Memory</td></tr>
+<tr><td>5</td><td><code>NtReadVirtualMemory</code></td><td>Read memory from a remote process</td><td>Memory</td></tr>
+<tr><td>6</td><td><code>NtWriteVirtualMemory</code></td><td>Write memory to a remote process</td><td>Memory</td></tr>
+<tr><td>7</td><td><code>NtCreateSection</code></td><td>Create a section object for memory mapping</td><td>Memory</td></tr>
+<tr><td>8</td><td><code>NtMapViewOfSection</code></td><td>Map a section object into a process address space</td><td>Memory</td></tr>
+<tr><td>9</td><td><code>NtUnmapViewOfSection</code></td><td>Unmap a previously mapped section from a process</td><td>Memory</td></tr>
+<tr><td>10</td><td><code>NtCreateThreadEx</code></td><td>Create a new thread (modern API with extended parameters)</td><td>Threads</td></tr>
+<tr><td>11</td><td><code>NtCreateThread</code></td><td>Create a new thread (legacy API)</td><td>Threads</td></tr>
+<tr><td>12</td><td><code>NtResumeThread</code></td><td>Resume a suspended thread</td><td>Threads</td></tr>
+<tr><td>13</td><td><code>NtGetContextThread</code></td><td>Read a thread's CPU context (registers, flags)</td><td>Threads</td></tr>
+<tr><td>14</td><td><code>NtSetContextThread</code></td><td>Set a thread's CPU context (used in sleep mask ROP chains)</td><td>Threads</td></tr>
+<tr><td>15</td><td><code>NtSetInformationThread</code></td><td>Set thread properties (e.g., <code>ThreadHideFromDebugger</code>)</td><td>Threads</td></tr>
+<tr><td>16</td><td><code>NtQueryInformationThread</code></td><td>Query thread information (start address, priority, etc.)</td><td>Threads</td></tr>
+<tr><td>17</td><td><code>NtOpenThread</code></td><td>Open a handle to an existing thread</td><td>Threads</td></tr>
+<tr><td>18</td><td><code>NtTerminateThread</code></td><td>Terminate a specific thread</td><td>Threads</td></tr>
+<tr><td>19</td><td><code>NtQueueApcThread</code></td><td>Queue an Asynchronous Procedure Call to a thread</td><td>Threads</td></tr>
+<tr><td>20</td><td><code>NtContinue</code></td><td>Resume execution from a modified context (used in sleep mask ROP for context switching)</td><td>Threads</td></tr>
+<tr><td>21</td><td><code>NtOpenProcess</code></td><td>Open a handle to a process</td><td>Process</td></tr>
+<tr><td>22</td><td><code>NtQueryInformationProcess</code></td><td>Query process information (PEB address, debug status, etc.)</td><td>Process</td></tr>
+<tr><td>23</td><td><code>NtTerminateProcess</code></td><td>Terminate a process</td><td>Process</td></tr>
+<tr><td>24</td><td><code>NtQuerySystemInformation</code></td><td>Query system-wide information (process list, handle table, etc.)</td><td>System</td></tr>
+<tr><td>25</td><td><code>NtCreateFile</code></td><td>Create or open a file (NT-level file I/O)</td><td>File I/O</td></tr>
+<tr><td>26</td><td><code>NtOpenFile</code></td><td>Open an existing file</td><td>File I/O</td></tr>
+<tr><td>27</td><td><code>NtReadFile</code></td><td>Read data from a file</td><td>File I/O</td></tr>
+<tr><td>28</td><td><code>NtCreateNamedPipeFile</code></td><td>Create a named pipe for inter-process communication</td><td>IPC</td></tr>
+<tr><td>29</td><td><code>NtClose</code></td><td>Close any NT handle (files, threads, processes, events, etc.)</td><td>Handles</td></tr>
+<tr><td>30</td><td><code>NtDuplicateObject</code></td><td>Duplicate a handle (within or across processes)</td><td>Handles</td></tr>
+<tr><td>31</td><td><code>NtCreateEvent</code></td><td>Create a synchronization event object</td><td>Sync</td></tr>
+<tr><td>32</td><td><code>NtOpenEvent</code></td><td>Open an existing event object by name</td><td>Sync</td></tr>
+<tr><td>33</td><td><code>NtCreateMutant</code></td><td>Create a mutex for mutual exclusion</td><td>Sync</td></tr>
+<tr><td>34</td><td><code>NtOpenMutant</code></td><td>Open an existing mutex by name</td><td>Sync</td></tr>
+<tr><td>35</td><td><code>NtWaitForSingleObject</code></td><td>Wait on a single handle (event, mutex, thread, process, etc.)</td><td>Sync</td></tr>
+</table>
+
+<div class="card highlight">
+<h4>Wait &mdash; What About NtWaitForMultipleObjects?</h4>
+<p>That is the 36th entry in the struct declaration above, bringing the total count to 35 named Nt* functions in the SYSCALL_API (the numbering in the table counts from 1). <code>NtWaitForMultipleObjects</code> waits on an array of handles simultaneously &mdash; used when Beacon needs to wait on multiple synchronization primitives at once.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. RTL_API &mdash; Runtime Library Functions</h2>
+
+<p>Not everything Beacon needs is a syscall. Three runtime library values are resolved by the loader and passed separately in the <code>RTL_API</code> structure:</p>
+
+<pre><code><span class="lang-tag">C</span>typedef struct {
+    PVOID RtlDosPathNameToNtPathNameUWithStatus;
+    PVOID RtlFreeHeap;
+    PVOID ProcessHeap;  // From PEB->ProcessHeap
+} RTL_API;</code></pre>
+
+<div class="card">
+<h4>Why These Three?</h4>
+<table>
+<tr><th>Field</th><th>What It Does</th><th>Why Beacon Needs It</th></tr>
+<tr><td><code>RtlDosPathNameToNtPathNameUWithStatus</code></td><td>Converts a DOS-style path like <code>C:\Windows\System32\cmd.exe</code> into an NT-style path like <code>\??\C:\Windows\System32\cmd.exe</code></td><td>The Nt* file APIs (<code>NtCreateFile</code>, <code>NtOpenFile</code>) require NT path format. Without this function, Beacon would need to resolve and call it dynamically every time it performs file I/O, adding overhead and resolution artifacts.</td></tr>
+<tr><td><code>RtlFreeHeap</code></td><td>Frees a heap allocation made with <code>RtlAllocateHeap</code> (the underlying implementation of <code>HeapFree</code>)</td><td>Beacon uses heap allocations internally for buffers, strings, and temporary data. Having the free function pre-resolved avoids repeated runtime lookups into ntdll.</td></tr>
+<tr><td><code>ProcessHeap</code></td><td>The default process heap handle, read directly from the Process Environment Block</td><td>Both <code>RtlAllocateHeap</code> and <code>RtlFreeHeap</code> require a heap handle as their first argument. Rather than reading the PEB each time, the loader reads it once and passes it through BUD.</td></tr>
+</table>
+</div>
+
+<h3>ResolveRtlFunctions Implementation</h3>
+
+<p>The loader resolves these three values during initialization, before the BUD handoff:</p>
+
+<pre><code><span class="lang-tag">C</span>void ResolveRtlFunctions(PRTL_API rtls)
+{
+    // Find ntdll base address via PEB walking + hash comparison
+    PVOID ntdll = findModuleByHash(NTDLL_HASH);
+
+    // Resolve the two RTL functions from ntdll's export table
+    rtls->RtlDosPathNameToNtPathNameUWithStatus = findFunctionByHash(
+        ntdll, RTL_DOSPATHNAME_HASH);
+    rtls->RtlFreeHeap = findFunctionByHash(
+        ntdll, RTL_FREEHEAP_HASH);
+
+    // Read ProcessHeap directly from the PEB
+    // PEB is at gs:[0x60] on x64
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+    rtls->ProcessHeap = pPeb->ProcessHeap;
+}</code></pre>
+
+<div class="card warn">
+<h4>PEB Access on x64</h4>
+<p>On 64-bit Windows, the PEB is accessible via the <code>GS</code> segment register at offset <code>0x60</code>. The <code>__readgsqword(0x60)</code> intrinsic reads an 8-byte pointer from <code>GS:[0x60]</code>, giving the base address of the PEB structure. The <code>ProcessHeap</code> field is at offset <code>0x30</code> within the PEB. This is a well-known technique used across offensive tooling for resolving runtime data without calling any API functions.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. ALLOCATED_MEMORY &mdash; Memory Region Tracking</h2>
+
+<p>This is the most complex component of BUD, and arguably the most important. The <code>ALLOCATED_MEMORY</code> structure gives Beacon a complete map of every memory region the loader allocated, with section-level granularity. This map is <strong>critical for sleep masking</strong> &mdash; without it, the sleep mask would have no way to know which regions to encrypt, what permissions to change, or how to restore them after waking up.</p>
+
+<pre><code><span class="lang-tag">C</span>typedef struct {
+    ALLOCATED_MEMORY_REGION AllocatedMemoryRegions[6];  // Up to 6 tracked regions
+} ALLOCATED_MEMORY;</code></pre>
+
+<p>Each region represents a single top-level memory allocation (e.g., the Beacon DLL image, the sleep mask code, a BOF buffer). Within each region, up to 8 sections describe the internal layout:</p>
+
+<pre><code><span class="lang-tag">C</span>typedef struct {
+    ALLOCATED_MEMORY_PURPOSE                 Purpose;
+    PVOID                                    AllocationBase;
+    SIZE_T                                   RegionSize;
+    DWORD                                    Type;          // MEM_COMMIT, MEM_RESERVE, etc.
+    ALLOCATED_MEMORY_SECTION                 Sections[8];   // Up to 8 sections per region
+    ALLOCATED_MEMORY_CLEANUP_INFORMATION     CleanupInformation;
+} ALLOCATED_MEMORY_REGION;</code></pre>
+
+<pre><code><span class="lang-tag">C</span>typedef struct {
+    ALLOCATED_MEMORY_LABEL  Label;           // TEXT, RDATA, DATA, PDATA, RELOC, etc.
+    PVOID                   BaseAddress;
+    SIZE_T                  VirtualSize;
+    DWORD                   CurrentProtect;
+    DWORD                   PreviousProtect;
+    BOOL                    MaskSection;     // TRUE = encrypt this section during sleep
+} ALLOCATED_MEMORY_SECTION;</code></pre>
+
+<div class="card">
+<h4>Section Fields Explained</h4>
+<table>
+<tr><th>Field</th><th>Description</th></tr>
+<tr><td><code>Label</code></td><td>Identifies what the section contains: <code>.text</code> (code), <code>.rdata</code> (read-only data), <code>.data</code> (writable data), <code>.pdata</code> (exception handlers), <code>.reloc</code> (relocations), the PE header, or a generic buffer.</td></tr>
+<tr><td><code>BaseAddress</code></td><td>The virtual address where this section starts. Combined with <code>VirtualSize</code>, this defines the exact byte range.</td></tr>
+<tr><td><code>VirtualSize</code></td><td>The size of this section in bytes. May differ from the on-disk raw size due to alignment and uninitialized data (.bss).</td></tr>
+<tr><td><code>CurrentProtect</code></td><td>The current memory protection (e.g., <code>PAGE_EXECUTE_READ</code> for <code>.text</code>, <code>PAGE_READWRITE</code> for <code>.data</code>). The sleep mask saves this before changing protections.</td></tr>
+<tr><td><code>PreviousProtect</code></td><td>The previous memory protection before the last <code>VirtualProtect</code> call. Used to track protection transitions.</td></tr>
+<tr><td><code>MaskSection</code></td><td>A boolean flag. If <code>TRUE</code>, the sleep mask will encrypt this section's memory during sleep and decrypt it on wake. Typically <code>TRUE</code> for all sections containing Beacon code or data.</td></tr>
+</table>
+</div>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">ALLOCATED_MEMORY Layout Example</h4>
+<div class="flow" style="flex-direction:column;gap:6px">
+<div class="box hl" style="width:100%"><strong>ALLOCATED_MEMORY</strong></div>
+<div style="display:flex;gap:10px;flex-wrap:wrap">
+<div style="flex:1;min-width:280px">
+<div class="box" style="width:100%;border-color:var(--accent)"><strong>Region 0</strong>: PURPOSE_BEACON_MEMORY<br><small>AllocationBase: 0x1A000000 | Size: 0x5C000</small></div>
+<div class="flow" style="flex-direction:column;gap:2px;padding:4px 0 0 20px">
+<div class="box" style="width:100%;padding:6px 10px"><small>Section 0: LABEL_PEHEADER | 0x1000 | PAGE_READWRITE | Mask: TRUE</small></div>
+<div class="box" style="width:100%;padding:6px 10px"><small>Section 1: LABEL_TEXT | 0x3E000 | PAGE_EXECUTE_READ | Mask: TRUE</small></div>
+<div class="box" style="width:100%;padding:6px 10px"><small>Section 2: LABEL_RDATA | 0x12000 | PAGE_READONLY | Mask: TRUE</small></div>
+<div class="box" style="width:100%;padding:6px 10px"><small>Section 3: LABEL_DATA | 0x4000 | PAGE_READWRITE | Mask: TRUE</small></div>
+<div class="box" style="width:100%;padding:6px 10px"><small>Section 4: LABEL_PDATA | 0x2000 | PAGE_READONLY | Mask: TRUE</small></div>
+<div class="box" style="width:100%;padding:6px 10px"><small>Section 5: LABEL_RELOC | 0x1000 | PAGE_READONLY | Mask: TRUE</small></div>
+</div>
+</div>
+<div style="flex:1;min-width:280px">
+<div class="box" style="width:100%;border-color:var(--accent2)"><strong>Region 1</strong>: PURPOSE_SLEEPMASK_MEMORY<br><small>AllocationBase: 0x1B000000 | Size: 0x8000</small></div>
+<div class="flow" style="flex-direction:column;gap:2px;padding:4px 0 0 20px">
+<div class="box" style="width:100%;padding:6px 10px"><small>Section 0: LABEL_TEXT | 0x6000 | PAGE_EXECUTE_READ | Mask: FALSE</small></div>
+<div class="box" style="width:100%;padding:6px 10px"><small>Section 1: LABEL_DATA | 0x2000 | PAGE_READWRITE | Mask: FALSE</small></div>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<div class="card warn">
+<h4>Why MaskSection Is FALSE for Sleep Mask Memory</h4>
+<p>The sleep mask cannot encrypt itself. The sleep mask code must remain in cleartext and executable while it is running the encryption routine on all other Beacon regions. If the sleep mask encrypted its own <code>.text</code> section, execution would immediately crash. This is why the sleep mask's own region has <code>MaskSection = FALSE</code> for all its sections.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Enums Explained</h2>
+
+<p>Three enum types provide semantic meaning to the raw integer values stored in the ALLOCATED_MEMORY structures. Understanding these is essential for interpreting the memory map correctly.</p>
+
+<h3>ALLOCATED_MEMORY_PURPOSE</h3>
+
+<pre><code><span class="lang-tag">C</span>enum ALLOCATED_MEMORY_PURPOSE {
+    PURPOSE_EMPTY           = 0,   // Slot is unused
+    PURPOSE_GENERIC_BUFFER  = 1,   // General-purpose buffer (loader scratch space)
+    PURPOSE_BEACON_MEMORY   = 2,   // The Beacon DLL image
+    PURPOSE_SLEEPMASK_MEMORY = 3,  // The sleep mask code
+    PURPOSE_BOF_MEMORY      = 4    // A loaded BOF (Beacon Object File)
+};</code></pre>
+
+<div class="card">
+<h4>Purpose Enum Usage</h4>
+<table>
+<tr><th>Value</th><th>When Used</th><th>Sleep Mask Behavior</th></tr>
+<tr><td><code>PURPOSE_EMPTY</code></td><td>Default. Indicates the region slot is not in use.</td><td>Skipped entirely</td></tr>
+<tr><td><code>PURPOSE_GENERIC_BUFFER</code></td><td>Loader scratch space, temporary allocations</td><td>Encrypted if MaskSection is TRUE</td></tr>
+<tr><td><code>PURPOSE_BEACON_MEMORY</code></td><td>The main Beacon DLL loaded by the UDRL</td><td>All sections encrypted during sleep</td></tr>
+<tr><td><code>PURPOSE_SLEEPMASK_MEMORY</code></td><td>The sleep mask's own code and data</td><td>Never encrypted (it would crash)</td></tr>
+<tr><td><code>PURPOSE_BOF_MEMORY</code></td><td>Beacon Object Files loaded at runtime</td><td>Encrypted if still resident during sleep</td></tr>
+</table>
+</div>
+
+<h3>ALLOCATED_MEMORY_LABEL</h3>
+
+<pre><code><span class="lang-tag">C</span>enum ALLOCATED_MEMORY_LABEL {
+    LABEL_BUFFER    = 0,   // Generic buffer (non-PE data)
+    LABEL_PEHEADER  = 1,   // PE/COFF headers
+    LABEL_TEXT      = 2,   // .text section (executable code)
+    LABEL_RDATA     = 3,   // .rdata section (read-only data, vtables, strings)
+    LABEL_DATA      = 4,   // .data section (writable initialized data)
+    LABEL_PDATA     = 5,   // .pdata section (exception handler tables)
+    LABEL_RELOC     = 6    // .reloc section (base relocation fixups)
+};</code></pre>
+
+<p>The label tells the sleep mask (and Beacon) what kind of data lives in each section. This matters because different sections need different permission transitions during sleep:</p>
+
+<table>
+<tr><th>Label</th><th>Normal Permission</th><th>Sleep Permission</th><th>Why</th></tr>
+<tr><td><code>LABEL_TEXT</code></td><td><code>PAGE_EXECUTE_READ</code></td><td><code>PAGE_READWRITE</code></td><td>Must become writable for encryption, non-executable to avoid memory scans</td></tr>
+<tr><td><code>LABEL_RDATA</code></td><td><code>PAGE_READONLY</code></td><td><code>PAGE_READWRITE</code></td><td>Must become writable for encryption</td></tr>
+<tr><td><code>LABEL_DATA</code></td><td><code>PAGE_READWRITE</code></td><td><code>PAGE_READWRITE</code></td><td>Already writable, just needs encryption</td></tr>
+<tr><td><code>LABEL_PDATA</code></td><td><code>PAGE_READONLY</code></td><td><code>PAGE_READWRITE</code></td><td>Must become writable for encryption</td></tr>
+<tr><td><code>LABEL_PEHEADER</code></td><td><code>PAGE_READWRITE</code></td><td><code>PAGE_READWRITE</code></td><td>Already writable, encrypt to hide PE header artifacts</td></tr>
+</table>
+
+<h3>ALLOCATED_MEMORY_ALLOCATION_METHOD</h3>
+
+<pre><code><span class="lang-tag">C</span>enum ALLOCATED_MEMORY_ALLOCATION_METHOD {
+    METHOD_VIRTUALALLOC  = 0,   // Allocated via VirtualAlloc / NtAllocateVirtualMemory
+    METHOD_HEAPALLOC     = 1,   // Allocated via HeapAlloc / RtlAllocateHeap
+    METHOD_MODULESTOMP   = 2,   // Overwrote an existing mapped module (module stomping)
+    METHOD_NTMAPVIEW     = 3    // Mapped via NtMapViewOfSection
+};</code></pre>
+
+<div class="card green">
+<h4>Why Allocation Method Matters</h4>
+<p>Different allocation methods require different deallocation APIs. When Beacon exits or needs to clean up a memory region, it must call the correct free function:</p>
+<table>
+<tr><th>Allocation Method</th><th>Deallocation API</th></tr>
+<tr><td><code>METHOD_VIRTUALALLOC</code></td><td><code>NtFreeVirtualMemory</code></td></tr>
+<tr><td><code>METHOD_HEAPALLOC</code></td><td><code>RtlFreeHeap</code> (via RTL_API)</td></tr>
+<tr><td><code>METHOD_MODULESTOMP</code></td><td>No deallocation needed (memory belongs to the stomped module)</td></tr>
+<tr><td><code>METHOD_NTMAPVIEW</code></td><td><code>NtUnmapViewOfSection</code></td></tr>
+</table>
+<p>Calling <code>NtFreeVirtualMemory</code> on a heap allocation, or <code>NtUnmapViewOfSection</code> on a VirtualAlloc region, would cause heap corruption or an access violation. The allocation method enum prevents these catastrophic cleanup errors.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Why BUD Matters for Sleep Masking</h2>
+
+<p>Sleep masking is the technique where Beacon encrypts its own memory during sleep intervals to avoid detection by memory scanners. Without BUD, the sleep mask would need to hardcode memory addresses, discover regions through heuristic scanning, or use a simplified single-region approach. BUD gives the sleep mask a <strong>complete, loader-provided map</strong> of every region and every section within those regions.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">Sleep Mask Lifecycle with BUD</h4>
+<div class="flow" style="flex-direction:column;gap:4px">
+<div class="box g" style="width:100%"><strong>Step 1:</strong> Beacon enters sleep &mdash; transfers control to the sleep mask function</div>
+<div class="box" style="width:100%"><strong>Step 2:</strong> Sleep mask reads <code>ALLOCATED_MEMORY</code> from BUD to enumerate all tracked regions</div>
+<div class="box" style="width:100%"><strong>Step 3:</strong> For each region, iterates through <code>Sections[8]</code> looking for <code>MaskSection == TRUE</code></div>
+<div class="box hl" style="width:100%"><strong>Step 4:</strong> For each maskable section: encrypts the memory with XOR/RC4/AES using a per-sleep random key</div>
+<div class="box hl" style="width:100%"><strong>Step 5:</strong> Changes section permissions to <code>PAGE_READWRITE</code> (removes EXECUTE to avoid RX memory scans)</div>
+<div class="box" style="width:100%"><strong>Step 6:</strong> Calls <code>NtWaitForSingleObject</code> with the sleep duration (using the pre-resolved syscall from BUD)</div>
+<div class="box hl" style="width:100%"><strong>Step 7:</strong> After waking: decrypts each section and restores original permissions from <code>CurrentProtect</code></div>
+<div class="box g" style="width:100%"><strong>Step 8:</strong> Beacon resumes execution with all memory restored to its pre-sleep state</div>
+</div>
+</div>
+
+<div class="card highlight">
+<h4>The Key Insight</h4>
+<p>Without BUD, the sleep mask would need to either:</p>
+<ul>
+<li><strong>Hardcode addresses</strong> &mdash; Brittle, breaks with ASLR, different payload sizes, or multiple regions</li>
+<li><strong>Scan for its own PE headers</strong> &mdash; Requires headers to still exist (Crystal-Loaders erases them)</li>
+<li><strong>Use a single-region model</strong> &mdash; Cannot track sleep mask memory separately from Beacon memory</li>
+</ul>
+<p>BUD solves all of these problems by giving the sleep mask a structured, complete, loader-provided memory map with section-level granularity and correct permission metadata. The sleep mask simply iterates the array and processes each entry &mdash; no guessing, no scanning, no hardcoding.</p>
+</div>
+
+<p>The sleep mask also benefits from the pre-resolved <code>SYSCALL_API</code> in BUD. During the sleep cycle, it needs to call <code>NtProtectVirtualMemory</code> (to change permissions) and <code>NtWaitForSingleObject</code> (to sleep). If it had to resolve these itself, it would need its own PEB walking and export table parsing code &mdash; duplicating work the loader already did. With BUD, the sleep mask just reads the pre-resolved entries.</p>
+
+<!-- ============================================================ -->
+<h2>8. The FixSectionPermissions Function</h2>
+
+<p>This function is the bridge between the PE loading logic (LibTCG) and the BUD memory tracking system. After the loader copies Beacon's PE sections into memory, <code>FixSectionPermissions</code> sets the correct per-section memory protections <strong>and</strong> populates the <code>ALLOCATED_MEMORY_REGION</code> structure for BUD.</p>
+
+<pre><code><span class="lang-tag">C</span>void FixSectionPermissions(PDLLDATA dlldata, PBYTE dst, PALLOCATED_MEMORY_REGION region)
+{
+    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(dlldata->NtHeaders);
+
+    // Set the region-level metadata
+    region->AllocationBase = dst;
+    region->RegionSize     = SizeOfDLL(dlldata);
+    region->Type           = MEM_COMMIT;
+
+    // Iterate each PE section and apply granular protections
+    for (WORD i = 0; i < dlldata->NtHeaders->FileHeader.NumberOfSections; i++)
+    {
+        DWORD protect = PAGE_READONLY;  // Default: read-only
+
+        // Determine the appropriate protection from section characteristics
+        if (section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            protect = PAGE_EXECUTE_READ;     // .text: RX
+        else if (section[i].Characteristics & IMAGE_SCN_MEM_WRITE)
+            protect = PAGE_READWRITE;        // .data: RW
+
+        // Apply the protection
+        DWORD oldProtect;
+        KERNEL32$VirtualProtect(
+            dst + section[i].VirtualAddress,   // Section base address
+            section[i].Misc.VirtualSize,       // Section size
+            protect,                           // New protection
+            &oldProtect                        // Previous protection (saved)
+        );
+
+        // Track the section metadata in the BUD region
+        region->Sections[i].Label          = GetLabelFromSectionHeader(section[i].Name);
+        region->Sections[i].BaseAddress    = dst + section[i].VirtualAddress;
+        region->Sections[i].VirtualSize    = section[i].Misc.VirtualSize;
+        region->Sections[i].CurrentProtect = protect;
+        region->Sections[i].MaskSection    = TRUE;  // All Beacon sections are maskable
+    }
+}</code></pre>
+
+<div class="card">
+<h4>What This Function Accomplishes</h4>
+<table>
+<tr><th>Step</th><th>What Happens</th><th>Why It Matters</th></tr>
+<tr><td>Region metadata</td><td>Sets <code>AllocationBase</code>, <code>RegionSize</code>, and <code>Type</code></td><td>Gives the sleep mask the top-level allocation boundaries for this region</td></tr>
+<tr><td>Section iteration</td><td>Walks each PE section via <code>IMAGE_FIRST_SECTION</code></td><td>Each section needs different permissions based on its characteristics flags</td></tr>
+<tr><td>Protection logic</td><td>Maps PE characteristics to Windows memory protections</td><td>Replaces the monolithic RWX allocation with granular per-section permissions, eliminating detection vector 3</td></tr>
+<tr><td>VirtualProtect call</td><td>Actually changes the page permissions</td><td>The memory was initially allocated as RW for writing; now each section gets its correct final protection</td></tr>
+<tr><td>BUD tracking</td><td>Records label, base, size, protection, and mask flag for each section</td><td>Builds the section map that the sleep mask will use to encrypt/decrypt and restore permissions</td></tr>
+</table>
+</div>
+
+<p>The <code>GetLabelFromSectionHeader</code> helper function converts PE section names (like <code>.text</code>, <code>.rdata</code>) into the corresponding <code>ALLOCATED_MEMORY_LABEL</code> enum values. This abstraction allows the sleep mask to reason about section types without parsing PE section name strings.</p>
+
+<div class="diagram">
+<h4 style="color:var(--accent);text-align:center;margin-bottom:15px;">FixSectionPermissions Data Flow</h4>
+<div class="flow">
+<div class="box">PE Section Table<br><small>from NtHeaders</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box hl">FixSectionPermissions<br><small>for each section</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box">VirtualProtect<br><small>set RX/RW/R</small></div>
+<div class="arrow">&rarr;</div>
+<div class="box g">BUD Section[i]<br><small>label + base + size<br>+ protect + mask</small></div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Module Summary</h2>
+
+<div class="card highlight">
+<h4>Key Takeaways</h4>
+<ul>
+<li><strong>BUD (Beacon User Data)</strong> is the structured contract between the UDRL loader and Beacon, delivered via a <code>DllMain</code> call with <code>fdwReason = 0x0d</code>.</li>
+<li>The <strong>USER_DATA</strong> structure contains a version field (<code>0x041100</code> for CS 4.11), pointers to SYSCALL_API (35 Nt* entries), RTL_API (3 runtime values), ALLOCATED_MEMORY (up to 6 regions), and a 32-byte custom field.</li>
+<li>The <strong>SYSCALL_API</strong> provides pre-resolved function addresses, <code>syscall;ret</code> gadget addresses, and SSNs for all 35 Nt* functions Beacon uses &mdash; enabling indirect syscall execution without runtime resolution.</li>
+<li>The <strong>RTL_API</strong> provides path conversion, heap freeing, and the default process heap handle &mdash; three values Beacon needs that are not syscalls.</li>
+<li>The <strong>ALLOCATED_MEMORY</strong> structure gives Beacon and its sleep mask a complete, section-level memory map including labels, permissions, and encryption flags.</li>
+<li>The <strong>allocation method enum</strong> ensures correct cleanup by telling Beacon which deallocation API to use for each region.</li>
+<li><strong>FixSectionPermissions</strong> is the function that bridges PE loading and BUD by setting granular per-section permissions and populating the BUD memory tracking data simultaneously.</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<div class="quiz" id="quiz6">
+<h4>Module 6 Quiz: Beacon User Data</h4>
+
+<div class="quiz-q" data-correct="1">
+<p>Q1: What version number does Crystal-Loaders set in USER_DATA for Cobalt Strike 4.11?</p>
+<label data-opt="0"><input type="radio" name="q6_0"> 0x040400</label>
+<label data-opt="1"><input type="radio" name="q6_0"> 0x041100</label>
+<label data-opt="2"><input type="radio" name="q6_0"> 0x041000</label>
+<label data-opt="3"><input type="radio" name="q6_0"> 0x050000</label>
+<div class="explain">Correct! The version field is set to <code>0x041100</code>, which represents Cobalt Strike 4.11. Beacon validates this value immediately when receiving the USER_DATA pointer &mdash; if it does not match the Beacon's own version, the entire BUD structure is ignored and all advanced evasion features that depend on it are silently disabled.</div>
+</div>
+
+<div class="quiz-q" data-correct="2">
+<p>Q2: What does the MaskSection field in ALLOCATED_MEMORY_SECTION control?</p>
+<label data-opt="0"><input type="radio" name="q6_1"> Whether the section is loaded into memory</label>
+<label data-opt="1"><input type="radio" name="q6_1"> Whether the section is writable</label>
+<label data-opt="2"><input type="radio" name="q6_1"> Whether the sleep mask should encrypt this section during sleep</label>
+<label data-opt="3"><input type="radio" name="q6_1"> Whether the section contains executable code</label>
+<div class="explain">Correct! The <code>MaskSection</code> boolean tells the sleep mask whether to encrypt this particular section during sleep intervals. When set to <code>TRUE</code>, the sleep mask will XOR/RC4/AES encrypt the section's contents, change its permissions to RW (removing the executable flag), and later decrypt and restore permissions on wake. It is set to <code>FALSE</code> for the sleep mask's own memory, since the sleep mask cannot encrypt itself while it is executing.</div>
+</div>
+
+<div class="quiz-q" data-correct="0">
+<p>Q3: Why does the loader track ALLOCATED_MEMORY_ALLOCATION_METHOD?</p>
+<label data-opt="0"><input type="radio" name="q6_2"> So Beacon knows which API to call for cleanup (VirtualFree, HeapFree, NtUnmapViewOfSection, etc.)</label>
+<label data-opt="1"><input type="radio" name="q6_2"> So the sleep mask can choose an encryption algorithm</label>
+<label data-opt="2"><input type="radio" name="q6_2"> So the loader can verify memory permissions</label>
+<label data-opt="3"><input type="radio" name="q6_2"> So Cobalt Strike can log memory usage</label>
+<div class="explain">Correct! Different allocation methods require different deallocation APIs. Calling <code>NtFreeVirtualMemory</code> on a heap allocation would corrupt the heap. Calling <code>NtUnmapViewOfSection</code> on a VirtualAlloc region would cause an access violation. The allocation method enum tells Beacon exactly which free function to call for each region: <code>NtFreeVirtualMemory</code> for VirtualAlloc, <code>RtlFreeHeap</code> for HeapAlloc, nothing for module stomping, and <code>NtUnmapViewOfSection</code> for mapped sections.</div>
+</div>
+
+<button class="quiz-btn" onclick="gradeQuiz('quiz6')">Check Answers</button>
+<div class="quiz-result"></div>
+</div>
+
+<div class="nav-btns">
+<a href="module5.html">&larr; Prev: UDRL Walkthrough</a>
+<a class="primary" href="module7.html">Next: Post-Ex &amp; Aggressor &rarr;</a>
+</div>
+</main>
+
+<script src="../../../assets/course.js"></script>
+</body>
+</html>
