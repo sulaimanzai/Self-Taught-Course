@@ -243,10 +243,10 @@ DWORD ReflectiveLoader(VOID)
 <div class="flow" style="flex-direction:column;gap:4px">
 <div class="box" style="width:100%"><strong>Default Reflective Loader</strong> &mdash; Stephen Fewer's technique, shipped with Cobalt Strike from the beginning. Functional but highly signatured.</div>
 <div class="box" style="width:100%"><strong>Artifact Kit</strong> &mdash; Customizable stager templates. Changed how the payload is packaged and executed, but the reflective loader itself remained the same.</div>
-<div class="box" style="width:100%"><strong>Sleep Mask Kit (CS 4.1)</strong> &mdash; Encrypt Beacon's memory during sleep. Addresses the problem of static signatures in idle Beacon memory, but does not change the loading process.</div>
+<div class="box" style="width:100%"><strong>Sleep Mask Kit (CS 4.4)</strong> &mdash; Encrypt Beacon's memory during sleep. Addresses the problem of static signatures in idle Beacon memory, but does not change the loading process.</div>
 <div class="box" style="width:100%;border-color:var(--accent)"><strong>User-Defined Reflective Loader (CS 4.4)</strong> &mdash; The pivotal change. Operators can now <strong>replace the entire reflective loader</strong> with their own implementation. This opened the door to loaders like AceLdr, BokuLoader, and TitanLdr.</div>
-<div class="box" style="width:100%"><strong>BeaconGate (CS 4.7)</strong> &mdash; Hook specific Win32 API calls made by Beacon. Allows operators to intercept and modify API calls (e.g., adding indirect syscalls) without modifying Beacon itself.</div>
-<div class="box" style="width:100%;border-color:var(--accent)"><strong>Crystal Palace (CS 4.10/4.11)</strong> &mdash; A spec-driven PIC linker that produces position-independent code output. No PE headers, no MZ signature, no traditional reflective loading. This is what Crystal-Loaders implements.</div>
+<div class="box" style="width:100%"><strong>BeaconGate (CS 4.10)</strong> &mdash; Hook specific Win32 API calls made by Beacon. Allows operators to intercept and modify API calls (e.g., adding indirect syscalls) without modifying Beacon itself.</div>
+<div class="box" style="width:100%;border-color:var(--accent)"><strong>Crystal Palace (Tradecraft Garden, June 2025)</strong> &mdash; A standalone spec-driven PIC linker released as part of the Tradecraft Garden project. Produces position-independent code output with no PE headers, no MZ signature, and no traditional reflective loading. This is what Crystal-Loaders is built with.</div>
 </div>
 </div>
 
@@ -259,8 +259,8 @@ DWORD ReflectiveLoader(VOID)
 <table>
 <tr><th>UDRL</th><th>Author</th><th>Key Innovation</th></tr>
 <tr><td><strong>AceLdr</strong></td><td>Kyle Avery</td><td>RC4 sleep encryption, private heap isolation, FOLIAGE-based APC sleep masking, return address spoofing. Evades Moneta, pe-sieve, BeaconEye, and Hunt-Sleeping-Beacons.</td></tr>
-<tr><td><strong>BokuLoader</strong></td><td>Bobby Cooke</td><td>Maps Beacon as MEM_IMAGE via section object, avoiding the MEM_PRIVATE detection vector. Uses SEC_IMAGE mapping to make reflectively loaded code look file-backed.</td></tr>
-<tr><td><strong>TitanLdr</strong></td><td>Austin Hudson (SecIdiot)</td><td>Full-featured loader with IAT hiding, header erasure, and advanced memory permission management. Companion to the Titan agent framework.</td></tr>
+<tr><td><strong>BokuLoader</strong></td><td>Bobby Cooke</td><td>Uses DLL module stomping via LoadLibraryExA with DONT_RESOLVE_DLL_REFERENCES to load a sacrificial DLL from disk (mapped as MEM_IMAGE by the OS), then writes Beacon over that region. Also uses indirect NT syscalls (HellsGate/HalosGate) and reflective call stack spoofing.</td></tr>
+<tr><td><strong>TitanLdr</strong></td><td>Austin Hudson (SecIdiot)</td><td>The original community UDRL that pioneered DNS-over-HTTPS (DoH) integration for Cobalt Strike DNS Beacons. Its primary innovation is IAT hooking &mdash; it hooks DNSQuery_A in Beacon's IAT to route DNS queries through HTTPS.</td></tr>
 </table>
 </div>
 
@@ -269,7 +269,7 @@ DWORD ReflectiveLoader(VOID)
 <!-- ============================================================ -->
 <h2>5. What Crystal-Loaders Brings to the Table</h2>
 
-<p>Crystal-Loaders (the open-source implementation of Crystal Palace concepts) does not patch or improve the reflective loading process. It <strong>eliminates it entirely</strong>. Instead of injecting a DLL and loading it in-memory, Crystal-Loaders uses a spec-driven build system to produce raw position-independent code at compile time.</p>
+<p>Crystal-Loaders (a collection of PIC loaders built with Crystal Palace, designed for Cobalt Strike) does not patch or improve the reflective loading process. It <strong>eliminates it entirely</strong>. Instead of injecting a DLL and loading it in-memory, Crystal-Loaders uses a spec-driven build system to produce raw position-independent code at compile time.</p>
 
 <div class="card green">
 <h4>The Six Key Innovations</h4>
@@ -333,7 +333,7 @@ DWORD ReflectiveLoader(VOID)
 <li><strong>LoadLibrary</strong> creates filesystem, PEB, and kernel callback telemetry that makes it unusable for offensive DLL loading.</li>
 <li><strong>Reflective DLL Injection</strong> (Stephen Fewer, 2008) loads DLLs from memory, but creates five new detection vectors: private-commit RX memory, MZ/PE headers, RWX allocations, unbacked return addresses, and IAT artifacts.</li>
 <li><strong>Cobalt Strike's UDRL</strong> (CS 4.4) enabled community loaders like AceLdr, BokuLoader, and TitanLdr to address these vectors individually.</li>
-<li><strong>Crystal Palace</strong> (CS 4.10/4.11) and its open-source companion <strong>Crystal-Loaders</strong> take a fundamentally different approach: a spec-driven PIC linker that produces headerless shellcode with no PE structure, no static imports, and encrypted embedded payloads.</li>
+<li><strong>Crystal Palace</strong> (released as part of the Tradecraft Garden project in June 2025) and <strong>Crystal-Loaders</strong> (built with Crystal Palace for Cobalt Strike) take a fundamentally different approach: a spec-driven PIC linker that produces headerless shellcode with no PE structure, no static imports, and encrypted embedded payloads.</li>
 <li>Crystal-Loaders eliminates vectors 2, 3, and 5. It reduces vector 1. Vector 4 (call stack analysis) requires additional techniques like synthetic frame construction.</li>
 </ul>
 </div>
@@ -357,7 +357,7 @@ DWORD ReflectiveLoader(VOID)
 <label data-opt="1"><input type="radio" name="q1_1"> Cobalt Strike 4.2</label>
 <label data-opt="2"><input type="radio" name="q1_1"> Cobalt Strike 4.4</label>
 <label data-opt="3"><input type="radio" name="q1_1"> Cobalt Strike 4.7</label>
-<div class="explain">Cobalt Strike 4.4 introduced the User-Defined Reflective Loader (UDRL) interface, which allowed operators to replace the entire reflective loader with a custom implementation. This was the pivotal change that enabled community projects like AceLdr, BokuLoader, and TitanLdr. CS 4.7 later added BeaconGate, and CS 4.10/4.11 introduced Crystal Palace.</div>
+<div class="explain">Cobalt Strike 4.4 introduced the User-Defined Reflective Loader (UDRL) interface, which allowed operators to replace the entire reflective loader with a custom implementation. This was the pivotal change that enabled community projects like AceLdr, BokuLoader, and TitanLdr. CS 4.10 later added BeaconGate, and Crystal Palace was released separately as part of the Tradecraft Garden project in 2025.</div>
 </div>
 
 <div class="quiz-q" data-correct="1">

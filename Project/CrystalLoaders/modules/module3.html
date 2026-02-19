@@ -35,7 +35,7 @@
 
 <div class="card highlight">
 <h4>Module Objective</h4>
-<p>LibTCG (Library for the Tradecraft Garden) is the beating heart of the Crystal-Loaders ecosystem. It is a pre-compiled relocatable object file that Crystal Palace merges into your loader via <code>mergelib</code>. Every primitive a reflective loader needs &mdash; parsing PE headers, mapping sections, processing relocations, resolving imports, and walking the PEB for hash-based API resolution &mdash; lives here. By the end of this module, you will understand every function in LibTCG and how they compose into a complete PE loading pipeline.</p>
+<p>LibTCG (Library for the Tradecraft Garden) is the beating heart of the Crystal-Loaders ecosystem. It is a pre-compiled relocatable object file that Crystal Palace merges into your loader via <code>mergelib</code>. Every primitive a reflective loader needs &mdash; parsing PE headers, mapping sections, processing relocations, resolving imports, and walking the PEB for hash-based API resolution &mdash; lives here. By the end of this module, you will understand the key functions in LibTCG and how they compose into a complete PE loading pipeline. LibTCG also includes helper functions like <code>LoadSections</code> (which handles per-section copying as a sub-step of the loading process) and <code>GetDataDirectory</code> (a convenience wrapper for accessing PE data directory entries), which follow the same patterns covered here.</p>
 </div>
 
 <!-- ============================================================ -->
@@ -66,8 +66,8 @@
 <p>This structure holds the two Win32 API function pointers that LibTCG needs for import resolution. These are resolved by the loader before calling any LibTCG PE loading functions:</p>
 
 <pre><code><span class="lang-tag">C — tcg.h</span>typedef struct {
-    PVOID LoadLibraryA;     // Pointer to kernel32!LoadLibraryA
-    PVOID GetProcAddress;   // Pointer to kernel32!GetProcAddress
+    __typeof__(LoadLibraryA)   * LoadLibraryA;     // Pointer to kernel32!LoadLibraryA
+    __typeof__(GetProcAddress) * GetProcAddress;   // Pointer to kernel32!GetProcAddress
 } IMPORTFUNCS;</code></pre>
 
 <div class="card">
@@ -80,9 +80,9 @@
 <p>This structure is populated by <code>ParseDLL()</code> and carries parsed PE header pointers through the entire loading pipeline:</p>
 
 <pre><code><span class="lang-tag">C — tcg.h</span>typedef struct {
-    PIMAGE_DOS_HEADER      DosHeader;       // Pointer to the MZ header
-    PIMAGE_NT_HEADERS      NtHeaders;       // Pointer to PE\0\0 + COFF + Optional
-    PIMAGE_OPTIONAL_HEADER OptionalHeader;  // Pointer to the Optional Header
+    IMAGE_DOS_HEADER      * DosHeader;       // Pointer to the MZ header
+    IMAGE_NT_HEADERS      * NtHeaders;       // Pointer to PE\0\0 + COFF + Optional
+    IMAGE_OPTIONAL_HEADER * OptionalHeader;  // Pointer to the Optional Header
 } DLLDATA;</code></pre>
 
 <p>Every subsequent LibTCG function takes a pointer to a <code>DLLDATA</code> struct. It acts as a parsed view into the raw PE bytes, avoiding redundant re-parsing at each stage.</p>
@@ -90,7 +90,7 @@
 <h3>Function Pointer Typedefs</h3>
 
 <pre><code><span class="lang-tag">C — tcg.h</span>// Standard DllMain signature for reflective DLL loading
-typedef BOOL (WINAPI * DLLMAIN_FUNC)(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved);
+typedef BOOL WINAPI (*DLLMAIN_FUNC)(HINSTANCE, DWORD, LPVOID);
 
 // Entry point for PIC Object (PICO) payloads
 typedef void (* PICOMAIN_FUNC)(char * arg);</code></pre>
@@ -103,13 +103,13 @@ typedef void (* PICOMAIN_FUNC)(char * arg);</code></pre>
 <h3>Utility Macros</h3>
 
 <pre><code><span class="lang-tag">C — tcg.h</span>// Pointer arithmetic: advance pointer x by y bytes
-#define PTR_OFFSET(x, y)  ((PBYTE)(x) + (y))
+#define PTR_OFFSET(x, y)  ( (void *)(x) + (ULONG)(y) )
 
 // Dereference a pointer-sized value at the given address
 #define DEREF(name)        *(UINT_PTR *)(name)
 
 // Get the caller's return address (MinGW built-in)
-#define WIN_GET_CALLER()   __builtin_return_address(0)</code></pre>
+#define WIN_GET_CALLER()   __builtin_extract_return_addr(__builtin_return_address(0))</code></pre>
 
 <div class="card">
 <h4>Macro Breakdown</h4>
@@ -143,15 +143,15 @@ typedef void (* PICOMAIN_FUNC)(char * arg);</code></pre>
 </div>
 </div>
 
-<h3>ParseDLL(payload, &amp;dlldata)</h3>
+<h3>ParseDLL(src, &amp;data)</h3>
 
 <p>The first step in the pipeline. <code>ParseDLL</code> takes a pointer to the raw PE bytes and populates the <code>DLLDATA</code> struct with pointers into the PE structure:</p>
 
 <pre><code><span class="lang-tag">C</span>// ParseDLL validates the DOS header and locates the NT headers
-void ParseDLL(PBYTE payload, PDLLDATA dlldata)
+void ParseDLL(char * src, DLLDATA * data)
 {
     // 1. Cast the start of the buffer to a DOS header
-    dlldata->DosHeader = (PIMAGE_DOS_HEADER)payload;
+    data->DosHeader = (IMAGE_DOS_HEADER *)src;
 
     // 2. Validate the MZ magic number (0x5A4D)
     //    If this check fails, the payload is not a valid PE
@@ -159,12 +159,12 @@ void ParseDLL(PBYTE payload, PDLLDATA dlldata)
     // 3. Use e_lfanew to locate the NT headers
     //    e_lfanew is a LONG at offset 0x3C in the DOS header
     //    It contains the file offset to the PE signature
-    dlldata->NtHeaders = (PIMAGE_NT_HEADERS)PTR_OFFSET(payload,
-                          dlldata->DosHeader->e_lfanew);
+    data->NtHeaders = (IMAGE_NT_HEADERS *)PTR_OFFSET(src,
+                          data->DosHeader->e_lfanew);
 
     // 4. Extract the Optional Header pointer
     //    The Optional Header immediately follows the COFF File Header
-    dlldata->OptionalHeader = &dlldata->NtHeaders->OptionalHeader;
+    data->OptionalHeader = &data->NtHeaders->OptionalHeader;
 }</code></pre>
 
 <div class="card">
@@ -172,43 +172,43 @@ void ParseDLL(PBYTE payload, PDLLDATA dlldata)
 <p>The <code>0x4D5A</code> magic ("MZ") at the very start of the file identifies it as a DOS executable. The <code>e_lfanew</code> field at offset 0x3C is a 4-byte offset pointing to the PE signature (<code>0x00004550</code> = "PE\0\0"). Every PE file, whether a DLL or EXE, begins with this same DOS header structure. If <code>e_lfanew</code> points outside the buffer or the PE signature doesn't match, the file is corrupt or not a PE.</p>
 </div>
 
-<h3>SizeOfDLL(&amp;dlldata)</h3>
+<h3>SizeOfDLL(&amp;data)</h3>
 
 <p>Returns the total virtual size needed for the fully loaded image:</p>
 
 <pre><code><span class="lang-tag">C</span>// SizeOfDLL returns the total memory required for the mapped image
-DWORD SizeOfDLL(PDLLDATA dlldata)
+DWORD SizeOfDLL(DLLDATA * data)
 {
     // SizeOfImage from the Optional Header tells us the total virtual
     // size of the PE when loaded into memory, including all sections
     // aligned to SectionAlignment boundaries
-    return dlldata->OptionalHeader->SizeOfImage;
+    return data->OptionalHeader->SizeOfImage;
 }</code></pre>
 
 <p>The caller uses this value to allocate a contiguous memory region (via <code>VirtualAlloc</code> or <code>NtAllocateVirtualMemory</code>) before calling <code>LoadDLL</code>. The <code>SizeOfImage</code> field accounts for section alignment padding, so it is always larger than the raw file size.</p>
 
-<h3>LoadDLL(&amp;dlldata, destination)</h3>
+<h3>LoadDLL(&amp;dll, src, dst)</h3>
 
-<p>Copies the PE headers and all sections to the destination buffer at their correct virtual offsets:</p>
+<p>Copies the PE headers and all sections from the source buffer to the destination buffer at their correct virtual offsets:</p>
 
 <pre><code><span class="lang-tag">C</span>// LoadDLL maps the PE into the destination buffer
-void LoadDLL(PDLLDATA dlldata, PVOID destination)
+void LoadDLL(DLLDATA * dll, char * src, char * dst)
 {
     // 1. Copy the PE headers (DOS + NT + Section Table)
     //    Size = OptionalHeader->SizeOfHeaders
-    memcpy(destination, dlldata->DosHeader,
-           dlldata->OptionalHeader->SizeOfHeaders);
+    memcpy(dst, src,
+           dll->OptionalHeader->SizeOfHeaders);
 
     // 2. Get the first section header
-    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(dlldata->NtHeaders);
-    WORD numSections = dlldata->NtHeaders->FileHeader.NumberOfSections;
+    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(dll->NtHeaders);
+    WORD numSections = dll->NtHeaders->FileHeader.NumberOfSections;
 
     // 3. Iterate each section and copy raw data to virtual address
     for (WORD i = 0; i < numSections; i++) {
         if (section[i].SizeOfRawData > 0) {
-            PBYTE src  = (PBYTE)dlldata->DosHeader + section[i].PointerToRawData;
-            PBYTE dest = (PBYTE)destination         + section[i].VirtualAddress;
-            memcpy(dest, src, section[i].SizeOfRawData);
+            char * rawSrc  = src + section[i].PointerToRawData;
+            char * rawDest = dst + section[i].VirtualAddress;
+            memcpy(rawDest, rawSrc, section[i].SizeOfRawData);
         }
     }
 }</code></pre>
@@ -218,25 +218,25 @@ void LoadDLL(PDLLDATA dlldata, PVOID destination)
 <p>On disk, section data is packed at <code>PointerToRawData</code> offsets aligned to <code>FileAlignment</code> (typically 0x200). In memory, sections sit at <code>VirtualAddress</code> offsets aligned to <code>SectionAlignment</code> (typically 0x1000). The gap between the raw and virtual layouts means sections may have zero-filled padding between them once mapped. This is why <code>SizeOfImage</code> is larger than the file size.</p>
 </div>
 
-<h3>ProcessRelocations(&amp;dlldata, destination)</h3>
+<h3>ProcessRelocations(&amp;dll, src, dst)</h3>
 
 <p>When a DLL is loaded at a base address different from its preferred <code>ImageBase</code>, all absolute addresses embedded in the code must be patched. This is what the <code>.reloc</code> section is for:</p>
 
 <pre><code><span class="lang-tag">C</span>// ProcessRelocations patches absolute addresses for the new base
-void ProcessRelocations(PDLLDATA dlldata, PVOID destination)
+void ProcessRelocations(DLLDATA * dll, char * src, char * dst)
 {
     // 1. Calculate the delta between actual and preferred base
-    UINT_PTR delta = (UINT_PTR)destination -
-                     dlldata->OptionalHeader->ImageBase;
+    UINT_PTR delta = (UINT_PTR)dst -
+                     dll->OptionalHeader->ImageBase;
 
     if (delta == 0) return;  // Loaded at preferred base, no fixups needed
 
     // 2. Locate the Base Relocation Directory
-    PIMAGE_DATA_DIRECTORY relocDir = &dlldata->OptionalHeader->
+    PIMAGE_DATA_DIRECTORY relocDir = &dll->OptionalHeader->
         DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
 
     PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)
-        PTR_OFFSET(destination, relocDir->VirtualAddress);
+        PTR_OFFSET(dst, relocDir->VirtualAddress);
 
     // 3. Walk each relocation block
     while (reloc->VirtualAddress != 0) {
@@ -250,7 +250,7 @@ void ProcessRelocations(PDLLDATA dlldata, PVOID destination)
 
             if (type == IMAGE_REL_BASED_DIR64) {   // Type 10: 64-bit fixup
                 PUINT_PTR patchAddr = (PUINT_PTR)PTR_OFFSET(
-                    destination, reloc->VirtualAddress + offset);
+                    dst, reloc->VirtualAddress + offset);
                 *patchAddr += delta;               // Apply the delta
             }
         }
@@ -270,48 +270,42 @@ void ProcessRelocations(PDLLDATA dlldata, PVOID destination)
 <p style="margin-top:10px;color:var(--dim);font-size:.85rem;">On x64, the only relocation type you typically encounter is <code>IMAGE_REL_BASED_DIR64</code> (type 10), which patches a 64-bit absolute address by adding the base delta.</p>
 </div>
 
-<h3>ProcessImports(&amp;dlldata, destination)</h3>
+<h3>ProcessImports(&amp;funcs, &amp;dll, dst)</h3>
 
 <p>Walks the Import Directory Table and resolves every imported function into the IAT:</p>
 
 <pre><code><span class="lang-tag">C</span>// ProcessImports resolves all imported DLLs and functions
-void ProcessImports(PDLLDATA dlldata, PVOID destination, IMPORTFUNCS * funcs)
+void ProcessImports(IMPORTFUNCS * funcs, DLLDATA * dll, char * dst)
 {
     // 1. Locate the Import Directory
-    PIMAGE_DATA_DIRECTORY importDir = &dlldata->OptionalHeader->
+    PIMAGE_DATA_DIRECTORY importDir = &dll->OptionalHeader->
         DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
 
     PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)
-        PTR_OFFSET(destination, importDir->VirtualAddress);
-
-    // Cast the function pointers from IMPORTFUNCS
-    typedef HMODULE (WINAPI * fnLoadLibraryA)(LPCSTR);
-    typedef FARPROC (WINAPI * fnGetProcAddress)(HMODULE, LPCSTR);
-    fnLoadLibraryA  pLoadLibraryA  = (fnLoadLibraryA)funcs->LoadLibraryA;
-    fnGetProcAddress pGetProcAddress = (fnGetProcAddress)funcs->GetProcAddress;
+        PTR_OFFSET(dst, importDir->VirtualAddress);
 
     // 2. Walk each import descriptor (one per imported DLL)
     while (importDesc->Name != 0) {
         // Resolve the imported DLL by name
-        char * dllName = (char *)PTR_OFFSET(destination, importDesc->Name);
-        HMODULE hModule = pLoadLibraryA(dllName);
+        char * dllName = (char *)PTR_OFFSET(dst, importDesc->Name);
+        HMODULE hModule = funcs->LoadLibraryA(dllName);
 
         // 3. Walk the ILT (Import Lookup Table) and IAT simultaneously
-        PUINT_PTR thunk    = (PUINT_PTR)PTR_OFFSET(destination,
+        PUINT_PTR thunk    = (PUINT_PTR)PTR_OFFSET(dst,
                               importDesc->OriginalFirstThunk);
-        PUINT_PTR iatEntry = (PUINT_PTR)PTR_OFFSET(destination,
+        PUINT_PTR iatEntry = (PUINT_PTR)PTR_OFFSET(dst,
                               importDesc->FirstThunk);
 
         while (*thunk != 0) {
             if (IMAGE_SNAP_BY_ORDINAL(*thunk)) {
                 // Import by ordinal
-                *iatEntry = (UINT_PTR)pGetProcAddress(hModule,
+                *iatEntry = (UINT_PTR)funcs->GetProcAddress(hModule,
                              (LPCSTR)IMAGE_ORDINAL(*thunk));
             } else {
                 // Import by name
                 PIMAGE_IMPORT_BY_NAME nameEntry = (PIMAGE_IMPORT_BY_NAME)
-                    PTR_OFFSET(destination, *thunk);
-                *iatEntry = (UINT_PTR)pGetProcAddress(hModule, nameEntry->Name);
+                    PTR_OFFSET(dst, *thunk);
+                *iatEntry = (UINT_PTR)funcs->GetProcAddress(hModule, nameEntry->Name);
             }
             thunk++;
             iatEntry++;
@@ -325,27 +319,27 @@ void ProcessImports(PDLLDATA dlldata, PVOID destination, IMPORTFUNCS * funcs)
 <p>After <code>ProcessImports</code> completes, every slot in the Import Address Table contains a live function pointer. When the loaded DLL's code calls an imported function like <code>VirtualProtect</code>, it reads the pointer from the IAT and jumps to it. This is identical to how the Windows loader resolves imports &mdash; the key difference is that LibTCG does it entirely in usermode without any loader lock or LDR notification.</p>
 </div>
 
-<h3>EntryPoint(&amp;dlldata, destination)</h3>
+<h3>EntryPoint(&amp;dll, base)</h3>
 
-<p>Computes the address of the DLL's entry point in the mapped image:</p>
+<p>Computes the address of the DLL's entry point in the mapped image and returns it as a <code>DLLMAIN_FUNC</code> pointer ready to call:</p>
 
 <pre><code><span class="lang-tag">C</span>// EntryPoint calculates the entry point address
-PVOID EntryPoint(PDLLDATA dlldata, PVOID destination)
+DLLMAIN_FUNC EntryPoint(DLLDATA * dll, void * base)
 {
     // AddressOfEntryPoint is an RVA in the Optional Header
-    // Add it to the destination base to get the absolute address
-    return PTR_OFFSET(destination,
-                      dlldata->OptionalHeader->AddressOfEntryPoint);
+    // Add it to the base to get the absolute address
+    return (DLLMAIN_FUNC)PTR_OFFSET(base,
+                      dll->OptionalHeader->AddressOfEntryPoint);
 }</code></pre>
 
-<p>The returned address is cast to <code>DLLMAIN_FUNC</code> and called with <code>DLL_PROCESS_ATTACH</code>. For a Cobalt Strike Beacon DLL, this is where execution begins after the reflective load completes.</p>
+<p>The returned <code>DLLMAIN_FUNC</code> pointer is called directly with <code>DLL_PROCESS_ATTACH</code>. For a Cobalt Strike Beacon DLL, this is where execution begins after the reflective load completes.</p>
 
 <!-- ============================================================ -->
 <h2>4. PEB Walking &mdash; findModuleByHash()</h2>
 
 <p>Before the PE loading pipeline can run, the loader needs <code>LoadLibraryA</code> and <code>GetProcAddress</code>. But you cannot call <code>GetProcAddress</code> to find <code>GetProcAddress</code> &mdash; that is circular. The solution is to walk the <strong>Process Environment Block (PEB)</strong> to find loaded modules by hash, then walk their Export Address Table to find functions by hash.</p>
 
-<pre><code><span class="lang-tag">C</span>PVOID findModuleByHash(DWORD hash)
+<pre><code><span class="lang-tag">C</span>char * findModuleByHash(DWORD moduleHash)
 {
     // 1. Read the PEB from the GS segment register (x64)
     //    On x64, gs:[0x60] points to the PEB
@@ -370,7 +364,7 @@ PVOID EntryPoint(PDLLDATA dlldata, PVOID destination)
                                        mod->BaseDllName.Length);
 
         // 5. Compare against the target hash
-        if (nameHash == hash)
+        if (nameHash == moduleHash)
             return mod->DllBase;  // Return the module's base address
 
         entry = entry->Flink;    // Advance to next module
@@ -414,31 +408,31 @@ PVOID EntryPoint(PDLLDATA dlldata, PVOID destination)
 
 <p>Once <code>findModuleByHash()</code> returns a module's base address, <code>findFunctionByHash()</code> searches that module's Export Address Table (EAT) for a function matching a given ROR13 hash:</p>
 
-<pre><code><span class="lang-tag">C</span>PVOID findFunctionByHash(PVOID moduleBase, DWORD functionHash)
+<pre><code><span class="lang-tag">C</span>void * findFunctionByHash(char * src, DWORD wantedFunction)
 {
     // 1. Parse PE headers to find the Export Directory
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)moduleBase;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)src;
     PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)
-        PTR_OFFSET(moduleBase, dos->e_lfanew);
+        PTR_OFFSET(src, dos->e_lfanew);
 
     PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)
-        PTR_OFFSET(moduleBase,
+        PTR_OFFSET(src,
             nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
             .VirtualAddress);
 
     // 2. Retrieve the three parallel arrays
-    PDWORD names     = (PDWORD)PTR_OFFSET(moduleBase, exports->AddressOfNames);
-    PDWORD functions = (PDWORD)PTR_OFFSET(moduleBase, exports->AddressOfFunctions);
-    PWORD  ordinals  = (PWORD) PTR_OFFSET(moduleBase, exports->AddressOfNameOrdinals);
+    PDWORD names     = (PDWORD)PTR_OFFSET(src, exports->AddressOfNames);
+    PDWORD functions = (PDWORD)PTR_OFFSET(src, exports->AddressOfFunctions);
+    PWORD  ordinals  = (PWORD) PTR_OFFSET(src, exports->AddressOfNameOrdinals);
 
     // 3. Iterate through all named exports
     for (DWORD i = 0; i < exports->NumberOfNames; i++) {
         // Resolve the function name string
-        char * name = (char *)PTR_OFFSET(moduleBase, names[i]);
+        char * name = (char *)PTR_OFFSET(src, names[i]);
 
         // Hash the name and compare
-        if (ror13_ascii(name) == functionHash)
-            return PTR_OFFSET(moduleBase, functions[ordinals[i]]);
+        if (ror13_ascii(name) == wantedFunction)
+            return PTR_OFFSET(src, functions[ordinals[i]]);
     }
     return NULL;  // Function not found
 }</code></pre>
@@ -547,7 +541,7 @@ DWORD ror13_unicode(const WCHAR * str, DWORD len)
 #define NTDLL_HASH      0x3CFA685D
 
 // At runtime, the loader calls:
-PVOID ntdll = findModuleByHash(NTDLL_HASH);
+char * ntdll = findModuleByHash(NTDLL_HASH);
 
 // The dfr directive in the .spec file tells Crystal Palace
 // to resolve function references the same way:

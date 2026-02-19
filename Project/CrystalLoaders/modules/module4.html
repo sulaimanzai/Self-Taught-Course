@@ -94,7 +94,7 @@
 <!-- ============================================================ -->
 <h2>3. LibGate Architecture</h2>
 
-<p>LibGate is rasta-mouse's Crystal Palace port of RecycledGate. It lives in two files: <code>gate.c</code> and <code>gate.h</code>. The entire API surface consists of one structure and three functions.</p>
+<p>LibGate is rasta-mouse's Crystal Palace port of RecycledGate. The API is declared in <code>gate.h</code>, and the implementation is provided as a precompiled library shipped inside <code>libgate.x64.zip</code>. The entire API surface consists of one structure and three functions.</p>
 
 <h3>The SYSCALL_GATE Structure</h3>
 
@@ -144,7 +144,9 @@ PBYTE stub = (PBYTE)func;
 if (stub[0] == 0x4C &amp;&amp;    // mov r10, rcx (byte 1)
     stub[1] == 0x8B &amp;&amp;    // mov r10, rcx (byte 2)
     stub[2] == 0xD1 &amp;&amp;    // mov r10, rcx (byte 3)
-    stub[3] == 0xB8)       // mov eax, imm32 (opcode)
+    stub[3] == 0xB8 &amp;&amp;    // mov eax, imm32 (opcode)
+    stub[6] == 0x00 &amp;&amp;    // upper bytes of SSN must be zero
+    stub[7] == 0x00)       // (valid SSNs are &lt; 0x200)
 {
     // SSN is the 16-bit little-endian value at offset 4-5
     gate-&gt;ssn = (stub[5] &lt;&lt; 8) | stub[4];
@@ -153,15 +155,22 @@ if (stub[0] == 0x4C &amp;&amp;    // mov r10, rcx (byte 1)
 
 <h3>Step 2 &mdash; Hook Detection</h3>
 
-<p>If the first byte is <code>0xE9</code> (the JMP rel32 opcode), the stub has been hooked by an EDR. The EDR replaced the original <code>mov r10, rcx</code> with a 5-byte relative jump to its inspection routine:</p>
+<p>In the actual RecycledGate source, Steps 1 and 2 are <strong>interleaved inside a single scanning loop</strong>. Each iteration checks for three conditions in order: (1) whether the stub is hooked (<code>0xE9</code> JMP opcode), (2) whether a <code>0xC3</code> (RET) opcode is encountered &mdash; which signals early termination of the scan since the stub boundary has been reached &mdash; and (3) whether the clean <code>4C 8B D1 B8</code> pattern matches. They are presented here as separate steps for clarity, but understand they execute as one loop in practice.</p>
 
-<pre><code><span class="lang-tag">C (Hook Detection)</span>BOOL bHooked = FALSE;
+<pre><code><span class="lang-tag">C (Hook Detection - within the scanning loop)</span>BOOL bHooked = FALSE;
 
-// 0xE9 = JMP rel32 (5-byte relative jump)
+// 0xE9 = JMP rel32 (5-byte relative jump) - stub is hooked
 if (stub[0] == 0xE9) {
     bHooked = TRUE;
     // Cannot extract SSN from this stub - bytes are overwritten
     // Fall through to neighbor search (Halo's Gate)
+}
+
+// 0xC3 = RET opcode - early termination of the scan
+// If we hit a ret before finding the pattern, stop searching
+if (stub[0] == 0xC3) {
+    // Stub boundary reached; abort scan
+    return FALSE;
 }</code></pre>
 
 <h3>Step 3 &mdash; Neighbor Search (Halo's Gate)</h3>
@@ -169,34 +178,33 @@ if (stub[0] == 0xE9) {
 <p>When the target stub is hooked, LibGate searches neighboring stubs. In ntdll, syscall stubs are laid out sequentially at <strong>32-byte intervals</strong>, and SSNs are consecutive. If the stub at offset <code>+2</code> (64 bytes later) is clean and has SSN 0x1A, then the target stub's SSN is <code>0x1A - 2 = 0x18</code>.</p>
 
 <pre><code><span class="lang-tag">C (Halo's Gate - Neighbor Search)</span>if (bHooked) {
-    // Search DOWN: neighbor at stub + (i * 32)
-    for (DWORD i = 1; i &lt; 500; i++) {
-        PBYTE neighbor = stub + (i * 32);
+    // Single loop: check BOTH directions per iteration
+    // Bounded by the number of exported functions, with boundary checks
+    for (DWORD i = 1; i &lt; pExportDir-&gt;NumberOfFunctions; i++) {
 
-        if (neighbor[0] == 0x4C &amp;&amp;
-            neighbor[1] == 0x8B &amp;&amp;
-            neighbor[2] == 0xD1 &amp;&amp;
-            neighbor[3] == 0xB8)
+        // Search DOWN: neighbor at stub + (i * 32)
+        PBYTE neighborDown = stub + (i * 32);
+        if (neighborDown[0] == 0x4C &amp;&amp;
+            neighborDown[1] == 0x8B &amp;&amp;
+            neighborDown[2] == 0xD1 &amp;&amp;
+            neighborDown[3] == 0xB8)
         {
-            // Clean neighbor found!
+            // Clean neighbor found below
             // neighbor SSN - i = our SSN (SSNs are sequential)
-            gate-&gt;ssn = ((neighbor[5] &lt;&lt; 8) | neighbor[4]) - i;
+            gate-&gt;ssn = ((neighborDown[5] &lt;&lt; 8) | neighborDown[4]) - i;
             break;
         }
-    }
 
-    // Search UP: neighbor at stub - (i * 32)
-    for (DWORD i = 1; i &lt; 500; i++) {
-        PBYTE neighbor = stub - (i * 32);
-
-        if (neighbor[0] == 0x4C &amp;&amp;
-            neighbor[1] == 0x8B &amp;&amp;
-            neighbor[2] == 0xD1 &amp;&amp;
-            neighbor[3] == 0xB8)
+        // Search UP: neighbor at stub - (i * 32)
+        PBYTE neighborUp = stub - (i * 32);
+        if (neighborUp[0] == 0x4C &amp;&amp;
+            neighborUp[1] == 0x8B &amp;&amp;
+            neighborUp[2] == 0xD1 &amp;&amp;
+            neighborUp[3] == 0xB8)
         {
-            // Clean neighbor found!
+            // Clean neighbor found above
             // neighbor SSN + i = our SSN
-            gate-&gt;ssn = ((neighbor[5] &lt;&lt; 8) | neighbor[4]) + i;
+            gate-&gt;ssn = ((neighborUp[5] &lt;&lt; 8) | neighborUp[4]) + i;
             break;
         }
     }
@@ -211,16 +219,16 @@ if (stub[0] == 0xE9) {
 
 <p>Whether the SSN came from the target stub (Step 1) or a neighbor (Step 3), LibGate now needs the address of the <code>syscall; ret</code> instruction sequence within the resolved stub. It scans for the three-byte pattern <code>0F 05 C3</code>:</p>
 
-<pre><code><span class="lang-tag">C (Gadget Search)</span>// Scan the stub for the syscall;ret gadget: 0F 05 C3
-// Even hooked stubs usually preserve these bytes at the end
-PBYTE target = bHooked ? (stub + (neighborOffset * 32)) : stub;
+<pre><code><span class="lang-tag">C (Gadget Search)</span>// If the stub was hooked, pStub has already been reassigned
+// to the clean neighbor's address during the Halo's Gate search.
+// The gadget search operates on whichever stub pStub points to.
 
 for (DWORD offset = 0; offset &lt; 32; offset++) {
-    if (target[offset]     == 0x0F &amp;&amp;   // syscall (byte 1)
-        target[offset + 1] == 0x05 &amp;&amp;   // syscall (byte 2)
-        target[offset + 2] == 0xC3)     // ret
+    if (pStub[offset]     == 0x0F &amp;&amp;   // syscall (byte 1)
+        pStub[offset + 1] == 0x05 &amp;&amp;   // syscall (byte 2)
+        pStub[offset + 2] == 0xC3)     // ret
     {
-        gate-&gt;jmpAddr = &amp;target[offset]; // Address of syscall;ret in ntdll
+        gate-&gt;jmpAddr = &amp;pStub[offset]; // Address of syscall;ret in ntdll
         break;
     }
 }</code></pre>
@@ -254,7 +262,7 @@ for (DWORD offset = 0; offset &lt; 32; offset++) {
 PrepareSyscall:
     xor  r11, r11          ; Zero r11
     xor  r10, r10          ; Zero r10
-    mov  r11d, ecx         ; r11d = SSN (first param)
+    mov  r11, rcx          ; r11  = SSN (first param)
     mov  r10, rdx          ; r10  = jmpAddr (second param, ntdll gadget)
     ret                    ; Return to caller</code></pre>
 
@@ -307,7 +315,7 @@ DoSyscall:
     __asm__(
         "xor %%r11, %%r11\n"
         "xor %%r10, %%r10\n"
-        "mov %%ecx, %%r11d\n"
+        "mov %%rcx, %%r11\n"
         "mov %%rdx, %%r10\n"
         "ret\n"
     );

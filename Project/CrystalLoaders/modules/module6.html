@@ -71,9 +71,9 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
 <p>The top-level structure that ties everything together. Every field is a pointer to a sub-structure (or a fixed-size buffer), and Beacon validates the <code>version</code> field before touching anything else.</p>
 
 <pre><code><span class="lang-tag">C</span>typedef struct {
-    DWORD               version;          // CS version: 0x041100 = 4.11
-    PSYSCALL_API        syscalls;         // Pre-resolved syscall entries (35 Nt*)
-    BYTE                custom[32];       // 32-byte user-defined field
+    unsigned int        version;          // CS version: 0x041100 = 4.11
+    PSYSCALL_API        syscalls;         // Pre-resolved syscall entries (36 Nt*)
+    char                custom[BEACON_USER_DATA_CUSTOM_SIZE]; // User-defined field
     PRTL_API            rtls;             // Pre-resolved RTL functions
     PALLOCATED_MEMORY   allocatedMemory;  // Memory region tracking
 } USER_DATA;</code></pre>
@@ -82,9 +82,9 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
 <h4>Field-by-Field Breakdown</h4>
 <table>
 <tr><th>Field</th><th>Type</th><th>Description</th></tr>
-<tr><td><code>version</code></td><td><code>DWORD</code></td><td>Must match the Cobalt Strike version that built the payload. For CS 4.11 this is <code>0x041100</code>. Beacon validates this value immediately &mdash; if it does not match, Beacon ignores the entire USER_DATA structure. This prevents version-mismatched loaders from corrupting Beacon's state.</td></tr>
-<tr><td><code>syscalls</code></td><td><code>PSYSCALL_API</code></td><td>Pointer to the SYSCALL_API structure containing all 35 Nt* function entries. Each entry holds the function address, a <code>syscall;ret</code> gadget address, and the System Service Number. Beacon uses these for all native API calls, routing them through indirect syscalls.</td></tr>
-<tr><td><code>custom[32]</code></td><td><code>BYTE[32]</code></td><td>A 32-byte user-defined buffer that the loader can use to pass arbitrary data to Beacon. This could be encryption keys, configuration flags, a nonce, or any other operator-defined data. Beacon does not interpret these bytes &mdash; they are available to post-exploitation scripts and BOFs via the Beacon User Data API.</td></tr>
+<tr><td><code>version</code></td><td><code>unsigned int</code></td><td>Must match the Cobalt Strike version that built the payload. For CS 4.11 this is <code>0x041100</code>. Beacon validates this value immediately &mdash; if it does not match, Beacon ignores the entire USER_DATA structure. This prevents version-mismatched loaders from corrupting Beacon's state.</td></tr>
+<tr><td><code>syscalls</code></td><td><code>PSYSCALL_API</code></td><td>Pointer to the SYSCALL_API structure containing all 36 Nt* function entries. Each entry holds the function address, a <code>syscall;ret</code> gadget address, and the System Service Number. Beacon uses these for all native API calls, routing them through indirect syscalls.</td></tr>
+<tr><td><code>custom[BEACON_USER_DATA_CUSTOM_SIZE]</code></td><td><code>char[]</code></td><td>A user-defined buffer (sized by <code>BEACON_USER_DATA_CUSTOM_SIZE</code>) that the loader can use to pass arbitrary data to Beacon. This could be encryption keys, configuration flags, a nonce, or any other operator-defined data. Beacon does not interpret these bytes &mdash; they are available to post-exploitation scripts and BOFs via the Beacon User Data API.</td></tr>
 <tr><td><code>rtls</code></td><td><code>PRTL_API</code></td><td>Pointer to the RTL_API structure with 3 resolved RTL (Runtime Library) function addresses from ntdll and the PEB. These are functions Beacon needs internally but that are not part of the syscall table.</td></tr>
 <tr><td><code>allocatedMemory</code></td><td><code>PALLOCATED_MEMORY</code></td><td>Pointer to the ALLOCATED_MEMORY structure that tracks up to 6 memory regions with up to 8 sections each. This gives Beacon (and its sleep mask) a complete map of every memory region the loader allocated, including section-level metadata for encryption and permission management.</td></tr>
 </table>
@@ -98,7 +98,7 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
 <!-- ============================================================ -->
 <h2>3. SYSCALL_API &mdash; The Syscall Table</h2>
 
-<p>The <code>SYSCALL_API</code> structure is the largest component of BUD. It contains 35 entries, one for each Nt* function that Beacon may need to call during its lifecycle. Each entry is a <code>SYSCALL_API_ENTRY</code> with three fields:</p>
+<p>The <code>SYSCALL_API</code> structure is the largest component of BUD. It contains 36 entries, one for each Nt* function that Beacon may need to call during its lifecycle. Each entry is a <code>SYSCALL_API_ENTRY</code> with three fields:</p>
 
 <pre><code><span class="lang-tag">C</span>typedef struct {
     PVOID fnAddr;     // Address of the Nt* function in ntdll.dll
@@ -116,94 +116,90 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
 </table>
 </div>
 
-<p>The full SYSCALL_API structure contains 35 named entries. Crystal-Loaders resolves all of them during the loading process using LibGate:</p>
+<p>The full SYSCALL_API structure contains 36 named entries. Crystal-Loaders resolves all of them during the loading process using LibGate:</p>
 
 <pre><code><span class="lang-tag">C</span>typedef struct {
-    SYSCALL_API_ENTRY NtAllocateVirtualMemory;
-    SYSCALL_API_ENTRY NtClose;
-    SYSCALL_API_ENTRY NtContinue;
-    SYSCALL_API_ENTRY NtCreateEvent;
-    SYSCALL_API_ENTRY NtCreateFile;
-    SYSCALL_API_ENTRY NtCreateMutant;
-    SYSCALL_API_ENTRY NtCreateNamedPipeFile;
-    SYSCALL_API_ENTRY NtCreateSection;
-    SYSCALL_API_ENTRY NtCreateThread;
-    SYSCALL_API_ENTRY NtCreateThreadEx;
-    SYSCALL_API_ENTRY NtDuplicateObject;
-    SYSCALL_API_ENTRY NtFreeVirtualMemory;
-    SYSCALL_API_ENTRY NtGetContextThread;
-    SYSCALL_API_ENTRY NtMapViewOfSection;
-    SYSCALL_API_ENTRY NtOpenEvent;
-    SYSCALL_API_ENTRY NtOpenFile;
-    SYSCALL_API_ENTRY NtOpenMutant;
-    SYSCALL_API_ENTRY NtOpenProcess;
-    SYSCALL_API_ENTRY NtOpenThread;
-    SYSCALL_API_ENTRY NtProtectVirtualMemory;
-    SYSCALL_API_ENTRY NtQueryInformationProcess;
-    SYSCALL_API_ENTRY NtQueryInformationThread;
-    SYSCALL_API_ENTRY NtQuerySystemInformation;
-    SYSCALL_API_ENTRY NtQueryVirtualMemory;
-    SYSCALL_API_ENTRY NtQueueApcThread;
-    SYSCALL_API_ENTRY NtReadFile;
-    SYSCALL_API_ENTRY NtReadVirtualMemory;
-    SYSCALL_API_ENTRY NtResumeThread;
-    SYSCALL_API_ENTRY NtSetContextThread;
-    SYSCALL_API_ENTRY NtSetInformationThread;
-    SYSCALL_API_ENTRY NtTerminateProcess;
-    SYSCALL_API_ENTRY NtTerminateThread;
-    SYSCALL_API_ENTRY NtUnmapViewOfSection;
-    SYSCALL_API_ENTRY NtWaitForSingleObject;
-    SYSCALL_API_ENTRY NtWaitForMultipleObjects;
-    SYSCALL_API_ENTRY NtWriteVirtualMemory;
+    SYSCALL_API_ENTRY ntAllocateVirtualMemory;
+    SYSCALL_API_ENTRY ntProtectVirtualMemory;
+    SYSCALL_API_ENTRY ntFreeVirtualMemory;
+    SYSCALL_API_ENTRY ntGetContextThread;
+    SYSCALL_API_ENTRY ntSetContextThread;
+    SYSCALL_API_ENTRY ntResumeThread;
+    SYSCALL_API_ENTRY ntCreateThreadEx;
+    SYSCALL_API_ENTRY ntOpenProcess;
+    SYSCALL_API_ENTRY ntOpenThread;
+    SYSCALL_API_ENTRY ntClose;
+    SYSCALL_API_ENTRY ntCreateSection;
+    SYSCALL_API_ENTRY ntMapViewOfSection;
+    SYSCALL_API_ENTRY ntUnmapViewOfSection;
+    SYSCALL_API_ENTRY ntQueryVirtualMemory;
+    SYSCALL_API_ENTRY ntDuplicateObject;
+    SYSCALL_API_ENTRY ntReadVirtualMemory;
+    SYSCALL_API_ENTRY ntWriteVirtualMemory;
+    SYSCALL_API_ENTRY ntReadFile;
+    SYSCALL_API_ENTRY ntWriteFile;
+    SYSCALL_API_ENTRY ntCreateFile;
+    SYSCALL_API_ENTRY ntQueueApcThread;
+    SYSCALL_API_ENTRY ntCreateProcess;
+    SYSCALL_API_ENTRY ntOpenProcessToken;
+    SYSCALL_API_ENTRY ntTestAlert;
+    SYSCALL_API_ENTRY ntSuspendProcess;
+    SYSCALL_API_ENTRY ntResumeProcess;
+    SYSCALL_API_ENTRY ntQuerySystemInformation;
+    SYSCALL_API_ENTRY ntQueryDirectoryFile;
+    SYSCALL_API_ENTRY ntSetInformationProcess;
+    SYSCALL_API_ENTRY ntSetInformationThread;
+    SYSCALL_API_ENTRY ntQueryInformationProcess;
+    SYSCALL_API_ENTRY ntQueryInformationThread;
+    SYSCALL_API_ENTRY ntOpenSection;
+    SYSCALL_API_ENTRY ntAdjustPrivilegesToken;
+    SYSCALL_API_ENTRY ntDeviceIoControlFile;
+    SYSCALL_API_ENTRY ntWaitForMultipleObjects;
 } SYSCALL_API;</code></pre>
 
 <h3>Complete Syscall Reference Table</h3>
 
-<p>All 35 Nt* functions in the SYSCALL_API, organized by functional category:</p>
+<p>All 36 Nt* functions in the SYSCALL_API, listed in source order:</p>
 
 <table>
 <tr><th>#</th><th>Function</th><th>Purpose</th><th>Category</th></tr>
-<tr><td>1</td><td><code>NtAllocateVirtualMemory</code></td><td>Allocate memory regions in a process address space</td><td>Memory</td></tr>
-<tr><td>2</td><td><code>NtFreeVirtualMemory</code></td><td>Free previously allocated memory regions</td><td>Memory</td></tr>
-<tr><td>3</td><td><code>NtProtectVirtualMemory</code></td><td>Change memory page permissions (RW, RX, etc.)</td><td>Memory</td></tr>
-<tr><td>4</td><td><code>NtQueryVirtualMemory</code></td><td>Query information about a memory region (type, protection, size)</td><td>Memory</td></tr>
-<tr><td>5</td><td><code>NtReadVirtualMemory</code></td><td>Read memory from a remote process</td><td>Memory</td></tr>
-<tr><td>6</td><td><code>NtWriteVirtualMemory</code></td><td>Write memory to a remote process</td><td>Memory</td></tr>
-<tr><td>7</td><td><code>NtCreateSection</code></td><td>Create a section object for memory mapping</td><td>Memory</td></tr>
-<tr><td>8</td><td><code>NtMapViewOfSection</code></td><td>Map a section object into a process address space</td><td>Memory</td></tr>
-<tr><td>9</td><td><code>NtUnmapViewOfSection</code></td><td>Unmap a previously mapped section from a process</td><td>Memory</td></tr>
-<tr><td>10</td><td><code>NtCreateThreadEx</code></td><td>Create a new thread (modern API with extended parameters)</td><td>Threads</td></tr>
-<tr><td>11</td><td><code>NtCreateThread</code></td><td>Create a new thread (legacy API)</td><td>Threads</td></tr>
-<tr><td>12</td><td><code>NtResumeThread</code></td><td>Resume a suspended thread</td><td>Threads</td></tr>
-<tr><td>13</td><td><code>NtGetContextThread</code></td><td>Read a thread's CPU context (registers, flags)</td><td>Threads</td></tr>
-<tr><td>14</td><td><code>NtSetContextThread</code></td><td>Set a thread's CPU context (used in sleep mask ROP chains)</td><td>Threads</td></tr>
-<tr><td>15</td><td><code>NtSetInformationThread</code></td><td>Set thread properties (e.g., <code>ThreadHideFromDebugger</code>)</td><td>Threads</td></tr>
-<tr><td>16</td><td><code>NtQueryInformationThread</code></td><td>Query thread information (start address, priority, etc.)</td><td>Threads</td></tr>
-<tr><td>17</td><td><code>NtOpenThread</code></td><td>Open a handle to an existing thread</td><td>Threads</td></tr>
-<tr><td>18</td><td><code>NtTerminateThread</code></td><td>Terminate a specific thread</td><td>Threads</td></tr>
-<tr><td>19</td><td><code>NtQueueApcThread</code></td><td>Queue an Asynchronous Procedure Call to a thread</td><td>Threads</td></tr>
-<tr><td>20</td><td><code>NtContinue</code></td><td>Resume execution from a modified context (used in sleep mask ROP for context switching)</td><td>Threads</td></tr>
-<tr><td>21</td><td><code>NtOpenProcess</code></td><td>Open a handle to a process</td><td>Process</td></tr>
-<tr><td>22</td><td><code>NtQueryInformationProcess</code></td><td>Query process information (PEB address, debug status, etc.)</td><td>Process</td></tr>
-<tr><td>23</td><td><code>NtTerminateProcess</code></td><td>Terminate a process</td><td>Process</td></tr>
-<tr><td>24</td><td><code>NtQuerySystemInformation</code></td><td>Query system-wide information (process list, handle table, etc.)</td><td>System</td></tr>
-<tr><td>25</td><td><code>NtCreateFile</code></td><td>Create or open a file (NT-level file I/O)</td><td>File I/O</td></tr>
-<tr><td>26</td><td><code>NtOpenFile</code></td><td>Open an existing file</td><td>File I/O</td></tr>
-<tr><td>27</td><td><code>NtReadFile</code></td><td>Read data from a file</td><td>File I/O</td></tr>
-<tr><td>28</td><td><code>NtCreateNamedPipeFile</code></td><td>Create a named pipe for inter-process communication</td><td>IPC</td></tr>
-<tr><td>29</td><td><code>NtClose</code></td><td>Close any NT handle (files, threads, processes, events, etc.)</td><td>Handles</td></tr>
-<tr><td>30</td><td><code>NtDuplicateObject</code></td><td>Duplicate a handle (within or across processes)</td><td>Handles</td></tr>
-<tr><td>31</td><td><code>NtCreateEvent</code></td><td>Create a synchronization event object</td><td>Sync</td></tr>
-<tr><td>32</td><td><code>NtOpenEvent</code></td><td>Open an existing event object by name</td><td>Sync</td></tr>
-<tr><td>33</td><td><code>NtCreateMutant</code></td><td>Create a mutex for mutual exclusion</td><td>Sync</td></tr>
-<tr><td>34</td><td><code>NtOpenMutant</code></td><td>Open an existing mutex by name</td><td>Sync</td></tr>
-<tr><td>35</td><td><code>NtWaitForSingleObject</code></td><td>Wait on a single handle (event, mutex, thread, process, etc.)</td><td>Sync</td></tr>
+<tr><td>1</td><td><code>ntAllocateVirtualMemory</code></td><td>Allocate memory regions in a process address space</td><td>Memory</td></tr>
+<tr><td>2</td><td><code>ntProtectVirtualMemory</code></td><td>Change memory page permissions (RW, RX, etc.)</td><td>Memory</td></tr>
+<tr><td>3</td><td><code>ntFreeVirtualMemory</code></td><td>Free previously allocated memory regions</td><td>Memory</td></tr>
+<tr><td>4</td><td><code>ntGetContextThread</code></td><td>Read a thread's CPU context (registers, flags)</td><td>Threads</td></tr>
+<tr><td>5</td><td><code>ntSetContextThread</code></td><td>Set a thread's CPU context (used in sleep mask ROP chains)</td><td>Threads</td></tr>
+<tr><td>6</td><td><code>ntResumeThread</code></td><td>Resume a suspended thread</td><td>Threads</td></tr>
+<tr><td>7</td><td><code>ntCreateThreadEx</code></td><td>Create a new thread (modern API with extended parameters)</td><td>Threads</td></tr>
+<tr><td>8</td><td><code>ntOpenProcess</code></td><td>Open a handle to a process</td><td>Process</td></tr>
+<tr><td>9</td><td><code>ntOpenThread</code></td><td>Open a handle to an existing thread</td><td>Threads</td></tr>
+<tr><td>10</td><td><code>ntClose</code></td><td>Close any NT handle (files, threads, processes, events, etc.)</td><td>Handles</td></tr>
+<tr><td>11</td><td><code>ntCreateSection</code></td><td>Create a section object for memory mapping</td><td>Memory</td></tr>
+<tr><td>12</td><td><code>ntMapViewOfSection</code></td><td>Map a section object into a process address space</td><td>Memory</td></tr>
+<tr><td>13</td><td><code>ntUnmapViewOfSection</code></td><td>Unmap a previously mapped section from a process</td><td>Memory</td></tr>
+<tr><td>14</td><td><code>ntQueryVirtualMemory</code></td><td>Query information about a memory region (type, protection, size)</td><td>Memory</td></tr>
+<tr><td>15</td><td><code>ntDuplicateObject</code></td><td>Duplicate a handle (within or across processes)</td><td>Handles</td></tr>
+<tr><td>16</td><td><code>ntReadVirtualMemory</code></td><td>Read memory from a remote process</td><td>Memory</td></tr>
+<tr><td>17</td><td><code>ntWriteVirtualMemory</code></td><td>Write memory to a remote process</td><td>Memory</td></tr>
+<tr><td>18</td><td><code>ntReadFile</code></td><td>Read data from a file</td><td>File I/O</td></tr>
+<tr><td>19</td><td><code>ntWriteFile</code></td><td>Write data to a file</td><td>File I/O</td></tr>
+<tr><td>20</td><td><code>ntCreateFile</code></td><td>Create or open a file (NT-level file I/O)</td><td>File I/O</td></tr>
+<tr><td>21</td><td><code>ntQueueApcThread</code></td><td>Queue an Asynchronous Procedure Call to a thread</td><td>Threads</td></tr>
+<tr><td>22</td><td><code>ntCreateProcess</code></td><td>Create a new process</td><td>Process</td></tr>
+<tr><td>23</td><td><code>ntOpenProcessToken</code></td><td>Open the access token associated with a process</td><td>Token</td></tr>
+<tr><td>24</td><td><code>ntTestAlert</code></td><td>Test and clear pending APCs for the current thread</td><td>Threads</td></tr>
+<tr><td>25</td><td><code>ntSuspendProcess</code></td><td>Suspend all threads in a target process</td><td>Process</td></tr>
+<tr><td>26</td><td><code>ntResumeProcess</code></td><td>Resume all threads in a previously suspended process</td><td>Process</td></tr>
+<tr><td>27</td><td><code>ntQuerySystemInformation</code></td><td>Query system-wide information (process list, handle table, etc.)</td><td>System</td></tr>
+<tr><td>28</td><td><code>ntQueryDirectoryFile</code></td><td>Query directory contents for file enumeration</td><td>File I/O</td></tr>
+<tr><td>29</td><td><code>ntSetInformationProcess</code></td><td>Set process properties (e.g., DEP policy, mitigation settings)</td><td>Process</td></tr>
+<tr><td>30</td><td><code>ntSetInformationThread</code></td><td>Set thread properties (e.g., <code>ThreadHideFromDebugger</code>)</td><td>Threads</td></tr>
+<tr><td>31</td><td><code>ntQueryInformationProcess</code></td><td>Query process information (PEB address, debug status, etc.)</td><td>Process</td></tr>
+<tr><td>32</td><td><code>ntQueryInformationThread</code></td><td>Query thread information (start address, priority, etc.)</td><td>Threads</td></tr>
+<tr><td>33</td><td><code>ntOpenSection</code></td><td>Open an existing section object by name</td><td>Memory</td></tr>
+<tr><td>34</td><td><code>ntAdjustPrivilegesToken</code></td><td>Enable or disable privileges in an access token</td><td>Token</td></tr>
+<tr><td>35</td><td><code>ntDeviceIoControlFile</code></td><td>Send a device I/O control request to a driver</td><td>Device I/O</td></tr>
+<tr><td>36</td><td><code>ntWaitForMultipleObjects</code></td><td>Wait on an array of handles simultaneously</td><td>Sync</td></tr>
 </table>
-
-<div class="card highlight">
-<h4>Wait &mdash; What About NtWaitForMultipleObjects?</h4>
-<p>That is the 36th entry in the struct declaration above, bringing the total count to 35 named Nt* functions in the SYSCALL_API (the numbering in the table counts from 1). <code>NtWaitForMultipleObjects</code> waits on an array of handles simultaneously &mdash; used when Beacon needs to wait on multiple synchronization primitives at once.</p>
-</div>
 
 <!-- ============================================================ -->
 <h2>4. RTL_API &mdash; Runtime Library Functions</h2>
@@ -211,18 +207,18 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
 <p>Not everything Beacon needs is a syscall. Three runtime library values are resolved by the loader and passed separately in the <code>RTL_API</code> structure:</p>
 
 <pre><code><span class="lang-tag">C</span>typedef struct {
-    PVOID RtlDosPathNameToNtPathNameUWithStatus;
-    PVOID RtlFreeHeap;
-    PVOID ProcessHeap;  // From PEB->ProcessHeap
-} RTL_API;</code></pre>
+    PVOID rtlDosPathNameToNtPathNameUWithStatusAddr;
+    PVOID rtlFreeHeapAddr;
+    PVOID rtlGetProcessHeapAddr;
+} RTL_API, *PRTL_API;</code></pre>
 
 <div class="card">
 <h4>Why These Three?</h4>
 <table>
 <tr><th>Field</th><th>What It Does</th><th>Why Beacon Needs It</th></tr>
-<tr><td><code>RtlDosPathNameToNtPathNameUWithStatus</code></td><td>Converts a DOS-style path like <code>C:\Windows\System32\cmd.exe</code> into an NT-style path like <code>\??\C:\Windows\System32\cmd.exe</code></td><td>The Nt* file APIs (<code>NtCreateFile</code>, <code>NtOpenFile</code>) require NT path format. Without this function, Beacon would need to resolve and call it dynamically every time it performs file I/O, adding overhead and resolution artifacts.</td></tr>
-<tr><td><code>RtlFreeHeap</code></td><td>Frees a heap allocation made with <code>RtlAllocateHeap</code> (the underlying implementation of <code>HeapFree</code>)</td><td>Beacon uses heap allocations internally for buffers, strings, and temporary data. Having the free function pre-resolved avoids repeated runtime lookups into ntdll.</td></tr>
-<tr><td><code>ProcessHeap</code></td><td>The default process heap handle, read directly from the Process Environment Block</td><td>Both <code>RtlAllocateHeap</code> and <code>RtlFreeHeap</code> require a heap handle as their first argument. Rather than reading the PEB each time, the loader reads it once and passes it through BUD.</td></tr>
+<tr><td><code>rtlDosPathNameToNtPathNameUWithStatusAddr</code></td><td>Converts a DOS-style path like <code>C:\Windows\System32\cmd.exe</code> into an NT-style path like <code>\??\C:\Windows\System32\cmd.exe</code></td><td>The Nt* file APIs (<code>NtCreateFile</code>) require NT path format. Without this function, Beacon would need to resolve and call it dynamically every time it performs file I/O, adding overhead and resolution artifacts.</td></tr>
+<tr><td><code>rtlFreeHeapAddr</code></td><td>Frees a heap allocation made with <code>RtlAllocateHeap</code> (the underlying implementation of <code>HeapFree</code>)</td><td>Beacon uses heap allocations internally for buffers, strings, and temporary data. Having the free function pre-resolved avoids repeated runtime lookups into ntdll.</td></tr>
+<tr><td><code>rtlGetProcessHeapAddr</code></td><td>The address of <code>RtlGetProcessHeap</code>, which returns the default process heap handle</td><td>Both <code>RtlAllocateHeap</code> and <code>RtlFreeHeap</code> require a heap handle as their first argument. Rather than reading the PEB each time, the loader provides the address of the function that retrieves it.</td></tr>
 </table>
 </div>
 
@@ -235,16 +231,13 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
     // Find ntdll base address via PEB walking + hash comparison
     PVOID ntdll = findModuleByHash(NTDLL_HASH);
 
-    // Resolve the two RTL functions from ntdll's export table
-    rtls->RtlDosPathNameToNtPathNameUWithStatus = findFunctionByHash(
+    // Resolve the RTL functions from ntdll's export table
+    rtls->rtlDosPathNameToNtPathNameUWithStatusAddr = findFunctionByHash(
         ntdll, RTL_DOSPATHNAME_HASH);
-    rtls->RtlFreeHeap = findFunctionByHash(
+    rtls->rtlFreeHeapAddr = findFunctionByHash(
         ntdll, RTL_FREEHEAP_HASH);
-
-    // Read ProcessHeap directly from the PEB
-    // PEB is at gs:[0x60] on x64
-    PPEB pPeb = (PPEB)__readgsqword(0x60);
-    rtls->ProcessHeap = pPeb->ProcessHeap;
+    rtls->rtlGetProcessHeapAddr = findFunctionByHash(
+        ntdll, RTL_GETPROCESSHEAP_HASH);
 }</code></pre>
 
 <div class="card warn">
@@ -280,6 +273,30 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
     DWORD                   PreviousProtect;
     BOOL                    MaskSection;     // TRUE = encrypt this section during sleep
 } ALLOCATED_MEMORY_SECTION;</code></pre>
+
+<p>The <code>CleanupInformation</code> field in each region tells Beacon how to clean up the allocation on exit. It contains the allocation method, a cleanup flag, and method-specific additional information:</p>
+
+<pre><code><span class="lang-tag">C</span>typedef struct {
+    BOOL                                             Cleanup;
+    ALLOCATED_MEMORY_ALLOCATION_METHOD               AllocationMethod;
+    ALLOCATED_MEMORY_ADDITIONAL_CLEANUP_INFORMATION   AdditionalCleanupInformation;
+} ALLOCATED_MEMORY_CLEANUP_INFORMATION;</code></pre>
+
+<p>The <code>AdditionalCleanupInformation</code> is a union that carries method-specific data needed for correct deallocation:</p>
+
+<pre><code><span class="lang-tag">C</span>typedef union {
+    HEAPALLOC_INFO    HeapAllocInfo;    // HeapHandle, DestroyHeap
+    MODULESTOMP_INFO  ModuleStompInfo;  // ModuleHandle
+} ALLOCATED_MEMORY_ADDITIONAL_CLEANUP_INFORMATION;
+
+typedef struct {
+    PVOID HeapHandle;   // Handle to the heap this region was allocated from
+    BOOL  DestroyHeap;  // TRUE if the heap itself should be destroyed on cleanup
+} HEAPALLOC_INFO;
+
+typedef struct {
+    PVOID ModuleHandle; // Handle to the stomped module
+} MODULESTOMP_INFO;</code></pre>
 
 <div class="card">
 <h4>Section Fields Explained</h4>
@@ -356,13 +373,16 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
 <h3>ALLOCATED_MEMORY_LABEL</h3>
 
 <pre><code><span class="lang-tag">C</span>enum ALLOCATED_MEMORY_LABEL {
-    LABEL_BUFFER    = 0,   // Generic buffer (non-PE data)
-    LABEL_PEHEADER  = 1,   // PE/COFF headers
-    LABEL_TEXT      = 2,   // .text section (executable code)
-    LABEL_RDATA     = 3,   // .rdata section (read-only data, vtables, strings)
-    LABEL_DATA      = 4,   // .data section (writable initialized data)
-    LABEL_PDATA     = 5,   // .pdata section (exception handler tables)
-    LABEL_RELOC     = 6    // .reloc section (base relocation fixups)
+    LABEL_EMPTY     = 0,   // Slot is unused / not assigned
+    LABEL_BUFFER    = 1,   // Generic buffer (non-PE data)
+    LABEL_PEHEADER  = 2,   // PE/COFF headers
+    LABEL_TEXT      = 3,   // .text section (executable code)
+    LABEL_RDATA     = 4,   // .rdata section (read-only data, vtables, strings)
+    LABEL_DATA      = 5,   // .data section (writable initialized data)
+    LABEL_PDATA     = 6,   // .pdata section (exception handler tables)
+    LABEL_RELOC     = 7,   // .reloc section (base relocation fixups)
+
+    LABEL_USER_DEFINED = 1000  // Starting value for user-defined labels
 };</code></pre>
 
 <p>The label tells the sleep mask (and Beacon) what kind of data lives in each section. This matters because different sections need different permission transitions during sleep:</p>
@@ -379,10 +399,13 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
 <h3>ALLOCATED_MEMORY_ALLOCATION_METHOD</h3>
 
 <pre><code><span class="lang-tag">C</span>enum ALLOCATED_MEMORY_ALLOCATION_METHOD {
-    METHOD_VIRTUALALLOC  = 0,   // Allocated via VirtualAlloc / NtAllocateVirtualMemory
-    METHOD_HEAPALLOC     = 1,   // Allocated via HeapAlloc / RtlAllocateHeap
-    METHOD_MODULESTOMP   = 2,   // Overwrote an existing mapped module (module stomping)
-    METHOD_NTMAPVIEW     = 3    // Mapped via NtMapViewOfSection
+    METHOD_UNKNOWN       = 0,   // Unknown or unset allocation method
+    METHOD_VIRTUALALLOC  = 1,   // Allocated via VirtualAlloc / NtAllocateVirtualMemory
+    METHOD_HEAPALLOC     = 2,   // Allocated via HeapAlloc / RtlAllocateHeap
+    METHOD_MODULESTOMP   = 3,   // Overwrote an existing mapped module (module stomping)
+    METHOD_NTMAPVIEW     = 4,   // Mapped via NtMapViewOfSection
+
+    METHOD_USER_DEFINED  = 1000 // Starting value for user-defined methods
 };</code></pre>
 
 <div class="card green">
@@ -437,39 +460,45 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
 
 <pre><code><span class="lang-tag">C</span>void FixSectionPermissions(PDLLDATA dlldata, PBYTE dst, PALLOCATED_MEMORY_REGION region)
 {
-    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(dlldata->NtHeaders);
-
     // Set the region-level metadata
     region->AllocationBase = dst;
     region->RegionSize     = SizeOfDLL(dlldata);
     region->Type           = MEM_COMMIT;
 
     // Iterate each PE section and apply granular protections
+    PIMAGE_SECTION_HEADER sectionHdr = IMAGE_FIRST_SECTION(dlldata->NtHeaders);
     for (WORD i = 0; i < dlldata->NtHeaders->FileHeader.NumberOfSections; i++)
     {
         DWORD protect = PAGE_READONLY;  // Default: read-only
 
         // Determine the appropriate protection from section characteristics
-        if (section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+        // NOTE: Simplified for clarity. The actual source has 7 cascading
+        // conditions handling PAGE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE,
+        // PAGE_EXECUTE, PAGE_EXECUTE_WRITECOPY, PAGE_EXECUTE_READ, and
+        // PAGE_EXECUTE_READWRITE based on the full set of characteristic flags.
+        if (sectionHdr->Characteristics & IMAGE_SCN_MEM_EXECUTE)
             protect = PAGE_EXECUTE_READ;     // .text: RX
-        else if (section[i].Characteristics & IMAGE_SCN_MEM_WRITE)
+        else if (sectionHdr->Characteristics & IMAGE_SCN_MEM_WRITE)
             protect = PAGE_READWRITE;        // .data: RW
 
         // Apply the protection
         DWORD oldProtect;
         KERNEL32$VirtualProtect(
-            dst + section[i].VirtualAddress,   // Section base address
-            section[i].Misc.VirtualSize,       // Section size
+            dst + sectionHdr->VirtualAddress,  // Section base address
+            sectionHdr->SizeOfRawData,         // Section size
             protect,                           // New protection
             &oldProtect                        // Previous protection (saved)
         );
 
         // Track the section metadata in the BUD region
-        region->Sections[i].Label          = GetLabelFromSectionHeader(section[i].Name);
-        region->Sections[i].BaseAddress    = dst + section[i].VirtualAddress;
-        region->Sections[i].VirtualSize    = section[i].Misc.VirtualSize;
-        region->Sections[i].CurrentProtect = protect;
-        region->Sections[i].MaskSection    = TRUE;  // All Beacon sections are maskable
+        region->Sections[i].Label           = GetLabelFromSectionHeader(sectionHdr->Name);
+        region->Sections[i].BaseAddress     = dst + sectionHdr->VirtualAddress;
+        region->Sections[i].VirtualSize     = sectionHdr->SizeOfRawData;
+        region->Sections[i].CurrentProtect  = protect;
+        region->Sections[i].PreviousProtect = oldProtect;
+        region->Sections[i].MaskSection     = TRUE;  // All Beacon sections are maskable
+
+        sectionHdr++;
     }
 }</code></pre>
 
@@ -507,8 +536,8 @@ DllMain(hInstance, DLL_BEACON_USER_DATA, (LPVOID)&userData);</code></pre>
 <h4>Key Takeaways</h4>
 <ul>
 <li><strong>BUD (Beacon User Data)</strong> is the structured contract between the UDRL loader and Beacon, delivered via a <code>DllMain</code> call with <code>fdwReason = 0x0d</code>.</li>
-<li>The <strong>USER_DATA</strong> structure contains a version field (<code>0x041100</code> for CS 4.11), pointers to SYSCALL_API (35 Nt* entries), RTL_API (3 runtime values), ALLOCATED_MEMORY (up to 6 regions), and a 32-byte custom field.</li>
-<li>The <strong>SYSCALL_API</strong> provides pre-resolved function addresses, <code>syscall;ret</code> gadget addresses, and SSNs for all 35 Nt* functions Beacon uses &mdash; enabling indirect syscall execution without runtime resolution.</li>
+<li>The <strong>USER_DATA</strong> structure contains a version field (<code>0x041100</code> for CS 4.11), pointers to SYSCALL_API (36 Nt* entries), RTL_API (3 runtime values), ALLOCATED_MEMORY (up to 6 regions), and a 32-byte custom field.</li>
+<li>The <strong>SYSCALL_API</strong> provides pre-resolved function addresses, <code>syscall;ret</code> gadget addresses, and SSNs for all 36 Nt* functions Beacon uses &mdash; enabling indirect syscall execution without runtime resolution.</li>
 <li>The <strong>RTL_API</strong> provides path conversion, heap freeing, and the default process heap handle &mdash; three values Beacon needs that are not syscalls.</li>
 <li>The <strong>ALLOCATED_MEMORY</strong> structure gives Beacon and its sleep mask a complete, section-level memory map including labels, permissions, and encryption flags.</li>
 <li>The <strong>allocation method enum</strong> ensures correct cleanup by telling Beacon which deallocation API to use for each region.</li>

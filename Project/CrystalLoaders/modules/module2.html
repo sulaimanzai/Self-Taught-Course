@@ -41,7 +41,7 @@
 <!-- ============================================================ -->
 <h2>1. What Is Crystal Palace?</h2>
 
-<p><strong>Crystal Palace</strong> is a Java-based linker and linker-script language designed by <strong>Raphael Mudge</strong> specifically for building PIC (position-independent code) DLL loaders. It was introduced alongside <strong>Cobalt Strike 4.10/4.11</strong> as the official mechanism for creating User-Defined Reflective Loaders (UDRLs).</p>
+<p><strong>Crystal Palace</strong> is a Java-based linker and linker-script language designed by <strong>Raphael Mudge</strong> specifically for building PIC (position-independent code) DLL loaders. It was released in 2025 as part of the Tradecraft Garden project and is designed for building PIC DLL loaders, including User-Defined Reflective Loaders (UDRLs) for Cobalt Strike.</p>
 
 <p>Crystal Palace takes compiled <strong>COFF object files</strong> (<code>.o</code>) produced by MinGW and transforms them into flat PIC shellcode with embedded resources. The transformation is driven by <code>.spec</code> files &mdash; declarative specifications that describe how to assemble, transform, and link the final payload.</p>
 
@@ -164,7 +164,7 @@ x64:
 <tr><td><code>make pic</code></td><td>Transform the loaded COFF into position-independent code</td><td><code>make pic +gofirst +optimize +disco</code></td></tr>
 <tr><td><code>+gofirst</code></td><td>Place the <code>go()</code> function at byte offset 0 of the PIC blob</td><td>Flag on <code>make pic</code></td></tr>
 <tr><td><code>+optimize</code></td><td>Enable code size optimization passes</td><td>Flag on <code>make pic</code></td></tr>
-<tr><td><code>+disco</code></td><td>Enable function discovery (allow Crystal Palace to find all functions in the object)</td><td>Flag on <code>make pic</code></td></tr>
+<tr><td><code>+disco</code></td><td>Randomize function order in the PIC blob (the first function is preserved when used with <code>+gofirst</code>)</td><td>Flag on <code>make pic</code></td></tr>
 <tr><td><code>dfr</code></td><td>Dynamic Function Resolution &mdash; rewrite all <code>__imp_MODULE$Function</code> references to call a resolver</td><td><code>dfr "resolve" "ror13"</code></td></tr>
 <tr><td><code>mergelib</code></td><td>Merge an external library's object files into the current build</td><td><code>mergelib "../libgate.x64.zip"</code></td></tr>
 <tr><td><code>generate</code></td><td>Generate random data (e.g., an XOR key) and store in a variable</td><td><code>generate $KEY 128</code></td></tr>
@@ -193,9 +193,9 @@ x64:
 
 <pre><code><span class="lang-tag">C</span>// These declarations tell the compiler: "this function comes from an external DLL"
 // The '$' separator tells Crystal Palace: module = KERNEL32, function = VirtualAlloc
-DECLSPEC_IMPORT PVOID WINAPI KERNEL32$VirtualAlloc(PVOID, SIZE_T, DWORD, DWORD);
-DECLSPEC_IMPORT BOOL  WINAPI KERNEL32$VirtualProtect(PVOID, SIZE_T, DWORD, PDWORD);
-DECLSPEC_IMPORT PVOID WINAPI MSVCRT$memcpy(PVOID, PVOID, SIZE_T);</code></pre>
+DECLSPEC_IMPORT LPVOID WINAPI KERNEL32$VirtualAlloc(LPVOID, SIZE_T, DWORD, DWORD);
+DECLSPEC_IMPORT BOOL   WINAPI KERNEL32$VirtualProtect(LPVOID, SIZE_T, DWORD, PDWORD);
+DECLSPEC_IMPORT int    WINAPI MSVCRT$strncmp(const char *, const char *, SIZE_T);</code></pre>
 
 <p>After compilation, these become <code>__imp_KERNEL32$VirtualAlloc</code> symbols in the COFF object's symbol table. In a normal linking process, these would be resolved against import libraries (<code>.lib</code> files). Crystal Palace does something fundamentally different.</p>
 
@@ -223,10 +223,10 @@ DECLSPEC_IMPORT PVOID WINAPI MSVCRT$memcpy(PVOID, PVOID, SIZE_T);</code></pre>
 
 <p>The <code>resolve()</code> function that Crystal Palace calls into is defined in <code>loader.c</code>:</p>
 
-<pre><code><span class="lang-tag">C (loader.c)</span>PVOID resolve(DWORD moduleHash, DWORD functionHash)
+<pre><code><span class="lang-tag">C (loader.c)</span>char * resolve(DWORD modHash, DWORD funcHash)
 {
-    PVOID mod = findModuleByHash(moduleHash);
-    return findFunctionByHash(mod, functionHash);
+    char * mod = findModuleByHash(modHash);
+    return findFunctionByHash(mod, funcHash);
 }</code></pre>
 
 <p><code>findModuleByHash</code> walks the <strong>PEB InMemoryOrderModuleList</strong> (the linked list of loaded DLLs maintained by the Windows loader), hashes each module name using the ROR13 algorithm, and compares against <code>moduleHash</code>. <code>findFunctionByHash</code> then walks the found module's <strong>Export Address Table</strong>, hashes each exported function name, and returns the matching function pointer.</p>
@@ -274,7 +274,7 @@ DECLSPEC_IMPORT PVOID WINAPI MSVCRT$memcpy(PVOID, PVOID, SIZE_T);</code></pre>
 <li><strong>Convert absolute addresses to RIP-relative</strong> &mdash; Any remaining absolute address references are rewritten to use x64 RIP-relative addressing so the code works regardless of where it is loaded</li>
 <li><strong>Place <code>go()</code> at offset 0</strong> &mdash; With the <code>+gofirst</code> flag, the entry point function is positioned at the very start of the blob so the caller can simply jump to byte 0</li>
 <li><strong>Optimize</strong> &mdash; With <code>+optimize</code>, Crystal Palace removes dead code and minimizes the output size</li>
-<li><strong>Discover functions</strong> &mdash; With <code>+disco</code>, Crystal Palace identifies all function boundaries, which is necessary for relocation and optimization</li>
+<li><strong>Randomize function order</strong> &mdash; With <code>+disco</code>, Crystal Palace randomizes the order of functions in the PIC blob (the first function is preserved when used with <code>+gofirst</code>)</li>
 </ol>
 
 <div class="diagram">
@@ -321,7 +321,7 @@ DECLSPEC_IMPORT PVOID WINAPI MSVCRT$memcpy(PVOID, PVOID, SIZE_T);</code></pre>
 <label data-opt="1"><input type="radio" name="q2"> The output is optimized for size</label>
 <label data-opt="2"><input type="radio" name="q2"> All functions are discovered by the linker</label>
 <label data-opt="3"><input type="radio" name="q2"> The output targets x64 architecture</label>
-<div class="explain">The <code>+gofirst</code> flag tells Crystal Palace to place the <code>go()</code> entry-point function at byte offset 0 of the final PIC blob. This means the caller can execute the shellcode by simply jumping to the start of the buffer &mdash; no need to parse headers or look up an entry point. The other flags (<code>+optimize</code> and <code>+disco</code>) handle size optimization and function discovery respectively.</div>
+<div class="explain">The <code>+gofirst</code> flag tells Crystal Palace to place the <code>go()</code> entry-point function at byte offset 0 of the final PIC blob. This means the caller can execute the shellcode by simply jumping to the start of the buffer &mdash; no need to parse headers or look up an entry point. The other flags (<code>+optimize</code> and <code>+disco</code>) handle size optimization and function order randomization respectively.</div>
 </div>
 
 <div class="quiz-q" data-correct="1">

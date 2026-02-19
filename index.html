@@ -516,6 +516,15 @@ header .separator {
 .course-card.nidhogg .module-item .num { background: #dc262620; color: #dc2626; }
 .course-card.nidhogg .launch-btn { background: linear-gradient(135deg, #dc2626, #b91c1c); }
 
+.course-card.crystalloaders:hover { border-color: #f43f5e40; }
+.course-card.crystalloaders::before { background: linear-gradient(135deg, #f43f5e, #fb923c); }
+.course-card.crystalloaders:hover::before { opacity: 1; }
+.course-card.crystalloaders .card-banner { background: linear-gradient(135deg, #f43f5e15, #fb923c15); border-bottom: 1px solid #f43f5e20; }
+.course-card.crystalloaders .card-banner .icon-wrap { background: linear-gradient(135deg, #f43f5e, #fb923c); }
+.course-card.crystalloaders .card-title { background: linear-gradient(135deg, #f43f5e, #fb923c); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.course-card.crystalloaders .module-item .num { background: #f43f5e20; color: #f43f5e; }
+.course-card.crystalloaders .launch-btn { background: linear-gradient(135deg, #f43f5e, #fb923c); }
+
 /* CARD BANNER */
 .card-banner {
   padding: 28px 28px 24px;
@@ -706,11 +715,11 @@ footer {
 
 <div class="stats-bar">
   <div class="stat">
-    <div class="num">18</div>
+    <div class="num">19</div>
     <div class="label">Courses</div>
   </div>
   <div class="stat">
-    <div class="num">147</div>
+    <div class="num">155</div>
     <div class="label">Modules</div>
   </div>
   <div class="stat">
@@ -1595,6 +1604,54 @@ footer {
         <li class="module-item"><span class="num">06</span><span class="diff-dot diff-yellow"></span> Kernel Callbacks &amp; Notifications</li>
         <li class="module-item"><span class="num">07</span><span class="diff-dot diff-red"></span> Memory Scanner Evasion</li>
         <li class="module-item"><span class="num">08</span><span class="diff-dot diff-red"></span> Full Chain &amp; Detection</li>
+      </ul>
+    </div>
+    <div class="card-footer">
+      <div class="meta">
+        <div class="meta-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
+          8 Modules
+        </div>
+        <div class="meta-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          Deep Dive
+        </div>
+      </div>
+      <button class="launch-btn" onclick="return true;">Launch &rarr;</button>
+    </div>
+  </a>
+
+  <!-- CRYSTALLOADERS CARD -->
+  <a href="Project/CrystalLoaders/CrystalLoaders_index.html" class="course-card crystalloaders">
+    <div class="card-banner">
+      <div class="icon-wrap">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+      </div>
+      <div>
+        <div class="card-title">Crystal-Loaders</div>
+        <div class="card-subtitle">PIC Reflective Loaders with Crystal Palace</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <p class="card-desc">
+        Position-independent reflective DLL loading built with Crystal Palace: spec-driven PIC linker,
+        LibTCG PE loading, LibGate indirect syscalls, DFR, Beacon User Data, and extending loaders beyond PoC.
+      </p>
+      <div class="tags">
+        <span class="tag beginner">Beginner</span>
+        <span class="tag intermediate">Intermediate</span>
+        <span class="tag advanced">Advanced</span>
+        <span class="tag lang">C / x64 PIC</span>
+      </div>
+      <ul class="module-list">
+        <li class="module-item"><span class="num">01</span><span class="diff-dot diff-green"></span> The Loader Problem</li>
+        <li class="module-item"><span class="num">02</span><span class="diff-dot diff-green"></span> Crystal Palace</li>
+        <li class="module-item"><span class="num">03</span><span class="diff-dot diff-yellow"></span> LibTCG</li>
+        <li class="module-item"><span class="num">04</span><span class="diff-dot diff-yellow"></span> LibGate Syscalls</li>
+        <li class="module-item"><span class="num">05</span><span class="diff-dot diff-yellow"></span> UDRL Walkthrough</li>
+        <li class="module-item"><span class="num">06</span><span class="diff-dot diff-red"></span> Beacon User Data</li>
+        <li class="module-item"><span class="num">07</span><span class="diff-dot diff-red"></span> Post-Ex &amp; Aggressor</li>
+        <li class="module-item"><span class="num">08</span><span class="diff-dot diff-red"></span> Extending Loaders</li>
       </ul>
     </div>
     <div class="card-footer">

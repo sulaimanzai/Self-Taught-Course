@@ -107,20 +107,18 @@ PBYTE dst = KERNEL32$VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_REA
 <p>The BUD <code>ALLOCATED_MEMORY</code> structure tracks how each region was allocated. When switching to module stomping, you must update the allocation method so the sleep mask and other BUD consumers know they are dealing with file-backed memory:</p>
 
 <pre><code><span class="lang-tag">C</span>// Use METHOD_MODULESTOMP instead of METHOD_VIRTUALALLOC
-region->Method = METHOD_MODULESTOMP;
+region->CleanupInformation.AllocationMethod = METHOD_MODULESTOMP;
 // or METHOD_NTMAPVIEW if using NtMapViewOfSection directly</code></pre>
 
 <h3>The MODULESTOMP_INFO Structure</h3>
 
 <p>Beacon's <code>beacon.h</code> defines a structure for tracking module-stomped allocations:</p>
 
-<pre><code><span class="lang-tag">C (beacon.h)</span>typedef struct {
-    DWORD              Unknown;
-    DWORD              SizeOfHeaders;
-    PIMAGE_DOS_HEADER  DosHeader;
-} MODULESTOMP_INFO;</code></pre>
+<pre><code><span class="lang-tag">C (beacon.h)</span>typedef struct _MODULESTOMP_INFO {
+    HMODULE ModuleHandle;
+} MODULESTOMP_INFO, *PMODULESTOMP_INFO;</code></pre>
 
-<p>This structure lets BUD consumers (especially the sleep mask) know that the region is file-backed and provides the original DOS header pointer for cleanup or restoration. The <code>SizeOfHeaders</code> field tells the sleep mask how much of the initial region is header data versus payload sections.</p>
+<p>This structure simply stores the module handle of the stomped DLL. BUD consumers (especially the sleep mask and cleanup routines) use the <code>ModuleHandle</code> to identify which loaded module was overwritten, enabling proper cleanup (e.g., unmapping the view) when the implant exits or the region is freed.</p>
 
 <div class="card warn">
 <h4>Sacrificial DLL Selection</h4>
@@ -255,36 +253,41 @@ for (int r = 0; r < 6; r++) {
 <!-- ============================================================ -->
 <h2>6. Extension 5 &mdash; Guardrailed Loaders</h2>
 
-<p>Guardrailing ensures that a captured payload is useless outside the target environment. Crystal-Loaders includes a reference to this concept via its <code>simple_rdll_guardrail</code> example, but does not implement it in the main loader. The full guardrail pattern works as follows:</p>
+<p>Guardrailing ensures that a captured payload is useless outside the target environment. The Tradecraft Garden includes a <code>simple_rdll_guardrail</code> example demonstrating this concept, though Crystal-Loaders itself does not implement guardrailing. The full guardrail pattern works as follows:</p>
 
 <h3>The Guardrail Flow</h3>
 
 <div class="diagram">
 <h4>Environment-Locked Payload Decryption</h4>
 <div class="flow" style="flex-direction:column;gap:4px;align-items:stretch;max-width:680px;margin:0 auto">
-<div class="box hl" style="width:100%"><strong>Link Time:</strong> Derive a key from target environment properties (hostname, domain, username hash)</div>
-<div class="box hl" style="width:100%"><strong>Link Time:</strong> Encrypt the Beacon DLL with this derived key</div>
-<div class="box y" style="width:100%"><strong>Runtime:</strong> Re-derive the key from the current environment</div>
-<div class="box g" style="width:100%"><strong>Match:</strong> Key matches &rarr; Beacon decrypts correctly and runs</div>
-<div class="box r" style="width:100%"><strong>Mismatch:</strong> Wrong environment &rarr; garbage output, no valid PE, no IOCs</div>
+<div class="box hl" style="width:100%"><strong>Link Time:</strong> Derive a key from target&rsquo;s C: drive volume serial number (<code>GetVolumeInformationA("c:\\")</code>)</div>
+<div class="box hl" style="width:100%"><strong>Link Time:</strong> Encrypt the Beacon DLL with RC4 via <code>SystemFunction033</code> using the derived key</div>
+<div class="box y" style="width:100%"><strong>Runtime:</strong> Re-derive the key from the current host&rsquo;s C: drive volume serial</div>
+<div class="box g" style="width:100%"><strong>Match:</strong> Serial matches &rarr; RC4 decryption succeeds, Beacon runs</div>
+<div class="box r" style="width:100%"><strong>Mismatch:</strong> Wrong host &rarr; wrong key &rarr; garbage output, no valid PE, no IOCs</div>
 </div>
 </div>
 
-<h3>Conceptual Implementation</h3>
+<h3>Implementation (simple_rdll_guardrail pattern)</h3>
 
-<pre><code><span class="lang-tag">C (Link Time - Operator Workstation)</span>// Generate environment-derived encryption key
-BYTE envKey[16];
-DeriveKey(targetHostname, targetDomain, envKey);
-EncryptBeacon(beacon, envKey);</code></pre>
+<p>The <code>simple_rdll_guardrail</code> example in the Tradecraft Garden derives its key from the target machine's <strong>C: drive volume serial number</strong> and uses <strong>RC4 encryption</strong> via the undocumented <code>SystemFunction033</code> export from <code>advapi32.dll</code>:</p>
 
-<pre><code><span class="lang-tag">C (Runtime - Target Host)</span>// Re-derive the key from the current environment
-BYTE runtimeKey[16];
-DeriveKey(GetComputerName(), GetDomainName(), runtimeKey);
+<pre><code><span class="lang-tag">C (Link Time - Operator Workstation)</span>// Obtain the target's C: volume serial (from recon)
+DWORD targetSerial = ...; // e.g., 0xABCD1234
 
-// Attempt decryption
-DecryptBeacon(encrypted, runtimeKey);
+// Encrypt the Beacon DLL with RC4 using the serial as key material
+RC4_Encrypt(beacon, beaconSize, &targetSerial, sizeof(DWORD));</code></pre>
 
-// If wrong environment: DecryptBeacon produces garbage
+<pre><code><span class="lang-tag">C (Runtime - Target Host)</span>// Re-derive the key from the current host's C: volume serial
+DWORD volumeSerial = 0;
+GetVolumeInformationA("c:\\", NULL, 0, &volumeSerial, NULL, NULL, NULL, 0);
+
+// Decrypt via SystemFunction033 (RC4)
+USTRING data = { beaconSize, beaconSize, encrypted };
+USTRING key  = { sizeof(DWORD), sizeof(DWORD), (PBYTE)&volumeSerial };
+SystemFunction033(&data, &key);
+
+// If wrong host: volumeSerial differs &rarr; RC4 produces garbage
 // No valid PE signature &rarr; ParseDLL fails &rarr; loader exits cleanly
 // No crash, no IOCs, no Beacon artifacts for blue team to analyze</code></pre>
 
@@ -319,7 +322,7 @@ dfr "resolve_default" "strings"</code></pre>
 
 <ul>
 <li><strong>Substitute LdrLoadDll for LoadLibraryA:</strong> <code>LoadLibraryA</code> (kernel32) is commonly hooked by EDRs. Calling <code>LdrLoadDll</code> (ntdll) directly bypasses kernel32 hooks while achieving the same result.</li>
-<li><strong>Custom hash algorithms:</strong> Replace ROR13 with CRC32, djb2, or a unique hash to avoid YARA rules that signature the ROR13 constant (<code>0x3CFA685D</code> for <code>NTDLL_HASH</code>).</li>
+<li><strong>Custom hash algorithms:</strong> Replace ROR13 with CRC32, djb2, or a unique hash to avoid YARA rules that signature the ROR13 constant (<code>0x3CFA685D</code>, defined as <code>NTDLL_HASH</code> in Crystal-Loaders' <code>loader.c</code>).</li>
 <li><strong>Proxy through threadpool:</strong> Route API calls through <code>TpAllocWork</code> / <code>TpPostWork</code> / <code>TpReleaseWork</code> threadpool work items. The call stack then shows the Windows threadpool infrastructure rather than direct calls from the PIC blob.</li>
 </ul>
 
@@ -416,7 +419,7 @@ dfr "resolve_default" "strings"</code></pre>
 <tr><td><strong>PE headers in memory</strong></td><td>Minimal &mdash; PIC blob has no PE headers, but loaded Beacon does</td><td style="color:var(--green)">Header erasure post-load</td></tr>
 <tr><td><strong>RWX memory</strong></td><td style="color:var(--green)">Avoids &mdash; uses RW then RX per section</td><td style="color:var(--green)">Same</td></tr>
 <tr><td><strong>Return address in private memory</strong></td><td style="color:#fb923c">LibGate indirect syscalls help (ntdll frame present)</td><td style="color:var(--green)">Call stack spoofing eliminates anomalous frames</td></tr>
-<tr><td><strong>YARA on ROR13 constants</strong></td><td style="color:var(--red)">NTDLL_HASH (0x3CFA685D) visible in PIC</td><td style="color:var(--green)">Custom hash algorithm obfuscates constants</td></tr>
+<tr><td><strong>YARA on ROR13 constants</strong></td><td style="color:var(--red)">NTDLL_HASH (<code>0x3CFA685D</code>, from <code>loader.c</code>) visible in PIC</td><td style="color:var(--green)">Custom hash algorithm obfuscates constants</td></tr>
 <tr><td><strong>ETW syscall telemetry</strong></td><td>Kernel-level &mdash; cannot bypass from userland</td><td>N/A &mdash; kernel telemetry remains</td></tr>
 <tr><td><strong>Behavioral analysis</strong></td><td style="color:var(--red)">VirtualAlloc + VirtualProtect patterns</td><td style="color:var(--green)">Module stomping changes the pattern entirely</td></tr>
 <tr><td><strong>Sleep mask detection</strong></td><td style="color:var(--red)">No sleep mask included</td><td style="color:var(--green)">BUD-aware sleep mask encrypts during sleep</td></tr>
@@ -465,7 +468,7 @@ dfr "resolve_default" "strings"</code></pre>
 <label data-opt="1"><input type="radio" name="q2_0"> Captured payloads cannot be analyzed outside the target environment</label>
 <label data-opt="2"><input type="radio" name="q2_0"> They bypass all EDR detections</label>
 <label data-opt="3"><input type="radio" name="q2_0"> They support 32-bit systems</label>
-<div class="explain">Guardrailed loaders derive an encryption key from the target environment's properties (hostname, domain, username). If the payload is captured and detonated in a sandbox or analyst workstation, the derived key will not match, and decryption produces garbage. The Beacon DLL never materializes, leaving no strings, configuration, or C2 addresses for blue team analysis. The payload is forensically inert outside the intended target.</div>
+<div class="explain">Guardrailed loaders derive an encryption key from a target-specific property &mdash; for example, the <code>simple_rdll_guardrail</code> uses the C: drive volume serial number obtained via <code>GetVolumeInformationA</code>, then encrypts with RC4 via <code>SystemFunction033</code>. If the payload is captured and detonated in a sandbox or analyst workstation, the derived key will not match, and RC4 decryption produces garbage. The Beacon DLL never materializes, leaving no strings, configuration, or C2 addresses for blue team analysis. The payload is forensically inert outside the intended target.</div>
 </div>
 
 <div class="quiz-q" data-correct="0">
