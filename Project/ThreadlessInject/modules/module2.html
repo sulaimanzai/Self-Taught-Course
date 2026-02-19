@@ -41,15 +41,17 @@
 <h2>What Is Inline Hooking?</h2>
 <p>At the machine code level, every function begins with a <strong>prologue</strong> &mdash; a sequence of instructions that sets up the stack frame. On x64 Windows, a typical function prologue looks like this:</p>
 
-<pre><code><span class="lang-tag">x86-64 ASM</span>; Typical x64 function prologue (5+ bytes)
-mov edi, edi          ; 2 bytes - hot-patch padding (older convention)
-push rbp              ; 1 byte  - save base pointer
-mov rbp, rsp          ; 3 bytes - set up stack frame
-sub rsp, 0x20         ; 4 bytes - allocate shadow space
+<pre><code><span class="lang-tag">x86-64 ASM</span>; Typical x64 function prologue
+sub rsp, 0x28         ; 4 bytes - allocate stack space (shadow space + alignment)
+mov [rsp+0x30], rcx   ; 5 bytes - save first parameter
+mov [rsp+0x38], rdx   ; 5 bytes - save second parameter
 
-; Or more commonly in modern MSVC compiled code:
-sub rsp, 0x28         ; 4 bytes - allocate stack space
-mov [rsp+0x30], rcx   ; 5 bytes - save first parameter</code></pre>
+; Or for functions that save nonvolatile registers:
+mov [rsp+0x08], rbx   ; 5 bytes - save nonvolatile register
+push rdi              ; 1 byte  - save nonvolatile register
+sub rsp, 0x20         ; 4 bytes - allocate shadow space</code></pre>
+
+<p><strong>Note:</strong> The <code>mov edi, edi</code> hot-patch padding sometimes referenced in hooking literature is a <strong>32-bit Windows</strong> convention. On x64, this padding does not exist; hot-patching uses different mechanisms.</p>
 
 <p>An inline hook overwrites these first bytes with a jump instruction that redirects execution to a different address. The original bytes that were overwritten are saved so they can be executed later (this is the "trampoline" pattern), allowing the original function to still work after the hook runs.</p>
 
@@ -65,7 +67,7 @@ dq targetAddress      ; 8 bytes - the 64-bit absolute address to jump to
 ;   RIP is loaded from the 8 bytes immediately following the JMP instruction
 ;   This gives us a full 64-bit address range</code></pre>
 
-<p>This 14-byte sequence is the building block of ThreadlessInject's remote hook. The 6-byte <code>JMP [RIP+0]</code> instruction tells the CPU to load the next instruction pointer from the memory location immediately after itself, which contains the 8-byte absolute address of your hook function (or in ThreadlessInject's case, your shellcode loader stub).</p>
+<p>This 14-byte absolute JMP is a common approach for generic x64 inline hooking. However, <strong>the actual ThreadlessInject tool uses a different strategy</strong>: a 5-byte relative <code>CALL</code> instruction (opcode <code>E8</code> + 4-byte signed offset), which only overwrites 5 bytes of the target function's prologue. To make this work, ThreadlessInject allocates its shellcode loader within +/- 2GB of the target function so the relative offset fits in 32 bits. The <code>CALL</code> also pushes the return address onto the stack, which the loader pops to know where the hook point is for self-restoration. This course uses the 14-byte absolute JMP approach for pedagogical clarity, as it demonstrates the full range of x64 hooking mechanics.</p>
 
 <div class="card warn">
 <h4>Why 14 Bytes?</h4>

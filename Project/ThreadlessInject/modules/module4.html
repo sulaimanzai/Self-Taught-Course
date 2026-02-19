@@ -54,17 +54,24 @@ typedef NTSTATUS (NTAPI *pNtAllocateVirtualMemory)(
 );
 
 // Usage in ThreadlessInject:
+// IMPORTANT: The actual tool allocates within +/- 2GB of the target export
+// to enable a 5-byte relative CALL (E8). It scans addresses near the target.
 PVOID remoteBase = NULL;
 SIZE_T regionSize = shellcodeLen + stubLen + originalBytesLen + 256; // padding
 
 NTSTATUS status = NtAllocateVirtualMemory(
     hProcess,                       // Target process handle
-    &amp;remoteBase,                    // System chooses base address
-    0,                              // No address constraints
+    &amp;remoteBase,                    // Desired base near target function
+    0,                              // No zero-bit constraints
     &amp;regionSize,                    // Total size needed
     MEM_COMMIT | MEM_RESERVE,       // Commit immediately
     PAGE_READWRITE                  // Start as RW (not executable yet)
 );</code></pre>
+
+<div class="card">
+<h4>The 2GB Allocation Constraint</h4>
+<p>Because ThreadlessInject uses a 5-byte relative <code>CALL</code> instruction (opcode <code>E8</code>) to redirect execution, the shellcode loader must be allocated <strong>within +/- 2GB</strong> of the target function. The actual tool scans memory regions near the target export address, attempting allocation at each candidate until one succeeds. This is a key operational constraint: if no suitable memory hole exists within range, the injection fails.</p>
+</div>
 
 <div class="card warn">
 <h4>Initial Protection: RW, Not RWX</h4>
@@ -150,10 +157,16 @@ NtProtectVirtualMemory(
 </table>
 
 <pre><code><span class="lang-tag">C++</span>// Opening the target process with minimum required rights
-HANDLE hProcess = OpenProcess(
+// ThreadlessInject uses NtOpenProcess (not kernel32 OpenProcess) for stealth
+OBJECT_ATTRIBUTES oa = {sizeof(OBJECT_ATTRIBUTES)};
+CLIENT_ID cid = {(HANDLE)(ULONG_PTR)targetPid, NULL};
+HANDLE hProcess = NULL;
+
+NtOpenProcess(
+    &amp;hProcess,
     PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
-    FALSE,
-    targetPid
+    &amp;oa,
+    &amp;cid
 );
 // Note: PROCESS_ALL_ACCESS works but is more suspicious
 // Using minimum rights reduces the detection surface</code></pre>

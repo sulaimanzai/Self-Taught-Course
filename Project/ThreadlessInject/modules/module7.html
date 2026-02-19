@@ -51,7 +51,8 @@
 </table>
 
 <h2>The Execution Guard: Preventing Re-Execution</h2>
-<p>ThreadlessInject uses a simple but effective mechanism to ensure one-shot execution: an <strong>execution guard flag</strong> stored in the allocated memory region. The hook stub checks this flag before calling the shellcode. On the first execution, the flag is clear, so the shellcode runs. The shellcode (or the stub itself) then sets the flag, and all subsequent invocations of the hook skip the shellcode call.</p>
+<p>There are several approaches to ensuring one-shot execution. The actual ThreadlessInject tool uses <strong>self-restoration</strong>: the loader stub writes the original function bytes back over the hook before calling the shellcode, so the hook is removed on first trigger and subsequent calls go straight to the original function. The injector process then polls the hooked function's bytes (via <code>NtReadVirtualMemory</code>) for up to 60 seconds to detect when the original bytes have been restored, confirming execution occurred.</p>
+<p>An alternative approach (shown below for educational purposes) uses an <strong>execution guard flag</strong> stored in the allocated memory region. The hook stub checks this flag before calling the shellcode. On the first execution, the flag is clear, so the shellcode runs. The stub then sets the flag, and all subsequent invocations skip the shellcode call.</p>
 
 <pre><code><span class="lang-tag">x86-64 ASM</span>; Modified hook stub with execution guard
 hook_stub:

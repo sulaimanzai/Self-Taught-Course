@@ -41,16 +41,21 @@
 <h2>Register Preservation: The x64 Calling Convention</h2>
 <p>On Windows x64, the calling convention uses registers <code>RCX</code>, <code>RDX</code>, <code>R8</code>, and <code>R9</code> for the first four integer/pointer arguments, with <code>XMM0</code> through <code>XMM3</code> for floating-point arguments. The <strong>volatile</strong> registers (RAX, RCX, RDX, R8-R11) can be modified by called functions, while <strong>nonvolatile</strong> registers (RBX, RBP, RDI, RSI, R12-R15) must be preserved by callees.</p>
 
-<p>However, our hook stub is not a normal function call &mdash; it is an unexpected detour that happens when a thread is about to execute a function. The thread's register state at the moment of the hook is meaningful to the calling code. We must preserve <strong>all</strong> registers, including the volatile ones, because the caller expects to have its argument registers intact after the hooked function returns.</p>
+<p>However, our hook stub is not a normal function call &mdash; it is an unexpected detour that happens when a thread is about to execute a function. The thread's register state at the moment of the hook is meaningful to the calling code. We must preserve the volatile registers because the caller expects to have its argument registers intact when the original function finally executes.</p>
 
 <table>
 <tr><th>Register Type</th><th>Registers</th><th>Must Save?</th><th>Why</th></tr>
 <tr><td>General Purpose (volatile)</td><td>RAX, RCX, RDX, R8-R11</td><td>Yes</td><td>Contain caller's arguments/state</td></tr>
-<tr><td>General Purpose (nonvolatile)</td><td>RBX, RBP, RDI, RSI, R12-R15</td><td>Yes</td><td>Shellcode might corrupt them</td></tr>
+<tr><td>General Purpose (nonvolatile)</td><td>RBX, RBP, RDI, RSI, R12-R15</td><td>Optional</td><td>The original function is responsible for preserving these per calling convention</td></tr>
 <tr><td>Stack Pointer</td><td>RSP</td><td>Implicitly</td><td>Balanced by push/pop pairs</td></tr>
-<tr><td>Flags</td><td>RFLAGS</td><td>Yes</td><td>Conditional jumps depend on flags</td></tr>
+<tr><td>Flags</td><td>RFLAGS</td><td>Ideally yes</td><td>Conditional jumps depend on flags</td></tr>
 <tr><td>SIMD</td><td>XMM0-XMM5</td><td>Ideally yes</td><td>Floating-point arguments</td></tr>
 </table>
+
+<div class="card warn">
+<h4>Actual Implementation: Volatile Registers Only</h4>
+<p>The actual ThreadlessInject loader stub saves only the <strong>volatile</strong> registers: RAX, RCX, RDX, R8, R9, R10, R11 (7 registers). It does not save nonvolatile registers (RBX, RBP, RDI, RSI, R12-R15) because the hook fires at the function entry point before the original function has used its arguments &mdash; the original function itself is responsible for preserving nonvolatile registers per the x64 calling convention. The comprehensive approach shown below (saving all registers) is more defensive and is included here for pedagogical completeness.</p>
+</div>
 
 <h2>The Hook Stub Assembly</h2>
 <p>Here is the hook stub that ThreadlessInject constructs. It is built as raw machine code bytes (position-independent) and written into the remote process. Every byte is carefully chosen:</p>

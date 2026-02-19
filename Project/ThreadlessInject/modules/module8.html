@@ -118,7 +118,7 @@ bool ThreadlessInject(DWORD pid, const char* dllName, const char* funcName,
 }</code></pre>
 
 <h2>Cobalt Strike BOF Integration</h2>
-<p>A <strong>Beacon Object File (BOF)</strong> is a compiled C object file (.o) that Cobalt Strike can load and execute directly within the Beacon process. BOFs are used for post-exploitation actions because they run in-process (no new process creation) and can use the Beacon's existing communication channel. ThreadlessInject has a BOF implementation that allows operators to perform threadless injection from a Cobalt Strike Beacon.</p>
+<p>A <strong>Beacon Object File (BOF)</strong> is a compiled C object file (.o) that Cobalt Strike can load and execute directly within the Beacon process. BOFs are used for post-exploitation actions because they run in-process (no new process creation) and can use the Beacon's existing communication channel. A BOF implementation of ThreadlessInject was created by <strong>iilegacyyii (Jordan Jay)</strong> as a community port of CCob's original C# technique, allowing operators to perform threadless injection from a Cobalt Strike Beacon.</p>
 
 <h3>BOF Architecture</h3>
 <p>BOFs use a special API provided by Cobalt Strike's Beacon runtime. They cannot use the standard C runtime library (no <code>printf</code>, <code>malloc</code>, etc.). Instead, they use Beacon API functions for output, memory management, and dynamic function resolution:</p>

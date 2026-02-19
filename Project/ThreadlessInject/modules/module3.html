@@ -45,7 +45,7 @@
 <tr><th>Requirement</th><th>Reason</th><th>Risk if Violated</th></tr>
 <tr><td><strong>Called frequently</strong></td><td>Shellcode needs to execute promptly</td><td>Payload never fires or fires too late</td></tr>
 <tr><td><strong>Exported by a loaded DLL</strong></td><td>You need to resolve its address from your injector process</td><td>Cannot find the function to hook</td></tr>
-<tr><td><strong>Prologue &ge; 14 bytes</strong></td><td>Need space for the absolute JMP + address</td><td>Overwrite spills into next function, crash</td></tr>
+<tr><td><strong>Prologue &ge; hook size</strong></td><td>Need space for the hook instruction (5 bytes for a relative CALL/JMP, or 14 for an absolute JMP)</td><td>Overwrite spills into next function, crash</td></tr>
 <tr><td><strong>Not currently executing</strong></td><td>Thread safety during hook installation</td><td>Thread hits partially-written hook, crash</td></tr>
 <tr><td><strong>Not hooked by EDR</strong></td><td>Avoid conflicts with existing EDR hooks</td><td>Double-hook conflict, detection, crash</td></tr>
 <tr><td><strong>Safe to detour briefly</strong></td><td>Your shellcode adds latency to the call</td><td>Timeouts, UI freezes, deadlocks</td></tr>
@@ -105,7 +105,7 @@ HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, targetPid);
 </div>
 
 <h2>Prologue Size Analysis</h2>
-<p>You need at least 14 bytes of the function prologue to overwrite. If the function's prologue is shorter than 14 bytes, you will overwrite into the middle of a subsequent instruction, which will cause a crash when execution returns to the function after the overwritten region. You must analyze the target function's disassembly to confirm it has enough room.</p>
+<p>You need enough prologue bytes to accommodate your hook instruction. For a 14-byte absolute JMP you need at least 14 bytes; the actual ThreadlessInject tool uses a 5-byte relative CALL, requiring only 5 bytes. If the function's prologue is shorter than the hook size, you will overwrite into the middle of a subsequent instruction, which will cause a crash when execution returns to the function after the overwritten region. You must analyze the target function's disassembly to confirm it has enough room.</p>
 
 <pre><code><span class="lang-tag">x86-64 ASM</span>; Example: NtWaitForSingleObject prologue (ntdll.dll)
 ; This has plenty of room for a 14-byte hook

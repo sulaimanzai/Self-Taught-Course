@@ -60,11 +60,11 @@ HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
 <p>This pattern works, but it is trivially detectable. The call to <code>CreateRemoteThread</code> triggers a well-documented chain of kernel events that security products monitor.</p>
 
 <h2>Kernel-Level Thread Creation Callbacks</h2>
-<p>Windows provides a documented mechanism for kernel-mode drivers to receive notifications whenever a new thread is created: <code>PsSetCreateThreadNotifyRoutine</code>. Every major EDR product registers a callback with this function. When your <code>CreateRemoteThread</code> call creates a new thread, the kernel walks its list of registered callbacks and invokes each one, passing a <code>PS_CREATE_NOTIFY_INFO</code> structure that includes the creating process ID, the target process ID, and the new thread ID.</p>
+<p>Windows provides a documented mechanism for kernel-mode drivers to receive notifications whenever a new thread is created: <code>PsSetCreateThreadNotifyRoutine</code>. Every major EDR product registers a callback with this function. When your <code>CreateRemoteThread</code> call creates a new thread, the kernel walks its list of registered callbacks and invokes each one, passing the owning process ID, the new thread ID, and a boolean indicating creation (TRUE) or deletion (FALSE).</p>
 
 <table>
 <tr><th>Kernel Callback</th><th>What It Reports</th><th>Used By</th></tr>
-<tr><td><code>PsSetCreateThreadNotifyRoutine</code></td><td>New thread creation: creator PID, target PID, thread ID</td><td>All major EDRs</td></tr>
+<tr><td><code>PsSetCreateThreadNotifyRoutine</code></td><td>New thread creation: owning process PID, thread ID, create/delete flag</td><td>All major EDRs</td></tr>
 <tr><td><code>PsSetCreateProcessNotifyRoutineEx</code></td><td>New process creation with full image path</td><td>All major EDRs</td></tr>
 <tr><td><code>PsSetLoadImageNotifyRoutine</code></td><td>DLL/image loads into any process</td><td>All major EDRs</td></tr>
 <tr><td><code>ObRegisterCallbacks</code></td><td>Handle operations (OpenProcess, OpenThread)</td><td>Most EDRs</td></tr>
